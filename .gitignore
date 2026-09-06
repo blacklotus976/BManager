@@ -1,0 +1,18 @@
+# Build output
+build/
+dist/
+build.zip
+
+# Build log scratch files accumulated during development
+build_*.txt
+build_*.log
+
+# Local runtime data - never commit real client data or machine-specific config
+data.db
+config.ini
+
+# Editor
+.vscode/
+
+# Shared external vcpkg tree (lives outside this repo, at the LEPP project path)
+vcpkg/
