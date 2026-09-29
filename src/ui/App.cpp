@@ -32,6 +32,10 @@
 #include <chrono>
 #include <ctime>
 
+
+#include "DatePicker.h"  
+
+
 // ---------------------------------------------------------------------------
 // Small shared helpers
 // ---------------------------------------------------------------------------
@@ -220,15 +224,20 @@ static AppState g_app;
 // ---------------------------------------------------------------------------
 // Card helpers
 // ---------------------------------------------------------------------------
-static bool BeginCard(const char* id, ImVec2 size) {
+static bool BeginCard(const char* id, ImVec2 size, bool noScroll = false) {
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    // Cards are a fixed-size visual box, never their own scroll region -- content
-    // that doesn't fit should be sized/laid out to fit, not silently get a
-    // scrollbar inside a small card.
-    bool open = ImGui::BeginChild(id, size, ImGuiChildFlags_Border, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGuiChildFlags  childFlags = ImGuiChildFlags_Border;
+    // NoScrollbar hides the bar; NoScrollWithMouse is what actually stops
+    // ImGui from scrolling the child on wheel events. Both are needed when
+    // the caller wants a truly frozen card (day banners, timeline rows).
+    ImGuiWindowFlags winFlags = noScroll
+        ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)
+        : 0;
+    bool open = ImGui::BeginChild(id, size, childFlags, winFlags);
     return open;
 }
+
 static void EndCard() {
     ImGui::EndChild();
     ImGui::PopStyleVar(2);
@@ -243,111 +252,14 @@ static void CardWrapNext(float cardWidth) {
         ImGui::SameLine();
 }
 
-// ---------------------------------------------------------------------------
-// Reusable calendar-popup date picker (replaces free-text date entry for
-// future-payment resolution dates, per client: "not handwritten text, a
-// calendar popup"). Renders a button showing the selected YYYY-MM-DD (or a
-// placeholder), which opens a small popup with month/year navigation and a
-// 7-column Sun-Sat day grid. Past days (today included -- the date must be
-// strictly in the future) are grayed out and non-clickable, so the future
-// constraint is enforced by the picker itself rather than validated after
-// the fact. Returns true the frame a day is actually picked.
-// ---------------------------------------------------------------------------
-static bool IsLeapYear(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
-static int DaysInMonth(int y, int m) {
-    static const int dim[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
-    if (m < 1 || m > 12) return 30;
-    if (m == 2 && IsLeapYear(y)) return 29;
-    return dim[m - 1];
-}
-// Sakamoto's algorithm: day of week for y-m-d (0=Sunday..6=Saturday).
-static int DayOfWeek(int y, int m, int d) {
-    static const int t[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
-    if (m < 3) y -= 1;
-    return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
-}
 
-static bool DatePickerButton(const char* label, std::string& dateStr) {
-    ImGui::PushID(label);
-    bool changed = false;
-    // Per-label nav state (currently-shown month/year in the popup), so more
-    // than one DatePickerButton on screen at once wouldn't fight over a single
-    // shared cursor -- keyed by label since that's already required to be
-    // unique per call site (it's what PushID above uses).
-    static std::map<std::string, std::pair<int, int>> s_nav;
 
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine();
-    std::string btnText = dateStr.empty() ? "Επιλογή..." : dateStr;
-    if (ImGui::Button(btnText.c_str(), ImVec2(160, 0))) {
-        int iy = 0, im = 0, id = 0;
-        std::time_t nowT = std::time(nullptr); std::tm nowTm{}; localtime_s(&nowTm, &nowT);
-        if (dateStr.size() == 10 && std::sscanf(dateStr.c_str(), "%d-%d-%d", &iy, &im, &id) == 3)
-            s_nav[label] = { iy, im };
-        else
-            s_nav[label] = { nowTm.tm_year + 1900, nowTm.tm_mon + 1 };
-        ImGui::OpenPopup("datepickerpopup");
-    }
-    if (ImGui::BeginPopup("datepickerpopup")) {
-        auto& nav = s_nav[label];
-        int& navY = nav.first; int& navM = nav.second;
-        if (ImGui::ArrowButton("##prevmonth", ImGuiDir_Left)) { navM--; if (navM < 1) { navM = 12; navY--; } }
-        ImGui::SameLine();
-        static const char* kMonthNames[] = { "Ιανουάριος","Φεβρουάριος","Μάρτιος","Απρίλιος","Μάιος","Ιούνιος",
-                                              "Ιούλιος","Αύγουστος","Σεπτέμβριος","Οκτώβριος","Νοέμβριος","Δεκέμβριος" };
-        ImGui::Text("%s %d", kMonthNames[navM - 1], navY);
-        ImGui::SameLine();
-        if (ImGui::ArrowButton("##nextmonth", ImGuiDir_Right)) { navM++; if (navM > 12) { navM = 1; navY++; } }
-
-        std::time_t nowT = std::time(nullptr); std::tm nowTm{}; localtime_s(&nowTm, &nowT);
-        int todayY = nowTm.tm_year + 1900, todayM = nowTm.tm_mon + 1, todayD = nowTm.tm_mday;
-
-        static const char* kDayHdr[] = { "Κυ","Δε","Τρ","Τε","Πε","Πα","Σα" };
-        if (ImGui::BeginTable("daygrid", 7, ImGuiTableFlags_SizingFixedFit)) {
-            for (int c = 0; c < 7; c++) ImGui::TableSetupColumn(kDayHdr[c]);
-            ImGui::TableHeadersRow();
-            int startDow = DayOfWeek(navY, navM, 1);
-            int dim = DaysInMonth(navY, navM);
-            int day = 1;
-            for (int row = 0; row < 6 && day <= dim; row++) {
-                ImGui::TableNextRow();
-                for (int col = 0; col < 7; col++) {
-                    ImGui::TableSetColumnIndex(col);
-                    if ((row == 0 && col < startDow) || day > dim) continue;
-                    // Strictly future only -- today itself is disabled too, per the
-                    // client ("ensures the date is in the future from now").
-                    bool isPastOrToday = (navY < todayY) || (navY == todayY && navM < todayM) ||
-                                          (navY == todayY && navM == todayM && day <= todayD);
-                    char lbl[8]; std::snprintf(lbl, sizeof(lbl), "%d", day);
-                    ImGui::PushID(day);
-                    if (isPastOrToday) {
-                        ImGui::BeginDisabled();
-                        ImGui::Selectable(lbl, false, 0, ImVec2(28, 22));
-                        ImGui::EndDisabled();
-                    } else {
-                        if (ImGui::Selectable(lbl, false, 0, ImVec2(28, 22))) {
-                            char buf[16]; std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", navY, navM, day);
-                            dateStr = buf;
-                            changed = true;
-                            ImGui::CloseCurrentPopup();
-                        }
-                    }
-                    ImGui::PopID();
-                    day++;
-                }
-            }
-            ImGui::EndTable();
-        }
-        ImGui::EndPopup();
-    }
-    ImGui::PopID();
-    return changed;
-}
 
 // ---------------------------------------------------------------------------
 // USERS SCREEN
 // ---------------------------------------------------------------------------
 static bool g_showUserDialog = false;
+static bool g_userDialogWasOpen = false;   // ← new
 static bool g_userDialogIsEdit = false;
 static int g_userDialogId = -1;
 static TextBuf ub_name, ub_phone, ub_addr, ub_area, ub_postal, ub_contract, ub_special;
@@ -363,8 +275,11 @@ static void OpenEditUser(const User& u) {
 }
 
 static void DrawUserDialog() {
+    if (g_showUserDialog && !g_userDialogWasOpen) {
+        ImGui::OpenPopup("Στοιχεία Ιδιοκτήτη");
+    }
+    g_userDialogWasOpen = g_showUserDialog;
     if (!g_showUserDialog) return;
-    ImGui::OpenPopup("Στοιχεία Ιδιοκτήτη");
     ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Στοιχεία Ιδιοκτήτη", &g_showUserDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::InputText("Ονοματεπώνυμο", ub_name.data, sizeof(ub_name.data));
@@ -413,9 +328,29 @@ static void DrawUserDialog() {
 // directly; the actual window-drawing functions are defined further down
 // (after the payment dialog they reuse) and invoked once per frame from the
 // main loop regardless of which tab is active.
-static int g_profileUserId = -1;    // >=0 opens the User Profile window
-static int g_detailServiceId = -1;  // >=0 opens the Service Detail window
-static int g_viewPaymentId = -1;    // >=0 opens the bare Payment Viewer window
+// Multi-window state: any number of each type can be open at once.
+// Opening the same ID twice is a no-op (push-if-absent), so clicking
+// the same row twice doesn't spawn a duplicate window. Closing a window
+// (X button) removes its entry, leaving the others untouched.
+static std::vector<int> g_profileUserIds;
+static std::vector<int> g_detailServiceIds;
+static std::vector<int> g_viewPaymentIds;
+
+static void OpenUserProfile(int id) {
+    if (id < 0) return;
+    if (std::find(g_profileUserIds.begin(), g_profileUserIds.end(), id) == g_profileUserIds.end())
+        g_profileUserIds.push_back(id);
+}
+static void OpenServiceDetail(int id) {
+    if (id < 0) return;
+    if (std::find(g_detailServiceIds.begin(), g_detailServiceIds.end(), id) == g_detailServiceIds.end())
+        g_detailServiceIds.push_back(id);
+}
+static void OpenPaymentView(int id) {
+    if (id < 0) return;
+    if (std::find(g_viewPaymentIds.begin(), g_viewPaymentIds.end(), id) == g_viewPaymentIds.end())
+        g_viewPaymentIds.push_back(id);
+}
 
 static char g_userSearch[128] = "";
 static void DrawUsersScreen() {
@@ -449,7 +384,7 @@ static void DrawUsersScreen() {
         ImGui::TextWrapped("%s", u.address.c_str());
         if (!u.special_code.empty()) ImGui::TextDisabled("Κωδ.: %s", u.special_code.c_str());
         ImGui::Spacing();
-        if (ImGui::SmallButton("Προφίλ")) g_profileUserId = u.id;
+        if (ImGui::SmallButton("Προφίλ")) OpenUserProfile(u.id);
         ImGui::SameLine();
         if (ImGui::SmallButton("Επεξ.")) OpenEditUser(u);
         ImGui::SameLine();
@@ -482,6 +417,7 @@ static void DrawUsersScreen() {
 // SERVICES SCREEN (single-owner services; joint services live on their own tab)
 // ---------------------------------------------------------------------------
 bool g_showServiceDialog = false;
+static bool g_serviceDialogWasOpen = false;
 bool g_serviceDialogIsEdit = false;
 int g_prefillOwnerUserId = -1;
 static int g_serviceDialogId = -1;
@@ -547,8 +483,11 @@ static void DrawPackageServiceForm() {
 }
 
 static void DrawServiceDialog() {
+    if (g_showServiceDialog && !g_serviceDialogWasOpen) {
+        ImGui::OpenPopup("Στοιχεία Υπηρεσίας");
+    }
+    g_serviceDialogWasOpen = g_showServiceDialog;
     if (!g_showServiceDialog) return;
-    ImGui::OpenPopup("Στοιχεία Υπηρεσίας");
     ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Στοιχεία Υπηρεσίας", &g_showServiceDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         if (!g_serviceDialogIsEdit) {
@@ -670,7 +609,7 @@ static void DrawServicesScreen() {
         ImGui::TextColored(ImVec4(0.5f,0.8f,1.0f,1), "%s", s.label.c_str());
         if (!s.extra_notes.empty()) ImGui::TextWrapped("%s", s.extra_notes.c_str());
         ImGui::Spacing();
-        if (ImGui::SmallButton("Άνοιγμα")) g_detailServiceId = s.id;
+        if (ImGui::SmallButton("Άνοιγμα")) OpenServiceDetail(s.id);
         ImGui::SameLine();
         if (ImGui::SmallButton("Επεξ.")) {
             g_serviceDialogIsEdit = true; g_serviceDialogId = s.id;
@@ -696,6 +635,7 @@ static void DrawServicesScreen() {
 // JOINT SERVICES SCREEN ("Κοινόχρηστες Υπηρεσίες")
 // ---------------------------------------------------------------------------
 static bool g_showJointDialog = false;
+static bool g_jointDialogWasOpen = false;
 static TextBuf jb_label, jb_notes;
 static std::vector<char> jb_selected; // parallel to g_app.users
 static TextBuf jb_newUserName, jb_newUserPhone;
@@ -708,8 +648,11 @@ static void OpenAddJoint() {
 }
 
 static void DrawJointDialog() {
+    if (g_showJointDialog && !g_jointDialogWasOpen) {
+        ImGui::OpenPopup("Νέα Κοινόχρηστη Υπηρεσία");
+    }
+    g_jointDialogWasOpen = g_showJointDialog;
     if (!g_showJointDialog) return;
-    ImGui::OpenPopup("Νέα Κοινόχρηστη Υπηρεσία");
     ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Νέα Κοινόχρηστη Υπηρεσία", &g_showJointDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::InputText("Ετικέτα", jb_label.data, sizeof(jb_label.data));
@@ -794,7 +737,7 @@ static void DrawJointServicesScreen() {
         ImGui::Text("Σύνολο οφειλής: %.2f €   Σύνολο πληρωμένο: %.2f €", j.totalDue, j.totalPaid);
         ImVec4 jNetCol = j.totalNet > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1);
         ImGui::TextColored(jNetCol, "Υπόλοιπο μέχρι μηδενισμού (πληρώθηκε - εισπράχθηκε): %.2f €", j.totalNet);
-        if (ImGui::SmallButton("Άνοιγμα")) g_detailServiceId = j.service.id;
+        if (ImGui::SmallButton("Άνοιγμα")) OpenServiceDetail(j.service.id);
         if (ImGui::BeginTable("roster", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, rosterH))) {
             ImGui::TableSetupColumn("Χρήστης");
             ImGui::TableSetupColumn("Οφειλή");
@@ -845,39 +788,45 @@ static void DrawMasterServicesScreen() {
     for (auto& ms : summaries) {
         ImGui::PushID(ms.masterService.id);
         float lineH = ImGui::GetTextLineHeightWithSpacing();
-        const float kRowH = 26.0f;
+        // Narrative layout per client request: package header sentence, then per
+        // component service a sub-header naming it, an "Εφαρμόζεται σε:" line, and
+        // one line per user ("-> Name -- Οφειλή: X€, Πληρωμένο: Y€") instead of a
+        // raw grid/table. Height must track this line count (same lesson as every
+        // other card-height bug in this file) -- not pixel-perfect since BeginCard
+        // now always has a scrollbar safety net, but close enough to avoid dead space.
         float innerH = 0.0f;
         for (size_t ci = 0; ci < ms.components.size(); ci++)
-            innerH += lineH /*component title/button line*/ + kRowH * (float)ms.componentRosters[ci].size() + 8.0f;
-        float cardH = lineH /*package title*/ + innerH + 24.0f /*padding*/;
+            innerH += lineH /*sub-header + Άνοιγμα*/ + lineH /*"Εφαρμόζεται σε:"*/
+                      + lineH * (float)ms.componentRosters[ci].size() /*per-user lines*/
+                      + (ms.componentRosters[ci].empty() ? lineH : 0.0f) /*"κανένας χρήστης" fallback*/
+                      + 10.0f /*spacing*/;
+        float cardH = lineH /*package header sentence*/ + innerH + 24.0f /*padding*/;
         BeginCard("card", ImVec2(ImGui::GetContentRegionAvail().x, cardH));
-        ImGui::TextColored(ImVec4(0.6f,0.9f,1.0f,1), "%s  (%zu υπηρεσίες)", ms.masterService.label.c_str(), ms.components.size());
+        ImGui::TextColored(ImVec4(0.6f,0.9f,1.0f,1), "Το πακέτο \"%s\" προσφέρει τις εξής υπηρεσίες:", ms.masterService.label.c_str());
         for (size_t ci = 0; ci < ms.components.size(); ci++) {
             Service& comp = ms.components[ci];
             auto& roster = ms.componentRosters[ci];
             ImGui::PushID(comp.id);
+            ImGui::Spacing();
             ImGui::Bullet(); ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.9f,0.9f,0.3f,1), "%s", comp.label.c_str());
             ImGui::SameLine();
-            if (ImGui::SmallButton("Άνοιγμα")) g_detailServiceId = comp.id;
-            if (ImGui::BeginTable("roster", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, kRowH * (float)roster.size() + 26.0f))) {
-                ImGui::TableSetupColumn("Χρήστης");
-                ImGui::TableSetupColumn("Οφειλή");
-                ImGui::TableSetupColumn("Πληρωμένο");
-                ImGui::TableHeadersRow();
+            if (ImGui::SmallButton("Άνοιγμα")) OpenServiceDetail(comp.id);
+            ImGui::Indent();
+            if (roster.empty()) {
+                ImGui::TextDisabled("Δεν εφαρμόζεται σε κανέναν χρήστη ακόμα.");
+            } else {
+                ImGui::TextDisabled("Εφαρμόζεται σε:");
                 for (auto& u : roster) {
                     double due = 0, paid = 0;
                     for (auto& p : allPayments) {
                         if (p.service_id != comp.id || p.user_id != u.id || p.status == "future") continue;
                         due += p.amount_due; paid += p.amount_paid;
                     }
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(u.full_name.c_str());
-                    ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", due);
-                    ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", paid);
+                    ImGui::Text("\xE2\x86\x92 %s \xE2\x80\x94 Οφειλή: %.2f\xE2\x82\xAC, Πληρωμένο: %.2f\xE2\x82\xAC", u.full_name.c_str(), due, paid);
                 }
-                ImGui::EndTable();
             }
+            ImGui::Unindent();
             ImGui::PopID();
         }
         EndCard();
@@ -892,7 +841,7 @@ static void DrawMasterServicesScreen() {
 // ---------------------------------------------------------------------------
 // PAYMENTS SCREEN (heaviest filter set, per spec)
 // ---------------------------------------------------------------------------
-static char g_payYearFrom[8] = "", g_payYearTo[8] = "", g_payMonthFrom[8] = "", g_payMonthTo[8] = "";
+static std::string g_payStartDate, g_payEndDate;
 static int g_payUserFilter = -1;
 static int g_payServiceFilter = -1;
 static int g_payStatusFilter = 0; // 0=all,1=future,2=resolved
@@ -927,6 +876,7 @@ static ImVec4 StatusColor(const std::string& status) {
 }
 
 static bool g_showPaymentDialog = false;
+static bool g_paymentDialogWasOpen = false;
 static bool g_paymentDialogIsEdit = false;
 static int g_paymentDialogId = -1;
 static int pb_userId = -1, pb_serviceId = -1;
@@ -936,7 +886,8 @@ static int pb_direction = 0; // 0 = in (collect from client), 1 = out (manager p
 // pending/overdue as user-selectable states -- old rows with those statuses still display
 // fine (anything != "future" is treated as resolved for coloring/counting).
 static bool pb_isFuture = false;
-static TextBuf pb_year, pb_month, pb_day, pb_due, pb_paid, pb_notes;
+static TextBuf pb_due, pb_paid, pb_notes;
+static std::string pb_dateStr;   // "YYYY-MM-DD" for the payment's own date
 // Resolution date is picked via the calendar popup (DatePickerButton), never
 // typed by hand -- a plain std::string, not a TextBuf, since there's no free
 // text entry for it anymore.
@@ -946,14 +897,17 @@ static void OpenAddPayment() {
     g_showPaymentDialog = true; g_paymentDialogIsEdit = false;
     pb_userId = g_app.users.empty() ? -1 : g_app.users[0].id;
     pb_serviceId = g_app.services.empty() ? -1 : g_app.services[0].id;
-    pb_year.set("2026"); pb_month.set("1"); pb_day.set("1");
+    pb_dateStr = CurrentDateString();
     pb_due.set("0"); pb_paid.set("0"); pb_notes.set(""); pb_resolutionDate.clear();
     pb_direction = 0; pb_isFuture = false;
 }
 
 static void DrawPaymentDialog() {
+    if (g_showPaymentDialog && !g_paymentDialogWasOpen) {
+        ImGui::OpenPopup("Στοιχεία Πληρωμής");
+    }
+    g_paymentDialogWasOpen = g_showPaymentDialog;
     if (!g_showPaymentDialog) return;
-    ImGui::OpenPopup("Στοιχεία Πληρωμής");
     ImGui::SetNextWindowSize(ImVec2(440, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Στοιχεία Πληρωμής", &g_showPaymentDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         if (ImGui::BeginCombo("Χρήστης", g_app.userName(pb_userId).c_str())) {
@@ -964,9 +918,8 @@ static void DrawPaymentDialog() {
             for (auto& s : g_app.services) if (ImGui::Selectable(s.label.c_str(), s.id == pb_serviceId)) pb_serviceId = s.id;
             ImGui::EndCombo();
         }
-        ImGui::InputText("Έτος", pb_year.data, sizeof(pb_year.data));
-        ImGui::InputText("Μήνας", pb_month.data, sizeof(pb_month.data));
-        ImGui::InputText("Ημέρα", pb_day.data, sizeof(pb_day.data));
+        ImGui::TextUnformatted("Ημερομηνία πληρωμής:");
+        DatePicker("paydate", pb_dateStr, ImVec2(0, 1));
         ImGui::Spacing();
         ImGui::TextDisabled("Τύπος:");
         ImGui::RadioButton("Είσπραξη από πελάτη", &pb_direction, 0);
@@ -980,7 +933,8 @@ static void DrawPaymentDialog() {
             // Real calendar popup, not handwritten text -- and the picker itself
             // refuses to let you click today or any past day, so the "must be in
             // the future from now" rule is enforced at selection time, not after.
-            DatePickerButton("Ημ/νία επίλυσης:", pb_resolutionDate);
+            ImGui::TextUnformatted("Ημ/νία επίλυσης:");
+            DatePicker("resdate", pb_resolutionDate, ImVec2(0, 1), /*futureOnly=*/true);
             ImGui::TextDisabled("Πότε αναμένεται αυτή η μελλοντική πληρωμή να γίνει πραγματική.");
         } else {
             ImGui::InputText("Πληρωμένο ποσό", pb_paid.data, sizeof(pb_paid.data));
@@ -992,7 +946,9 @@ static void DrawPaymentDialog() {
         if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) {
             Payment np;
             np.user_id = pb_userId; np.service_id = pb_serviceId;
-            np.year = atoi(pb_year.str().c_str()); np.month = atoi(pb_month.str().c_str()); np.day = atoi(pb_day.str().c_str());
+                        int iy = 0, im = 0, id = 0;
+            std::sscanf(pb_dateStr.c_str(), "%d-%d-%d", &iy, &im, &id);
+            np.year = iy; np.month = im; np.day = id;
             if (pb_isFuture) {
                 np.amount_due = atof(pb_due.str().c_str()); np.amount_paid = 0.0;
                 np.balance = np.amount_due;
@@ -1037,6 +993,7 @@ static void DrawPaymentDialog() {
 // explicitly leaves year/month/day (the initiation date) untouched.
 // ---------------------------------------------------------------------------
 static bool g_showResolveDialog = false;
+static bool g_resolveDialogWasOpen = false;
 static int g_resolveDialogId = -1;
 static TextBuf rb_paid;
 
@@ -1047,8 +1004,11 @@ static void OpenResolvePayment(const Payment& p) {
 }
 
 static void DrawResolveDialog() {
+    if (g_showResolveDialog && !g_resolveDialogWasOpen) {
+        ImGui::OpenPopup("Επίλυση Μελλοντικής Πληρωμής");
+    }
+    g_resolveDialogWasOpen = g_showResolveDialog;
     if (!g_showResolveDialog) return;
-    ImGui::OpenPopup("Επίλυση Μελλοντικής Πληρωμής");
     ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Επίλυση Μελλοντικής Πληρωμής", &g_showResolveDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         Payment p = g_app.conn->getPaymentById(g_resolveDialogId);
@@ -1089,10 +1049,12 @@ static void DrawPaymentsScreen() {
     if (ImGui::Button("Ανανέωση")) g_app.reloadPayments();
     ImGui::Separator();
     ImGui::TextDisabled("Φίλτρα:");
-    ImGui::SetNextItemWidth(60); ImGui::InputTextWithHint("##yf", "έτος από", g_payYearFrom, sizeof(g_payYearFrom)); ImGui::SameLine();
-    ImGui::SetNextItemWidth(60); ImGui::InputTextWithHint("##yt", "έτος έως", g_payYearTo, sizeof(g_payYearTo)); ImGui::SameLine();
-    ImGui::SetNextItemWidth(50); ImGui::InputTextWithHint("##mf", "μήνας από", g_payMonthFrom, sizeof(g_payMonthFrom)); ImGui::SameLine();
-    ImGui::SetNextItemWidth(50); ImGui::InputTextWithHint("##mt", "μήνας έως", g_payMonthTo, sizeof(g_payMonthTo));
+    ImGui::TextDisabled("Από:"); ImGui::SameLine();
+    DatePicker("payfilt_start", g_payStartDate, ImVec2(0, 1));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Έως:"); ImGui::SameLine();
+    DatePicker("payfilt_end", g_payEndDate, ImVec2(0, 1));
+    ImGui::SameLine();
 
     ImGui::SetNextItemWidth(180);
     if (ImGui::BeginCombo("Χρήστης##filt", g_payUserFilter < 0 ? "Όλοι" : g_app.userName(g_payUserFilter).c_str())) {
@@ -1115,14 +1077,13 @@ static void DrawPaymentsScreen() {
     ImGui::Combo("Τύπος##filt", &g_payDirectionFilter, kDirectionFilterNames, 3);
     ImGui::Separator();
 
-    int yf = atoi(g_payYearFrom), yt = atoi(g_payYearTo), mf = atoi(g_payMonthFrom), mt = atoi(g_payMonthTo);
     ImGui::BeginChild("paycards", ImVec2(0, 0), false);
     const float cardW = 260;
     for (auto& p : g_app.payments) {
-        if (yf > 0 && p.year < yf) continue;
-        if (yt > 0 && p.year > yt) continue;
-        if (mf > 0 && p.month < mf) continue;
-        if (mt > 0 && p.month > mt) continue;
+        char payDate[16];
+        std::snprintf(payDate, sizeof(payDate), "%04d-%02d-%02d", p.year, p.month, p.day);
+        if (!g_payStartDate.empty() && std::string(payDate) < g_payStartDate) continue;
+        if (!g_payEndDate.empty()   && std::string(payDate) > g_payEndDate)   continue;
         if (g_payUserFilter >= 0 && p.user_id != g_payUserFilter) continue;
         if (g_payServiceFilter >= 0 && p.service_id != g_payServiceFilter) continue;
         // Simplified status filter: 1=future, 2=resolved (anything that isn't "future" --
@@ -1153,12 +1114,14 @@ static void DrawPaymentsScreen() {
         if (showResDate) ImGui::TextDisabled("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
         if (showResolvedAt) ImGui::TextDisabled("Επιλύθηκε: %s", p.resolved_at.c_str());
         if (!p.notes.empty()) ImGui::TextWrapped("%s", p.notes.c_str());
-        if (ImGui::SmallButton("Προβολή")) g_viewPaymentId = p.id;
+        if (ImGui::SmallButton("Προβολή")) OpenPaymentView(p.id);
         ImGui::SameLine();
         if (ImGui::SmallButton("Επεξ.")) {
             g_paymentDialogIsEdit = true; g_paymentDialogId = p.id;
             pb_userId = p.user_id; pb_serviceId = p.service_id;
-            pb_year.set(std::to_string(p.year)); pb_month.set(std::to_string(p.month)); pb_day.set(std::to_string(p.day));
+                        char db[16];
+            std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
+            pb_dateStr = db;
             pb_due.set(std::to_string(p.amount_due)); pb_paid.set(std::to_string(p.amount_paid));
             pb_isFuture = (p.status == "future"); pb_notes.set(p.notes); pb_resolutionDate = p.resolution_date;
             pb_direction = p.direction == "out" ? 1 : 0;
@@ -1192,6 +1155,7 @@ static void DrawPaymentsScreen() {
 // matching how single-owner services already behave elsewhere); if it has more
 // than one (a joint service), a small picker asks which owner first.
 static bool g_showPayOwnerPick = false;
+static bool g_payOwnerPickWasOpen = false;
 static int g_payPickServiceId = -1;
 
 static void OpenAddPaymentForService(int serviceId) {
@@ -1208,8 +1172,11 @@ static void OpenAddPaymentForService(int serviceId) {
 }
 
 static void DrawPayOwnerPickPopup() {
+    if (g_showPayOwnerPick && !g_payOwnerPickWasOpen) {
+        ImGui::OpenPopup("Για ποιον ιδιοκτήτη είναι η πληρωμή;");
+    }
+    g_payOwnerPickWasOpen = g_showPayOwnerPick;
     if (!g_showPayOwnerPick) return;
-    ImGui::OpenPopup("Για ποιον ιδιοκτήτη είναι η πληρωμή;");
     ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Για ποιον ιδιοκτήτη είναι η πληρωμή;", &g_showPayOwnerPick, ImGuiWindowFlags_AlwaysAutoResize)) {
         auto roster = g_app.conn->getUsersForService(g_payPickServiceId);
@@ -1231,200 +1198,255 @@ static void DrawPayOwnerPickPopup() {
 // User Profile: the user's own info + every service tied to them (via the
 // service_users roster), each clickable through to its Service Detail window.
 static void DrawUserProfileWindow() {
-    if (g_profileUserId < 0) return;
-    User u = g_app.conn->getUserById(g_profileUserId);
-    bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(520, 500), ImGuiCond_Appearing);
-    ImGui::Begin(("Προφίλ: " + u.full_name).c_str(), &open);
-    ImGui::Text("Τηλέφωνο: %s", u.phone.c_str());
-    ImGui::Text("Περιοχή: %s", u.area.c_str());
-    ImGui::TextWrapped("Διεύθυνση: %s", u.address.c_str());
-    if (!u.postal_code.empty()) ImGui::Text("Τ.Κ.: %s", u.postal_code.c_str());
-    if (!u.contract_code.empty()) ImGui::Text("Κωδικός Συμβολαίου: %s", u.contract_code.c_str());
-    if (!u.special_code.empty()) ImGui::Text("Ειδικός Κωδικός: %s", u.special_code.c_str());
-    if (!u.created_at.empty()) ImGui::TextDisabled("Δημιουργήθηκε: %s", u.created_at.c_str());
-    if (ImGui::SmallButton("+ Υπηρεσία")) {
-        g_serviceDialogIsEdit = false;
-        g_prefillOwnerUserId = u.id;
-        ResetServiceDialogFields();
-        g_showServiceDialog = true;
-    }
-    ImGui::Separator();
+    // Snapshot the ID list: drawing a profile can push a new profile onto the
+    // vector via its own clickable children (unlikely but possible), so we
+    // iterate over a copy to avoid iterator invalidation.
+    std::vector<int> ids = g_profileUserIds;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        int uid = ids[i];
+        User u = g_app.conn->getUserById(uid);
+        bool open = true;
 
-    auto services = g_app.conn->getServicesForUser(u.id);
-    auto allPayments = g_app.conn->getPaymentsForUser(u.id); // cross-service, fetched once
+        // Cascade position: each open profile offset a bit from the previous,
+        // so multiple profiles don't spawn stacked on top of each other.
+        ImGuiIO& io = ImGui::GetIO();
+        float cascade = (float)i * 26.0f;
+        std::string title = "Προφίλ: " + u.full_name + "###profile_" + std::to_string(uid);
+        ImGui::SetNextWindowSize(ImVec2(560, 520), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 620.0f - cascade, 60.0f + cascade),
+                                ImGuiCond_FirstUseEver);
+        ImGui::Begin(title.c_str(), &open);
 
-    double totalDue = 0, totalPaid = 0, totalNet = 0;
-    // Pre-compute per-service totals from the single cross-service fetch above,
-    // instead of re-querying getPaymentsForService per row.
-    ImGui::BeginChild("profileBottom", ImVec2(0, -1), false);
-    float colW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-
-    // --- Left column: services, relabeled per client wording ---
-    ImGui::BeginChild("profileServicesCol", ImVec2(colW, -1), true);
-    ImGui::Text("Υπηρεσίες:");
-    ImGui::Separator();
-    for (auto& s : services) {
-        double due = 0, paid = 0, paidOut = 0, collected = 0;
-        int paymentCount = 0;
-        for (auto& p : allPayments) {
-            if (p.service_id != s.id) continue;
-            paymentCount++;
-            if (p.status == "future") continue;
-            due += p.amount_due; paid += p.amount_paid;
-            if (p.direction == "out") paidOut += p.amount_paid; else collected += p.amount_paid;
+        ImGui::Text("Τηλέφωνο: %s", u.phone.c_str());
+        ImGui::Text("Περιοχή: %s", u.area.c_str());
+        ImGui::TextWrapped("Διεύθυνση: %s", u.address.c_str());
+        if (!u.postal_code.empty()) ImGui::Text("Τ.Κ.: %s", u.postal_code.c_str());
+        if (!u.contract_code.empty()) ImGui::Text("Κωδικός Συμβολαίου: %s", u.contract_code.c_str());
+        if (!u.special_code.empty()) ImGui::Text("Ειδικός Κωδικός: %s", u.special_code.c_str());
+        if (!u.created_at.empty()) ImGui::TextDisabled("Δημιουργήθηκε: %s", u.created_at.c_str());
+        if (ImGui::SmallButton("+ Υπηρεσία")) {
+            g_serviceDialogIsEdit = false;
+            g_prefillOwnerUserId = u.id;
+            ResetServiceDialogFields();
+            g_showServiceDialog = true;
         }
-        double net = paidOut - collected;
-        totalDue += due; totalPaid += paid; totalNet += net;
-        ImGui::PushID(s.id);
-        ImGui::PushStyleColor(ImGuiCol_Text, net > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1));
-        bool sel = ImGui::Selectable(("Υπηρεσία: " + s.label + "  —  Σύνολο: " + std::to_string(paid) +
-                                       "  —  Πληρωμές: " + std::to_string(paymentCount)).c_str());
-        ImGui::PopStyleColor();
-        if (sel) g_detailServiceId = s.id;
-        ImGui::PopID();
+        ImGui::Separator();
+
+        auto services = g_app.conn->getServicesForUser(u.id);
+        auto allPayments = g_app.conn->getPaymentsForUser(u.id);
+
+        double totalDue = 0, totalPaid = 0, totalNet = 0;
+        ImGui::BeginChild("profileBottom", ImVec2(0, -1), false);
+        float colW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+        ImGui::BeginChild("profileServicesCol", ImVec2(colW, -1), true);
+        ImGui::Text("Υπηρεσίες:");
+        ImGui::Separator();
+        for (auto& s : services) {
+            double due = 0, paid = 0, paidOut = 0, collected = 0;
+            int paymentCount = 0;
+            for (auto& p : allPayments) {
+                if (p.service_id != s.id) continue;
+                paymentCount++;
+                if (p.status == "future") continue;
+                due += p.amount_due; paid += p.amount_paid;
+                if (p.direction == "out") paidOut += p.amount_paid; else collected += p.amount_paid;
+            }
+            double net = paidOut - collected;
+            totalDue += due; totalPaid += paid; totalNet += net;
+            ImGui::PushID(s.id);
+            ImGui::PushStyleColor(ImGuiCol_Text, net > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1));
+            bool sel = ImGui::Selectable(("Υπηρεσία: " + s.label + "  —  Σύνολο: " + std::to_string(paid) +
+                                           "  —  Πληρωμές: " + std::to_string(paymentCount)).c_str());
+            ImGui::PopStyleColor();
+            if (sel) OpenServiceDetail(s.id);
+            ImGui::PopID();
+        }
+        if (services.empty()) ImGui::TextDisabled("Καμία υπηρεσία ακόμα.");
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        ImGui::BeginChild("profilePaymentsCol", ImVec2(colW, -1), true);
+        ImGui::Text("Πληρωμές (όλες οι υπηρεσίες):");
+        ImGui::Separator();
+        for (auto& p : allPayments) {
+            ImGui::PushID(p.id);
+            std::string label = !p.notes.empty() ? p.notes
+                : (std::to_string(p.year) + "-" + std::to_string(p.month) + "-" + std::to_string(p.day));
+            std::string line = "Πληρωμή: " + label + "  —  " + std::to_string(p.amount_paid) +
+                                " €  —  " + g_app.serviceLabel(p.service_id);
+            ImGui::PushStyleColor(ImGuiCol_Text, DirectionColor(p.direction));
+            bool clicked = ImGui::Selectable(line.c_str());
+            ImGui::PopStyleColor();
+            if (clicked) OpenPaymentView(p.id);
+            ImGui::PopID();
+        }
+        if (allPayments.empty()) ImGui::TextDisabled("Καμία πληρωμή ακόμα.");
+        ImGui::EndChild();
+
+        ImGui::EndChild();
+        ImGui::Text("Σύνολο (όλες οι υπηρεσίες) - Οφειλή: %.2f  Πληρωμένο: %.2f", totalDue, totalPaid);
+        ImGui::TextColored(totalNet > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1),
+                            "Συνολικό υπόλοιπο μέχρι μηδενισμού: %.2f €", totalNet);
+        ImGui::End();
+
+        if (!open) {
+            g_profileUserIds.erase(std::remove(g_profileUserIds.begin(), g_profileUserIds.end(), uid),
+                                   g_profileUserIds.end());
+        }
     }
-    if (services.empty()) ImGui::TextDisabled("Καμία υπηρεσία ακόμα.");
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-
-    // --- Right column: every payment this user has ever made, across all services ---
-    ImGui::BeginChild("profilePaymentsCol", ImVec2(colW, -1), true);
-    ImGui::Text("Πληρωμές (όλες οι υπηρεσίες):");
-    ImGui::Separator();
-    for (auto& p : allPayments) {
-        ImGui::PushID(p.id);
-        std::string label = !p.notes.empty() ? p.notes
-            : (std::to_string(p.year) + "-" + std::to_string(p.month) + "-" + std::to_string(p.day));
-        std::string line = "Πληρωμή: " + label + "  —  " + std::to_string(p.amount_paid) +
-                            " €  —  " + g_app.serviceLabel(p.service_id);
-        ImGui::PushStyleColor(ImGuiCol_Text, DirectionColor(p.direction));
-        bool clicked = ImGui::Selectable(line.c_str());
-        ImGui::PopStyleColor();
-        if (clicked) g_viewPaymentId = p.id;
-        ImGui::PopID();
-    }
-    if (allPayments.empty()) ImGui::TextDisabled("Καμία πληρωμή ακόμα.");
-    ImGui::EndChild();
-
-    ImGui::EndChild();
-    ImGui::Text("Σύνολο (όλες οι υπηρεσίες) - Οφειλή: %.2f  Πληρωμένο: %.2f", totalDue, totalPaid);
-    ImGui::TextColored(totalNet > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1),
-                        "Συνολικό υπόλοιπο μέχρι μηδενισμού: %.2f €", totalNet);
-    ImGui::End();
-    if (!open) g_profileUserId = -1;
 }
+
 
 // Service Detail: differs by roster size. Single owner -> a flat payment list.
 // Joint (2+ owners) -> per-owner totals table (like the Joint screen) plus every
 // payment tagged with whose share it is.
 static void DrawServiceDetailWindow() {
-    if (g_detailServiceId < 0) return;
-    Service s = g_app.conn->getServiceById(g_detailServiceId);
-    auto roster = g_app.conn->getUsersForService(s.id);
-    bool joint = roster.size() > 1;
-    bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(600, 550), ImGuiCond_Appearing);
-    ImGui::Begin((std::string(joint ? "Κοινόχρηστη Υπηρεσία: " : "Υπηρεσία: ") + s.label).c_str(), &open);
-    if (!s.extra_notes.empty()) ImGui::TextWrapped("%s", s.extra_notes.c_str());
-    if (!s.created_at.empty()) ImGui::TextDisabled("Δημιουργήθηκε: %s", s.created_at.c_str());
-    if (!joint && !roster.empty()) {
-        ImGui::Text("Ιδιοκτήτης: %s", roster[0].full_name.c_str());
-        if (ImGui::SmallButton("Προφίλ Ιδιοκτήτη")) g_profileUserId = roster[0].id;
-    } else {
-        ImGui::Text("Συνιδιοκτήτες (%zu):", roster.size());
-        for (auto& ru : roster) {
-            ImGui::SameLine();
-            ImGui::PushID(ru.id);
-            if (ImGui::SmallButton(ru.full_name.c_str())) g_profileUserId = ru.id;
-            ImGui::PopID();
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("+ Πληρωμή")) OpenAddPaymentForService(s.id);
-    ImGui::Separator();
+    std::vector<int> ids = g_detailServiceIds;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        int sid = ids[i];
+        Service s = g_app.conn->getServiceById(sid);
+        auto roster = g_app.conn->getUsersForService(s.id);
+        bool joint = roster.size() > 1;
+        bool open = true;
 
-    auto payments = g_app.conn->getPaymentsForService(s.id);
-    // Direction-aware net: e.g. you pay a bill in advance for the client (direction=out),
-    // then collect it back from them (direction=in) -- this is what should trend to zero,
-    // not the raw due/paid sums, which would conflate the two directions.
-    double paidOut = 0, collected = 0, pendingCollect = 0, pendingPay = 0;
-    for (auto& p : payments) {
-        if (p.status == "future") continue;
-        if (p.direction == "out") {
-            if (p.status == "paid") paidOut += p.amount_paid; else pendingPay += p.balance;
+        ImGuiIO& io = ImGui::GetIO();
+        float cascade = (float)i * 26.0f;
+        std::string title = std::string(joint ? "Κοινόχρηστη Υπηρεσία: " : "Υπηρεσία: ") + s.label
+                          + "###service_" + std::to_string(sid);
+        ImGui::SetNextWindowSize(ImVec2(640, 560), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 700.0f - cascade, 100.0f + cascade),
+                                ImGuiCond_FirstUseEver);
+        ImGui::Begin(title.c_str(), &open);
+
+        if (!s.extra_notes.empty()) ImGui::TextWrapped("%s", s.extra_notes.c_str());
+        if (!s.created_at.empty()) ImGui::TextDisabled("Δημιουργήθηκε: %s", s.created_at.c_str());
+        if (!joint && !roster.empty()) {
+            ImGui::Text("Ιδιοκτήτης: %s", roster[0].full_name.c_str());
+            if (ImGui::SmallButton("Προφίλ Ιδιοκτήτη")) OpenUserProfile(roster[0].id);
         } else {
-            if (p.status == "paid") collected += p.amount_paid; else pendingCollect += p.balance;
-        }
-    }
-    double net = paidOut - collected; // >0: client still owes this service; <=0: settled/ahead
-    ImGui::Text("Πληρώθηκε (για λογαριασμό πελάτη): %.2f €   Εισπράχθηκε: %.2f €", paidOut, collected);
-    ImVec4 netCol = net > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1);
-    ImGui::TextColored(netCol, "Υπόλοιπο μέχρι μηδενισμού: %.2f €  (%s)", net,
-                        net > 0.005 ? "ο πελάτης χρωστάει ακόμα" : "μηδενισμένο / πιστωτικό");
-    if (pendingCollect > 0.005) ImGui::TextDisabled("Εκκρεμεί προς είσπραξη: %.2f €", pendingCollect);
-    if (pendingPay > 0.005) ImGui::TextDisabled("Εκκρεμεί προς πληρωμή: %.2f €", pendingPay);
-    ImGui::Text("Πληρωμές:");
-    ImGui::BeginChild("svcPayments", ImVec2(0, -1), true);
-    for (auto& p : payments) {
-        ImGui::PushID(p.id);
-        std::string line = std::string(DirectionBadge(p.direction)) + "  " +
-            (joint ? g_app.userName(p.user_id) + "  |  " : std::string()) +
-            std::to_string(p.year) + "-" + std::to_string(p.month) + "-" + std::to_string(p.day) +
-            "  " + p.status + "  " + std::to_string(p.amount_paid) + "/" + std::to_string(p.amount_due) +
-            (p.status == "future" && !p.resolution_date.empty() ? "  (αναμ. " + p.resolution_date + ")" : std::string());
-        ImGui::PushStyleColor(ImGuiCol_Text, DirectionColor(p.direction));
-        bool clicked = ImGui::Selectable(line.c_str());
-        ImGui::PopStyleColor();
-        if (clicked) g_viewPaymentId = p.id;
-        if (p.status == "future") {
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Επίλυση")) OpenResolvePayment(p);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Επεξ.")) {
-                g_paymentDialogIsEdit = true; g_paymentDialogId = p.id;
-                pb_userId = p.user_id; pb_serviceId = p.service_id;
-                pb_year.set(std::to_string(p.year)); pb_month.set(std::to_string(p.month)); pb_day.set(std::to_string(p.day));
-                pb_due.set(std::to_string(p.amount_due)); pb_paid.set(std::to_string(p.amount_paid));
-                pb_isFuture = (p.status == "future"); pb_notes.set(p.notes); pb_resolutionDate = p.resolution_date;
-                pb_direction = p.direction == "out" ? 1 : 0;
-                g_showPaymentDialog = true;
+            ImGui::Text("Συνιδιοκτήτες (%zu):", roster.size());
+            for (auto& ru : roster) {
+                ImGui::SameLine();
+                ImGui::PushID(ru.id);
+                if (ImGui::SmallButton(ru.full_name.c_str())) OpenUserProfile(ru.id);
+                ImGui::PopID();
             }
         }
-        ImGui::PopID();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+ Πληρωμή")) OpenAddPaymentForService(s.id);
+        ImGui::Separator();
+
+        auto payments = g_app.conn->getPaymentsForService(s.id);
+        double paidOut = 0, collected = 0, pendingCollect = 0, pendingPay = 0;
+        for (auto& p : payments) {
+            if (p.status == "future") continue;
+            if (p.direction == "out") {
+                if (p.status == "paid") paidOut += p.amount_paid; else pendingPay += p.balance;
+            } else {
+                if (p.status == "paid") collected += p.amount_paid; else pendingCollect += p.balance;
+            }
+        }
+        double net = paidOut - collected;
+        ImGui::Text("Πληρώθηκε (για λογαριασμό πελάτη): %.2f €   Εισπράχθηκε: %.2f €", paidOut, collected);
+        ImVec4 netCol = net > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1);
+        ImGui::TextColored(netCol, "Υπόλοιπο μέχρι μηδενισμού: %.2f €  (%s)", net,
+                            net > 0.005 ? "ο πελάτης χρωστάει ακόμα" : "μηδενισμένο / πιστωτικό");
+        if (pendingCollect > 0.005) ImGui::TextDisabled("Εκκρεμεί προς είσπραξη: %.2f €", pendingCollect);
+        if (pendingPay > 0.005) ImGui::TextDisabled("Εκκρεμεί προς πληρωμή: %.2f €", pendingPay);
+        ImGui::Text("Πληρωμές:");
+        ImGui::BeginChild("svcPayments", ImVec2(0, -1), true);
+        for (auto& p : payments) {
+            ImGui::PushID(p.id);
+            std::string line = std::string(DirectionBadge(p.direction)) + "  " +
+                (joint ? g_app.userName(p.user_id) + "  |  " : std::string()) +
+                std::to_string(p.year) + "-" + std::to_string(p.month) + "-" + std::to_string(p.day) +
+                "  " + p.status + "  " + std::to_string(p.amount_paid) + "/" + std::to_string(p.amount_due) +
+                (p.status == "future" && !p.resolution_date.empty() ? "  (αναμ. " + p.resolution_date + ")" : std::string());
+            ImGui::PushStyleColor(ImGuiCol_Text, DirectionColor(p.direction));
+            bool clicked = ImGui::Selectable(line.c_str());
+            ImGui::PopStyleColor();
+            if (clicked) OpenPaymentView(p.id);
+            if (p.status == "future") {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Επίλυση")) OpenResolvePayment(p);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Επεξ.")) {
+                    g_paymentDialogIsEdit = true; g_paymentDialogId = p.id;
+                    pb_userId = p.user_id; pb_serviceId = p.service_id;
+                    char db[16];
+                    std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
+                    pb_dateStr = db;
+                    pb_due.set(std::to_string(p.amount_due)); pb_paid.set(std::to_string(p.amount_paid));
+                    pb_isFuture = (p.status == "future"); pb_notes.set(p.notes); pb_resolutionDate = p.resolution_date;
+                    pb_direction = p.direction == "out" ? 1 : 0;
+                    g_showPaymentDialog = true;
+                }
+            }
+            ImGui::PopID();
+        }
+        if (payments.empty()) ImGui::TextDisabled("Καμία πληρωμή ακόμα.");
+        ImGui::EndChild();
+        ImGui::End();
+
+        if (!open) {
+            g_detailServiceIds.erase(std::remove(g_detailServiceIds.begin(), g_detailServiceIds.end(), sid),
+                                     g_detailServiceIds.end());
+        }
     }
-    if (payments.empty()) ImGui::TextDisabled("Καμία πληρωμή ακόμα.");
-    ImGui::EndChild();
-    ImGui::End();
-    if (!open) g_detailServiceId = -1;
 }
+
 
 // Payment Viewer: the bare minimum, read-only, nowhere further to go.
 static void DrawPaymentViewWindow() {
-    if (g_viewPaymentId < 0) return;
-    Payment p = g_app.conn->getPaymentById(g_viewPaymentId);
-    bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_Appearing);
-    ImGui::Begin("Πληρωμή", &open);
-    ImGui::TextColored(DirectionColor(p.direction), "%s", DirectionBadge(p.direction));
-    ImGui::Text("Ιδιοκτήτης: %s", g_app.userName(p.user_id).c_str());
-    ImGui::Text("Υπηρεσία: %s", g_app.serviceLabel(p.service_id).c_str());
-    ImGui::Text("Ημερομηνία: %04d-%02d-%02d", p.year, p.month, p.day);
-    ImGui::Text("Οφειλόμενο: %.2f €", p.amount_due);
-    ImGui::Text("Πληρωμένο: %.2f €", p.amount_paid);
-    ImGui::Text("Κατάσταση: %s", p.status.c_str());
-    if (p.status == "future" && !p.resolution_date.empty()) ImGui::Text("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
-    if (!p.resolved_at.empty()) ImGui::TextDisabled("Επιλύθηκε στις: %s", p.resolved_at.c_str());
-    if (!p.notes.empty()) ImGui::TextWrapped("Σημειώσεις: %s", p.notes.c_str());
-    ImGui::End();
-    if (!open) g_viewPaymentId = -1;
+    std::vector<int> ids = g_viewPaymentIds;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        int pid = ids[i];
+        Payment p = g_app.conn->getPaymentById(pid);
+        bool open = true;
+
+        ImGuiIO& io = ImGui::GetIO();
+        float cascade = (float)i * 26.0f;
+        std::string title = "Πληρωμή #" + std::to_string(pid) + "###payment_" + std::to_string(pid);
+        ImGui::SetNextWindowSize(ImVec2(400, 0), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 440.0f - cascade, 80.0f + cascade),
+                                ImGuiCond_FirstUseEver);
+        ImGui::Begin(title.c_str(), &open);
+
+        ImGui::TextColored(DirectionColor(p.direction), "%s", DirectionBadge(p.direction));
+        ImGui::Separator();
+
+        // Clickable: opens a *new* profile / service window (or focuses the
+        // existing one if this exact id already has a window open).
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.72f, 1.0f, 1.0f));
+        if (ImGui::Selectable(("Ιδιοκτήτης: " + g_app.userName(p.user_id)).c_str()))
+            OpenUserProfile(p.user_id);
+        if (ImGui::Selectable(("Υπηρεσία: " + g_app.serviceLabel(p.service_id)).c_str()))
+            OpenServiceDetail(p.service_id);
+        ImGui::PopStyleColor();
+
+        ImGui::Separator();
+        ImGui::Text("Ημερομηνία: %04d-%02d-%02d", p.year, p.month, p.day);
+        ImGui::Text("Οφειλόμενο: %.2f €", p.amount_due);
+        ImGui::Text("Πληρωμένο: %.2f €", p.amount_paid);
+        ImGui::Text("Κατάσταση: %s", p.status.c_str());
+        if (p.status == "future" && !p.resolution_date.empty()) ImGui::Text("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
+        if (!p.resolved_at.empty()) ImGui::TextDisabled("Επιλύθηκε στις: %s", p.resolved_at.c_str());
+        if (!p.notes.empty()) ImGui::TextWrapped("Σημειώσεις: %s", p.notes.c_str());
+        ImGui::End();
+
+        if (!open) {
+            g_viewPaymentIds.erase(std::remove(g_viewPaymentIds.begin(), g_viewPaymentIds.end(), pid),
+                                   g_viewPaymentIds.end());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // DASHBOARD / TIMELINE SCREEN ("Αρχική")
 // ---------------------------------------------------------------------------
-static char g_dashYearFrom[8] = "", g_dashYearTo[8] = "";
+static std::string g_dashStartDate, g_dashEndDate;
 static int g_dashUserFilter = -1, g_dashServiceFilter = -1;
 static bool g_showNotifPopup = false;
 
@@ -1436,13 +1458,241 @@ static int g_dashPageOffset = 0;
 static const int kDashPageSize = 20;
 // Snapshot of the filter values as of the last frame, used purely to detect a
 // change and reset paging -- compared by value every frame, cheap at this scale.
-static char g_dashYearFromPrev[8] = "", g_dashYearToPrev[8] = "";
+static std::string g_dashStartDatePrev, g_dashEndDatePrev;
 static int g_dashUserFilterPrev = -1, g_dashServiceFilterPrev = -1;
-// Set true whenever the timeline content is rebuilt in a way that should snap the
-// scroll position back to the boundary between future (dimmed, above) and resolved
-// (below) entries -- i.e. right after the future-payments section -- so the user
-// lands on "now" instead of at the very top of the future list.
+// Set true whenever the timeline is rebuilt (filter change / chip switch /
+// refresh) so the scroll position snaps back to the top -- the newest entries
+// are always what the user lands on. (Historical name kept; the boundary
+// divider it used to snap to no longer exists.)
 static bool g_dashScrollToBoundary = true;
+// Quick type filter above the timeline: 0 = Όλα, 1 = μόνο εισπράξεις (in),
+// 2 = μόνο πληρωμές (out), 3 = μόνο μελλοντικές. Does NOT affect the stat
+// tiles above -- those always reflect the full filtered set.
+static int g_dashTypeFilter = 0;
+
+// --- Phone-book-style picker state ------------------------------------------
+// Each picker owns its own search text, letter filter, sort direction, and page
+// offset. Only one page of rows is fetched from the DB per frame while the
+// popup is open (kXxxPickerPageSize), so the pickers stay cheap even when the
+// users/services tables are huge -- the full tables are never loaded just to
+// render the filter row.
+static char g_userPickerSearch[128] = "";
+// Multi-select letter filter: click a letter to add it to the active set,
+// click it again to remove it. "Όλοι" clears the whole set (no letter filter).
+// Empty set = no filtering. Non-empty set = names starting with ANY of them.
+static std::set<std::string> g_userPickerLetters;
+static bool g_userPickerReverse = false;    // false = Α→Ω, true = Ω→Α
+static int g_userPickerOffset = 0;
+static const int kUserPickerPageSize = 20;
+
+static char g_servicePickerSearch[128] = "";
+static int g_servicePickerOffset = 0;
+static const int kServicePickerPageSize = 20;
+
+// Phone-book user picker: label on left with colon, then a button showing the
+// current selection, which opens a dictionary-style popup with a Greek-letter
+// strip (jump to first letter), a name search, an A→Z / Z→A toggle, and paged
+// rows. Selecting a row sets `selectedUserId` and closes the popup.
+static void DrawUserFilterPicker(const char* label, int& selectedUserId, float width) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+
+    std::string preview = (selectedUserId < 0) ? "Όλοι" : g_app.userName(selectedUserId);
+    ImGui::PushID(label);
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::Button((preview + " ▼").c_str(), ImVec2(width, 0))) {
+        g_userPickerOffset = 0;
+        ImGui::OpenPopup("##userpicker");
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopup("##userpicker")) {
+        ImGui::TextDisabled("Επιλογή ιδιοκτήτη");
+        ImGui::Separator();
+
+                // Greek-letter strip: Όλοι + Α..Ω, wraps every 13 buttons.
+        // Letters are TOGGLES: click to activate (adds to the filter set),
+        // click again to deactivate (removes it). Multiple letters can be
+        // active at once -- names starting with ANY active letter match.
+        // "Όλοι" is active (and clicking it) when the set is empty.
+        static const char* kLetters[] = {
+            "Α","Β","Γ","Δ","Ε","Ζ","Η","Θ","Ι","Κ","Λ","Μ",
+            "Ν","Ξ","Ο","Π","Ρ","Σ","Τ","Υ","Φ","Χ","Ψ","Ω"
+        };
+        const int kTotal = 1 + IM_ARRAYSIZE(kLetters);
+        const int kPerRow = 13;
+        for (int i = 0; i < kTotal; i++) {
+            if (i > 0 && (i % kPerRow) != 0) ImGui::SameLine();
+            if (i == 0) {
+                bool active = g_userPickerLetters.empty();
+                if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f,0.55f,0.75f,1.0f));
+                if (ImGui::SmallButton("Όλοι")) { g_userPickerLetters.clear(); g_userPickerOffset = 0; }
+                if (active) ImGui::PopStyleColor();
+            } else {
+                const char* L = kLetters[i - 1];
+                bool active = (g_userPickerLetters.count(L) > 0);
+                if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f,0.55f,0.75f,1.0f));
+                ImGui::PushID(i);
+                if (ImGui::SmallButton(L)) {
+                    // Toggle: if it's already active, remove it; otherwise add it.
+                    if (active) g_userPickerLetters.erase(L);
+                    else        g_userPickerLetters.insert(L);
+                    g_userPickerOffset = 0;
+                }
+                ImGui::PopID();
+                if (active) ImGui::PopStyleColor();
+            }
+        }
+
+        ImGui::Separator();
+
+        // Search + sort toggle
+        ImGui::SetNextItemWidth(280);
+        if (ImGui::InputTextWithHint("##userpickersearch", "Αναζήτηση ονόματος...",
+                                     g_userPickerSearch, sizeof(g_userPickerSearch))) {
+            g_userPickerOffset = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(g_userPickerReverse ? "Ω → Α" : "Α → Ω")) {
+            g_userPickerReverse = !g_userPickerReverse;
+            g_userPickerOffset = 0;
+        }
+
+        ImGui::Separator();
+
+        // Fetch this page + count in one shot per frame while popup is open.
+                // Fetch this page + count in one shot per frame while popup is open.
+        // The letter set is copied into a vector just before the call (that's
+        // what the SQL builder expects); empty vector = no letter filtering.
+        std::vector<std::string> lettersVec(g_userPickerLetters.begin(),
+                                            g_userPickerLetters.end());
+        std::vector<User> rows = g_app.conn->pickerUsers(
+            lettersVec, g_userPickerSearch,
+            g_userPickerOffset, kUserPickerPageSize, g_userPickerReverse);
+        int total = g_app.conn->pickerUsersCount(lettersVec, g_userPickerSearch);
+
+        ImGui::BeginChild("##userpickerlist", ImVec2(400, 320), true);
+        if (rows.empty()) {
+            ImGui::TextDisabled("Καμία εγγραφή.");
+        }
+        std::string lastInitial;
+        for (auto& u : rows) {
+            // Section header whenever the first byte(s) of the name change.
+            std::string initial;
+            if (!u.full_name.empty()) {
+                unsigned char c = (unsigned char)u.full_name[0];
+                if (c < 0x80) initial = std::string(1, (char)c);
+                else if ((c & 0xE0) == 0xC0 && u.full_name.size() >= 2) initial = u.full_name.substr(0, 2);
+                else if ((c & 0xF0) == 0xE0 && u.full_name.size() >= 3) initial = u.full_name.substr(0, 3);
+                else initial = std::string(1, (char)c);
+            }
+            if (initial != lastInitial) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("— %s —", initial.c_str());
+                lastInitial = initial;
+            }
+            ImGui::PushID(u.id);
+            if (ImGui::Selectable(u.full_name.c_str(), u.id == selectedUserId)) {
+                selectedUserId = u.id;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        int showingEnd = std::min(g_userPickerOffset + (int)rows.size(), total);
+        ImGui::TextDisabled("Εμφάνιση %d-%d από %d",
+                            rows.empty() ? 0 : g_userPickerOffset + 1, showingEnd, total);
+        ImGui::SameLine();
+        if (g_userPickerOffset > 0) {
+            if (ImGui::SmallButton("← Προηγ.")) g_userPickerOffset = std::max(0, g_userPickerOffset - kUserPickerPageSize);
+        } else { ImGui::BeginDisabled(); ImGui::SmallButton("← Προηγ."); ImGui::EndDisabled(); }
+        ImGui::SameLine();
+        if (showingEnd < total) {
+            if (ImGui::SmallButton("Επόμενα →")) g_userPickerOffset += kUserPickerPageSize;
+        } else { ImGui::BeginDisabled(); ImGui::SmallButton("Επόμενα →"); ImGui::EndDisabled(); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Καθαρισμός")) {
+            selectedUserId = -1;
+            g_userPickerSearch[0] = 0;
+            g_userPickerLetters.clear();
+            g_userPickerReverse = false;
+            g_userPickerOffset = 0;
+        }
+
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+}
+
+// Service picker: label on left, button showing current selection, popup with
+// a name search and paged rows (no letter strip -- the user asked for a simple
+// searchable dropdown here).
+static void DrawServiceFilterPicker(const char* label, int& selectedServiceId, float width) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+
+    std::string preview = (selectedServiceId < 0) ? "Όλες" : g_app.serviceLabel(selectedServiceId);
+    ImGui::PushID(label);
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::Button((preview + " ▼").c_str(), ImVec2(width, 0))) {
+        g_servicePickerOffset = 0;
+        ImGui::OpenPopup("##servicepicker");
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopup("##servicepicker")) {
+        ImGui::TextDisabled("Επιλογή υπηρεσίας");
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(280);
+        if (ImGui::InputTextWithHint("##servicepickersearch", "Αναζήτηση υπηρεσίας...",
+                                     g_servicePickerSearch, sizeof(g_servicePickerSearch))) {
+            g_servicePickerOffset = 0;
+        }
+
+        ImGui::Separator();
+
+        std::vector<Service> rows = g_app.conn->pickerServices(
+            g_servicePickerSearch, g_servicePickerOffset, kServicePickerPageSize);
+        int total = g_app.conn->pickerServicesCount(g_servicePickerSearch);
+
+        ImGui::BeginChild("##servicepickerlist", ImVec2(400, 320), true);
+        if (rows.empty()) ImGui::TextDisabled("Καμία εγγραφή.");
+        for (auto& s : rows) {
+            ImGui::PushID(s.id);
+            if (ImGui::Selectable(s.label.c_str(), s.id == selectedServiceId)) {
+                selectedServiceId = s.id;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        int showingEnd = std::min(g_servicePickerOffset + (int)rows.size(), total);
+        ImGui::TextDisabled("Εμφάνιση %d-%d από %d",
+                            rows.empty() ? 0 : g_servicePickerOffset + 1, showingEnd, total);
+        ImGui::SameLine();
+        if (g_servicePickerOffset > 0) {
+            if (ImGui::SmallButton("← Προηγ.")) g_servicePickerOffset = std::max(0, g_servicePickerOffset - kServicePickerPageSize);
+        } else { ImGui::BeginDisabled(); ImGui::SmallButton("← Προηγ."); ImGui::EndDisabled(); }
+        ImGui::SameLine();
+        if (showingEnd < total) {
+            if (ImGui::SmallButton("Επόμενα →")) g_servicePickerOffset += kServicePickerPageSize;
+        } else { ImGui::BeginDisabled(); ImGui::SmallButton("Επόμενα →"); ImGui::EndDisabled(); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Καθαρισμός")) {
+            selectedServiceId = -1;
+            g_servicePickerSearch[0] = 0;
+            g_servicePickerOffset = 0;
+        }
+
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+}
 
 // Small stat tile used across the top of the dashboard: big bold value, small
 // label under it, optional accent color and subtitle (e.g. period-over-period).
@@ -1482,75 +1732,113 @@ static int DaysUntilDate(const std::string& dateStr) {
     return (int)std::round(std::difftime(targetT, nowNoon) / 86400.0);
 }
 
-// Whole days between two Y/M/D calendar dates (b - a), used to place the weekly
-// ruler markers on the timeline spine at real 7-day intervals rather than every
-// N rows (row spacing != calendar spacing once multiple payments land on one day).
-static int DaysBetweenYMD(int ay, int am, int ad, int by, int bm, int bd) {
-    std::tm ta{}; ta.tm_year = ay - 1900; ta.tm_mon = am - 1; ta.tm_mday = ad; ta.tm_hour = 12;
-    std::tm tb{}; tb.tm_year = by - 1900; tb.tm_mon = bm - 1; tb.tm_mday = bd; tb.tm_hour = 12;
-    std::time_t at = std::mktime(&ta), bt = std::mktime(&tb);
-    if (at == (std::time_t)-1 || bt == (std::time_t)-1) return 0;
-    return (int)std::round(std::difftime(bt, at) / 86400.0);
+
+// Full-width day section banner: "Πέμπτη, 20 Αυγούστου 2026 · Σήμερα" on the
+// left, that day's net total on the right. Each day's rows stack under their
+// banner, giving the timeline a banking-app look. Replaces both the old
+// muted two-line "Σήμερα/Χθες" header and the removed weekly ruler markers.
+static void DrawDaySectionHeader(int year, int month, int day,
+                                  int curYear, int curMonth, int curDay,
+                                  double dayNet) {
+    static const char* kWeekday[] = { "Κυριακή","Δευτέρα","Τρίτη","Τετάρτη","Πέμπτη","Παρασκευή","Σάββατο" };
+    static const char* kMonthNames[] = { "Ιανουαρίου","Φεβρουαρίου","Μαρτίου","Απριλίου","Μαΐου","Ιουνίου",
+                                          "Ιουλίου","Αυγούστου","Σεπτεμβρίου","Οκτωβρίου","Νοεμβρίου","Δεκεμβρίου" };
+    auto dow = [](int y, int m, int d) {
+        static const int t[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+        if (m < 3) y -= 1;
+        return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+    };
+
+    // "Σήμερα" / "Χθες" suffix, same rules as before.
+    std::tm t{}; t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day; t.tm_hour = 12;
+    std::time_t dT = std::mktime(&t);
+    std::tm c{}; c.tm_year = curYear - 1900; c.tm_mon = curMonth - 1; c.tm_mday = curDay; c.tm_hour = 12;
+    std::time_t cT = std::mktime(&c);
+    double diffDays = (dT != (std::time_t)-1 && cT != (std::time_t)-1) ? std::difftime(cT, dT) / 86400.0 : 999.0;
+    const char* suffix = "";
+    if (year == curYear && month == curMonth && day == curDay) suffix = "  ·  Σήμερα";
+    else if (diffDays >= 0.5 && diffDays < 1.5) suffix = "  ·  Χθες";
+
+    char dateBuf[96];
+    std::snprintf(dateBuf, sizeof(dateBuf), "%s, %d %s %d%s",
+                  kWeekday[dow(year, month, day)], day, kMonthNames[month - 1], year, suffix);
+
+    float w = ImGui::GetContentRegionAvail().x;
+    const float hdrH = 36.0f;
+    std::string dayId = "day_" + std::to_string(year) + "_" + std::to_string(month) + "_" + std::to_string(day);
+    ImGui::PushID(dayId.c_str());
+    // Distinct background so the banner reads as a section tab, not a row.
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.16f, 0.19f, 0.24f, 0.65f));
+        BeginCard("dayhdr", ImVec2(w, hdrH), /*noScroll=*/true);
+
+    ImGui::SetCursorPos(ImVec2(14, 8));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.91f, 0.98f, 1.0f));
+    ImGui::TextUnformatted(dateBuf);
+    ImGui::PopStyleColor();
+
+    ImGui::SetCursorPos(ImVec2(std::max(200.0f, w - 170.0f), 8));
+    ImVec4 netCol = dayNet >= 0 ? ImVec4(0.35f,0.80f,0.50f,1) : ImVec4(0.90f,0.40f,0.40f,1);
+    ImGui::PushStyleColor(ImGuiCol_Text, netCol);
+    ImGui::Text("%s%.2f €", dayNet >= 0 ? "+" : "", dayNet);
+    ImGui::PopStyleColor();
+
+    EndCard();
+    ImGui::PopStyleColor();
+    ImGui::PopID();
 }
 
-// Banking-app-style day-group header ("Σήμερα" / "Χθες" / plain date), drawn once
-// per distinct calendar date as the centered timeline scrolls past a new day.
-static void DrawDayHeader(int year, int month, int day, int curYear, int curMonth, int curDay) {
-    std::string label;
-    if (year == curYear && month == curMonth && day == curDay) label = "Σήμερα";
-    else {
-        std::tm t{}; t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day; t.tm_hour = 12;
-        std::time_t dT = std::mktime(&t);
-        std::tm c{}; c.tm_year = curYear - 1900; c.tm_mon = curMonth - 1; c.tm_mday = curDay; c.tm_hour = 12;
-        std::time_t cT = std::mktime(&c);
-        double diffDays = (dT != (std::time_t)-1 && cT != (std::time_t)-1) ? std::difftime(cT, dT) / 86400.0 : 999.0;
-        if (diffDays >= 0.5 && diffDays < 1.5) label = "Χθες";
-    }
-    if (label.empty()) { char b[16]; std::snprintf(b, sizeof(b), "%04d-%02d-%02d", year, month, day); label = b; }
-    ImGui::Spacing();
-    ImGui::TextDisabled("%s", label.c_str());
-    ImGui::Spacing();
-}
-
-// One timeline entry: a tight, minimal card -- counterparty/service on the left,
-// a clear right-aligned +/- amount on the right, banking-app style. The date is
-// carried by the day-group header above it, not repeated per row. Clicking
-// anywhere on the row opens the existing read-only Payment Viewer window.
+// One timeline row: circular direction arrow at the left, owner name on top
+// with the service label under it, amount on the right. Two-line layout so
+// the full-width card reads like a bank statement entry rather than the old
+// cramped one-liner. Date is carried by the day-section banner above, not
+// repeated per row.
 static void DrawTimelineRow(const Payment& p, bool faded) {
     ImGui::PushID(p.id);
     float w = ImGui::GetContentRegionAvail().x;
-    const float rowH = 44.0f; // one line of content, tight padding -- "nice and tidy"
-    if (faded) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
-    BeginCard("row", ImVec2(w, rowH));
+    const float rowH = 54.0f;
+    if (faded) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.60f);
+        BeginCard("row", ImVec2(w, rowH), /*noScroll=*/true);
 
-    // Direction badge line removed here: it was a second line of text inside a
-    // card only sized for one (rowH=44), so it visibly clipped/overlapped the
-    // card's bottom border. It was also redundant -- the amount's own +/- sign
-    // and color already communicate direction just as clearly.
-    ImGui::SetCursorPos(ImVec2(12, 13));
-    ImGui::TextUnformatted((g_app.userName(p.user_id) + "  ·  " + g_app.serviceLabel(p.service_id)).c_str());
+    bool isOut = p.direction == "out";
+    ImVec4 dirCol = isOut ? ImVec4(0.90f,0.40f,0.40f,1) : ImVec4(0.35f,0.80f,0.50f,1);
 
-    ImGui::SameLine();
-    float rightW = 140.0f;
-    ImGui::SetCursorPos(ImVec2(std::max(160.0f, w - rightW - 12.0f), 12));
+    // Left: direction arrow
+    ImGui::SetCursorPos(ImVec2(16, 16));
+    ImGui::PushStyleColor(ImGuiCol_Text, dirCol);
+    ImGui::Text("%s", isOut ? u8"↑" : u8"↓");
+    ImGui::PopStyleColor();
+
+    // Middle, line 1: owner name
+    ImGui::SetCursorPos(ImVec2(44, 8));
+    ImGui::TextUnformatted(g_app.userName(p.user_id).c_str());
+
+    // Middle, line 2: service · direction · optional future marker · optional note
+    ImGui::SetCursorPos(ImVec2(44, 30));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f,0.63f,0.70f,1));
+    std::string sub = g_app.serviceLabel(p.service_id);
+    sub += "  ·  ";
+    sub += isOut ? "Πληρωμή" : "Είσπραξη";
+    if (p.status == "future") sub += "  ·  ⏱ Μελλοντική";
+    if (!p.notes.empty()) { sub += "  ·  "; sub += p.notes; }
+    ImGui::TextUnformatted(sub.c_str());
+    ImGui::PopStyleColor();
+
+    // Right: amount (paid if resolved, due if future)
+    ImGui::SetCursorPos(ImVec2(std::max(220.0f, w - 160.0f), 18));
     {
-        bool isOut = p.direction == "out";
         bool isPaid = p.status != "future";
-        ImVec4 amtCol = isOut ? ImVec4(0.90f,0.40f,0.40f,1) : ImVec4(0.35f,0.80f,0.50f,1);
-        ImGui::PushStyleColor(ImGuiCol_Text, amtCol);
+        ImGui::PushStyleColor(ImGuiCol_Text, dirCol);
         ImGui::Text("%s%.2f €", isOut ? "-" : "+", isPaid ? p.amount_paid : p.amount_due);
         ImGui::PopStyleColor();
     }
 
-    // Invisible full-card button drawn last, on top, so a click anywhere on the
-    // row (but under the interactive text) opens the viewer.
+    // Invisible full-row click zone -- opens the read-only Payment Viewer.
     ImGui::SetCursorPos(ImVec2(0, 0));
-    if (ImGui::InvisibleButton("clickzone", ImVec2(w, rowH))) g_viewPaymentId = p.id;
+    if (ImGui::InvisibleButton("clickzone", ImVec2(w, rowH))) OpenPaymentView(p.id);
     EndCard();
     if (faded) ImGui::PopStyleVar();
     ImGui::PopID();
 }
-
 static void DrawDashboardScreen() {
     auto future = g_app.conn->getFuturePayments();
 
@@ -1590,31 +1878,27 @@ static void DrawDashboardScreen() {
     }
     ImGui::Separator();
 
-    // --- Filters, restyled as one integrated toolbar row ----------------
+        // --- Filters, restyled as one integrated toolbar row ----------------
+    // Filters now use the phone-book pickers: label on the LEFT with a colon,
+    // and a button that opens a paged, searchable popup. Users list is NOT
+    // loaded in full -- only the visible page is queried from the DB.
     BeginCard("filters", ImVec2(0, 60));
     ImGui::TextDisabled("Φίλτρα:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(60); ImGui::InputTextWithHint("##dyf", "έτος από", g_dashYearFrom, sizeof(g_dashYearFrom)); ImGui::SameLine();
-    ImGui::SetNextItemWidth(60); ImGui::InputTextWithHint("##dyt", "έτος έως", g_dashYearTo, sizeof(g_dashYearTo)); ImGui::SameLine();
-    ImGui::SetNextItemWidth(160);
-    if (ImGui::BeginCombo("Χρήστης##dash", g_dashUserFilter < 0 ? "Όλοι" : g_app.userName(g_dashUserFilter).c_str())) {
-        if (ImGui::Selectable("Όλοι", g_dashUserFilter < 0)) g_dashUserFilter = -1;
-        for (auto& u : g_app.users) if (ImGui::Selectable(u.full_name.c_str(), u.id == g_dashUserFilter)) g_dashUserFilter = u.id;
-        ImGui::EndCombo();
-    }
+    ImGui::TextDisabled("Από:"); ImGui::SameLine();
+    DatePicker("dash_start", g_dashStartDate, ImVec2(0, 1));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(160);
-    if (ImGui::BeginCombo("Υπηρεσία##dash", g_dashServiceFilter < 0 ? "Όλες" : g_app.serviceLabel(g_dashServiceFilter).c_str())) {
-        if (ImGui::Selectable("Όλες", g_dashServiceFilter < 0)) g_dashServiceFilter = -1;
-        for (auto& s : g_app.services) if (ImGui::Selectable(s.label.c_str(), s.id == g_dashServiceFilter)) g_dashServiceFilter = s.id;
-        ImGui::EndCombo();
-    }
+    ImGui::TextDisabled("Έως:"); ImGui::SameLine();
+    DatePicker("dash_end", g_dashEndDate, ImVec2(0, 1));
+    ImGui::SameLine();
+    DrawUserFilterPicker("Χρήστης:", g_dashUserFilter, 180.0f);
+    ImGui::SameLine();
+    DrawServiceFilterPicker("Υπηρεσία:", g_dashServiceFilter, 180.0f);
     EndCard();
     ImGui::Spacing();
 
     // --- Compute filtered set + stats ------------------------------------
     std::vector<Payment> shown;
-    int yf = atoi(g_dashYearFrom), yt = atoi(g_dashYearTo);
     std::time_t nowT = std::time(nullptr);
     std::tm nowTm{}; localtime_s(&nowTm, &nowT);
     int curYear = nowTm.tm_year + 1900, curMonth = nowTm.tm_mon + 1, curDay = nowTm.tm_mday;
@@ -1631,8 +1915,10 @@ static void DrawDashboardScreen() {
     double outcomeA = 0, inputA = 0; // resolved
     double outcomeB = 0, inputB = 0; // future
     for (auto& p : g_app.payments) {
-        if (yf > 0 && p.year < yf) continue;
-        if (yt > 0 && p.year > yt) continue;
+        char payDate[16];
+        std::snprintf(payDate, sizeof(payDate), "%04d-%02d-%02d", p.year, p.month, p.day);
+        if (!g_dashStartDate.empty() && std::string(payDate) < g_dashStartDate) continue;
+        if (!g_dashEndDate.empty()   && std::string(payDate) > g_dashEndDate)   continue;
         if (g_dashUserFilter >= 0 && p.user_id != g_dashUserFilter) continue;
         if (g_dashServiceFilter >= 0 && p.service_id != g_dashServiceFilter) continue;
         shown.push_back(p);
@@ -1659,15 +1945,15 @@ static void DrawDashboardScreen() {
     // Reset pagination whenever a filter actually changed since last frame (or the
     // caller pressed "Ανανέωση", handled separately below) -- a filter change makes
     // the previous offset window meaningless.
-    bool filtersChanged = std::strcmp(g_dashYearFrom, g_dashYearFromPrev) != 0 ||
-                           std::strcmp(g_dashYearTo, g_dashYearToPrev) != 0 ||
-                           g_dashUserFilter != g_dashUserFilterPrev ||
-                           g_dashServiceFilter != g_dashServiceFilterPrev;
+    bool filtersChanged = g_dashStartDate != g_dashStartDatePrev ||
+                       g_dashEndDate   != g_dashEndDatePrev   ||
+                       g_dashUserFilter    != g_dashUserFilterPrev ||
+                       g_dashServiceFilter != g_dashServiceFilterPrev;
     if (filtersChanged) {
         g_dashPageOffset = 0;
         g_dashScrollToBoundary = true;
-        std::strncpy(g_dashYearFromPrev, g_dashYearFrom, sizeof(g_dashYearFromPrev) - 1);
-        std::strncpy(g_dashYearToPrev, g_dashYearTo, sizeof(g_dashYearToPrev) - 1);
+        g_dashStartDatePrev = g_dashStartDate;
+        g_dashEndDatePrev   = g_dashEndDate;
         g_dashUserFilterPrev = g_dashUserFilter;
         g_dashServiceFilterPrev = g_dashServiceFilter;
     }
@@ -1737,176 +2023,205 @@ static void DrawDashboardScreen() {
     }
 
     ImGui::Spacing();
+
+    // --- Informational type filter: inline text links, not tabby buttons.
+    // Reads as a quiet strip you can click, not a chunky segmented control.
+    // Does NOT affect the stat tiles above -- only the timeline below.
+    ImGui::TextDisabled("Εμφάνιση:");
+    ImGui::SameLine();
+    auto QuietFilter = [](const char* label, bool active) -> bool {
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.25f,0.32f,0.55f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.25f,0.30f,0.40f,0.80f));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            active ? ImVec4(0.40f,0.90f,0.60f,1.0f) : ImVec4(0.58f,0.63f,0.70f,1.0f));
+        bool clicked = ImGui::Button(label);
+        ImGui::PopStyleColor(4);
+        return clicked;
+    };
+    auto ApplyTypeFilter = [&](int v) {
+        g_dashTypeFilter = v; g_dashPageOffset = 0; g_dashScrollToBoundary = true;
+    };
+    if (QuietFilter("Όλες",        g_dashTypeFilter == 0)) ApplyTypeFilter(0);
+    ImGui::SameLine(); ImGui::TextDisabled("·"); ImGui::SameLine();
+    if (QuietFilter("Εισπράξεις",  g_dashTypeFilter == 1)) ApplyTypeFilter(1);
+    ImGui::SameLine(); ImGui::TextDisabled("·"); ImGui::SameLine();
+    if (QuietFilter("Πληρωμές",    g_dashTypeFilter == 2)) ApplyTypeFilter(2);
+    ImGui::SameLine(); ImGui::TextDisabled("·"); ImGui::SameLine();
+    if (QuietFilter("Μελλοντικές", g_dashTypeFilter == 3)) ApplyTypeFilter(3);
     ImGui::Separator();
-    ImGui::TextDisabled("Πρόσφατες κινήσεις - οι μελλοντικές πληρωμές είναι πιο πάνω, περάστε το όριο.");
-    // Real breathing room before the scrollable timeline starts (and its own
-    // "future/resolved" boundary divider) -- a single Spacing() read as cramped
-    // right under this helper text, per the client's screenshot.
-    ImGui::Dummy(ImVec2(0.0f, 14.0f));
 
-    // --- Real vertical-line timeline (Revolut/N26-style): a fixed-max-width column
-    // centered in the available window width, with a continuous spine drawn down a
-    // narrow gutter to its left via ImDrawList, a node/dot on the spine per entry,
-    // and a coarser weekly ruler marker along the spine every ~7 real calendar days
-    // of span (separate from the existing per-day "Σήμερα"/"Χθες" group headers,
-    // which organize the cards -- the weekly markers are the timeline's own ruler).
-    //
-    // Layout, top to bottom, matching the client's "scroll up for future, scroll
-    // down for older" request:
-    //   [dimmed future entries, most-distant at top, soonest-due near the bottom]
-    //   [boundary divider: "▲ Μελλοντικές Πληρωμές"]
-    //   [most recent resolved entry ... down to the current page's oldest]
-    //   ["Φόρτωση παλαιότερων" button, if more remain]
-    // The child's scroll position is snapped to the boundary divider once per
-    // rebuild (filter change / refresh) via ImGui::SetScrollY, so opening the
-    // dashboard lands on "now" rather than at the very top of the future list.
-    const float kColumnWidth = 680.0f;
-    const float kGutterWidth = 28.0f;
-    const float kTotalWidth = kColumnWidth + kGutterWidth;
-    float indent = std::max(0.0f, (ImGui::GetContentRegionAvail().x - kTotalWidth) * 0.5f);
+    // --- Apply the type filter to `shown` (timeline only) -----------------
+    if (g_dashTypeFilter != 0) {
+        std::vector<Payment> typed;
+        typed.reserve(shown.size());
+        for (auto& p : shown) {
+            if (g_dashTypeFilter == 1 && p.direction != "in")   continue;
+            if (g_dashTypeFilter == 2 && p.direction != "out")  continue;
+            if (g_dashTypeFilter == 3 && p.status != "future")  continue;
+            typed.push_back(p);
+        }
+        shown.swap(typed);
+    }
 
-    // Build the resolved (non-future) list, newest-first (shown is already sorted
-    // that way), and the future list separately, sorted soonest-first then rendered
-    // in reverse so the most distant future entry lands at the very top.
-    std::vector<Payment> resolvedList;
-    resolvedList.reserve(shown.size());
-    for (auto& p : shown) if (p.status != "future") resolvedList.push_back(p);
-    std::vector<Payment> futureList;
-    for (auto& p : shown) if (p.status == "future") futureList.push_back(p);
+    if (shown.empty()) {
+        ImGui::TextDisabled("Καμία κίνηση στο τρέχον φίλτρο.");
+        return;
+    }
+
+    // Split shown into future (top section) and resolved (bottom, paged).
+    std::vector<Payment> futureList, resolvedList;
+    for (auto& p : shown) {
+        if (p.status == "future") futureList.push_back(p);
+        else                      resolvedList.push_back(p);
+    }
+    // Future: nearest-due at the BOTTOM (closest to the boundary). More-distant
+    // ones sit above -- scroll up to see them. ISO dates sort lexicographically.
     std::sort(futureList.begin(), futureList.end(), [](const Payment& a, const Payment& b) {
-        // ISO "YYYY-MM-DD" sorts correctly lexicographically; empty dates sink to
-        // the end (treated as "unknown/far away", same convention as DaysUntilDate).
-        const std::string& da = a.resolution_date; const std::string& db = b.resolution_date;
-        if (da.empty() != db.empty()) return db.empty(); // non-empty date before empty
-        return da > db; // descending: most distant date first
+        return a.resolution_date > b.resolution_date;
+    });
+    // Resolved: newest first.
+    std::sort(resolvedList.begin(), resolvedList.end(), [](const Payment& a, const Payment& b) {
+        if (a.year != b.year) return a.year > b.year;
+        if (a.month != b.month) return a.month > b.month;
+        if (a.day != b.day) return a.day > b.day;
+        return a.id > b.id;
     });
 
     int pageEnd = std::min((int)resolvedList.size(), g_dashPageOffset + kDashPageSize);
 
     ImGui::BeginChild("timelinelist", ImVec2(0, 0), false);
-    ImGui::Indent(indent);
-    ImGui::PushItemWidth(kColumnWidth);
 
+    // --- Vertical timeline spine setup -----------------------------------
+    // Background line on channel 0, per-entry dots on channel 1 -- so the line
+    // never paints over a dot regardless of draw order. The line itself is
+    // emitted LAST (we don't know its bottom Y until all content is laid out).
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    // Z-order-independent drawing: put the spine line on channel 0 (background)
-    // and the per-entry dots/markers on channel 1 (foreground), so the line never
-    // paints over a dot regardless of the order things are actually emitted in --
-    // we don't know the spine's final bottom Y until after the whole list is laid
-    // out, so the line has to be drawn last but appear behind everything.
     dl->ChannelsSplit(2);
-
-    float spineX = ImGui::GetCursorScreenPos().x + kGutterWidth * 0.5f;
-    ImVec4 spineLineCol4 = ImVec4(0.35f, 0.37f, 0.42f, 0.65f);
-    ImU32 spineLineCol = ImGui::ColorConvertFloat4ToU32(spineLineCol4);
+    const float kSpineXOffset = 22.0f;
+    const float kRowIndent    = 46.0f;
+    const float kRowHeight    = 54.0f;
+    float spineX    = ImGui::GetCursorScreenPos().x + kSpineXOffset;
     float spineTopY = ImGui::GetCursorScreenPos().y;
+    ImU32 spineLineCol = ImGui::ColorConvertFloat4ToU32(ImVec4(0.30f,0.33f,0.40f,0.75f));
 
-    auto drawSpineNode = [&](ImVec4 col, float rowHeight) {
+    auto DrawSpineDot = [&](ImVec4 col, float rowH) {
         dl->ChannelsSetCurrent(1);
-        float cy = ImGui::GetCursorScreenPos().y + rowHeight * 0.5f;
+        float cy = ImGui::GetCursorScreenPos().y + rowH * 0.5f;
         dl->AddCircleFilled(ImVec2(spineX, cy), 4.5f, ImGui::ColorConvertFloat4ToU32(col));
-        dl->AddCircle(ImVec2(spineX, cy), 4.5f, IM_COL32(20, 20, 24, 255), 0, 1.0f);
+        dl->AddCircle(ImVec2(spineX, cy), 4.5f, IM_COL32(20,20,24,255), 0, 1.0f);
         dl->ChannelsSetCurrent(0);
     };
-    auto drawWeekMarker = [&](const std::string& label) {
+    auto DrawSpineBigDot = [&](ImU32 col, float cy) {
         dl->ChannelsSetCurrent(1);
-        ImVec2 sp = ImGui::GetCursorScreenPos();
-        dl->AddCircleFilled(ImVec2(spineX, sp.y + 8.0f), 2.5f, IM_COL32(150, 158, 172, 200));
+        dl->AddCircleFilled(ImVec2(spineX, cy), 6.0f, col);
+        dl->AddCircle(ImVec2(spineX, cy), 6.0f, IM_COL32(20,20,24,255), 0, 1.2f);
         dl->ChannelsSetCurrent(0);
-        ImGui::Indent(kGutterWidth);
-        ImGui::TextDisabled("— %s —", label.c_str());
-        ImGui::Unindent(kGutterWidth);
-        ImGui::Spacing();
     };
 
     bool any = false;
 
-    // --- Future section (dimmed), above the boundary ------------------------
-    int lastFY = -1, lastFM = -1, lastFD = -1;
-    for (auto& p : futureList) {
-        any = true;
-        drawSpineNode(StatusColor("future"), 44.0f);
-        ImGui::Indent(kGutterWidth);
-        DrawTimelineRow(p, /*faded=*/true);
-        ImGui::Unindent(kGutterWidth);
-        ImGui::Spacing(); ImGui::Spacing(); // "some gaps" -- extra breathing room between nodes
+    // --- FUTURE section (top, dimmed) ------------------------------------
+    // Fade future rows only when they sit alongside resolved rows; when the
+    // "Μελλοντικές" filter is active they ARE the focus, so no fade.
+    bool fadeFuture = (g_dashTypeFilter != 3);
+    if (!futureList.empty()) {
+        for (auto& p : futureList) {
+            any = true;
+            DrawSpineDot(StatusColor("future"), kRowHeight);
+            ImGui::Indent(kRowIndent);
+            DrawTimelineRow(p, /*faded=*/fadeFuture);
+            ImGui::Unindent(kRowIndent);
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        }
     }
 
-    // --- Boundary divider -----------------------------------------------------
-    ImGui::Spacing();
-    dl->ChannelsSetCurrent(1);
-    ImVec2 bp = ImGui::GetCursorScreenPos();
-    dl->AddCircleFilled(ImVec2(spineX, bp.y + 10.0f), 5.5f, IM_COL32(200, 170, 60, 255));
-    dl->ChannelsSetCurrent(0);
-    ImGui::Indent(kGutterWidth);
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.85f, 0.70f, 0.30f, 1), "%s", u8"▲ Μελλοντικές Πληρωμές  ·  ▼ Πρόσφατες Κινήσεις");
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::Unindent(kGutterWidth);
-    ImGui::Spacing();
+    // --- BOUNDARY divider between future (above) and resolved (below) -----
+    // Only shown when both sections are present this frame.
+    if (!futureList.empty() && !resolvedList.empty()) {
+        DrawSpineBigDot(IM_COL32(200,170,60,255), ImGui::GetCursorScreenPos().y + 12.0f);
+        ImGui::Indent(kRowIndent);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.85f,0.70f,0.30f,1.0f), "%s", u8"▲ Μελλοντικές Πληρωμές  ·  Πρόσφατες Κινήσεις ▼");
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::Unindent(kRowIndent);
 
-    // Snap scroll to right here (top of the resolved section) once per rebuild,
-    // so the dashboard opens showing "now" instead of the top of the future list.
-    float boundaryScrollY = ImGui::GetCursorPosY();
-    if (g_dashScrollToBoundary) {
-        ImGui::SetScrollY(std::max(0.0f, boundaryScrollY - 40.0f));
+        // Snap scroll so the boundary sits ~40px from the top of the viewport
+        // -- resolves are what you land on, and you scroll UP to reveal future.
+        // Only done ONCE per rebuild (filter change / chip switch / refresh).
+        float boundaryY = ImGui::GetCursorPosY();
+        if (g_dashScrollToBoundary) {
+            ImGui::SetScrollY(std::max(0.0f, boundaryY - 40.0f));
+            g_dashScrollToBoundary = false;
+        }
+    } else if (g_dashScrollToBoundary) {
+        // No boundary this frame (e.g. only future or only resolved) -- sit at
+        // the top of the list.
+        ImGui::SetScrollY(0.0f);
         g_dashScrollToBoundary = false;
     }
 
-    // --- Resolved section (current page), most recent first -------------------
-    int lastYear = -1, lastMonth = -1, lastDay = -1;
-    int lastWeekY = -1, lastWeekM = -1, lastWeekD = -1;
-    for (int i = 0; i < pageEnd; ++i) {
+    // --- RESOLVED section (day banners + rows) ----------------------------
+    int lastY = -1, lastM = -1, lastD = -1;
+    for (int i = 0; i < pageEnd; i++) {
         Payment& p = resolvedList[i];
         any = true;
-        if (p.year != lastYear || p.month != lastMonth || p.day != lastDay) {
-            DrawDayHeader(p.year, p.month, p.day, curYear, curMonth, curDay);
-            lastYear = p.year; lastMonth = p.month; lastDay = p.day;
-        }
-        if (lastWeekY < 0) { lastWeekY = p.year; lastWeekM = p.month; lastWeekD = p.day; }
-        else {
-            int span = std::abs(DaysBetweenYMD(lastWeekY, lastWeekM, lastWeekD, p.year, p.month, p.day));
-            if (span >= 7) {
-                char lbl[16]; std::snprintf(lbl, sizeof(lbl), "%04d-%02d-%02d", p.year, p.month, p.day);
-                drawWeekMarker(lbl);
-                lastWeekY = p.year; lastWeekM = p.month; lastWeekD = p.day;
+        if (p.year != lastY || p.month != lastM || p.day != lastD) {
+            // Day net computed from the FULL resolved list (not just this page)
+            // so the banner total is truthful when a day spans a page boundary.
+            double dayNet = 0.0;
+            for (auto& q : resolvedList) {
+                if (q.year == p.year && q.month == p.month && q.day == p.day) {
+                    dayNet += (q.direction == "out") ? -q.amount_paid : q.amount_paid;
+                }
             }
+            DrawSpineBigDot(ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f,0.65f,0.85f,1.0f)),
+                            ImGui::GetCursorScreenPos().y + 18.0f);
+            ImGui::Indent(kRowIndent);
+            DrawDaySectionHeader(p.year, p.month, p.day, curYear, curMonth, curDay, dayNet);
+            ImGui::Unindent(kRowIndent);
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            lastY = p.year; lastM = p.month; lastD = p.day;
         }
-        drawSpineNode(StatusColor(p.status), 44.0f);
-        ImGui::Indent(kGutterWidth);
+        DrawSpineDot(StatusColor(p.status), kRowHeight);
+        ImGui::Indent(kRowIndent);
         DrawTimelineRow(p, false);
-        ImGui::Unindent(kGutterWidth);
-        ImGui::Spacing(); ImGui::Spacing(); // deliberate gaps between nodes, per client's wording
+        ImGui::Unindent(kRowIndent);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
     }
 
-    if (!any) ImGui::TextDisabled("Καμία πληρωμή στο τρέχον φίλτρο.");
+    if (!any) ImGui::TextDisabled("Καμία κίνηση στο τρέχον φίλτρο.");
 
-    // --- Offset-based pagination: reveal 20 more older entries per click. The
-    // full filtered set (`g_app.payments`, loaded once via getAllPayments()) is
-    // already in memory -- this pages the RENDER, not a separate DB query, since
-    // the dataset is small enough that re-querying per page would just add
-    // latency for no benefit; the goal ("don't render/keep everything on screen
-    // at once") is about UI cost, which this fully solves.
+    // --- LOAD OLDER -------------------------------------------------------
     if (pageEnd < (int)resolvedList.size()) {
         ImGui::Spacing();
-        ImGui::Indent(kGutterWidth);
+        ImGui::Indent(kRowIndent);
         int remaining = (int)resolvedList.size() - pageEnd;
-        char lbl[64];
-        std::snprintf(lbl, sizeof(lbl), "Φόρτωση παλαιότερων (+%d, %d απομένουν)", std::min(kDashPageSize, remaining), remaining);
-        if (ImGui::Button(lbl, ImVec2(kColumnWidth, 0))) g_dashPageOffset += kDashPageSize;
-        ImGui::Unindent(kGutterWidth);
+        // Large buffer on purpose: Greek chars are 2 UTF-8 bytes each, so the
+        // old char[64] silently truncated the label mid-character and rendered
+        // garbled text whenever the remaining count hit 3+ digits.
+        char lbl[256];
+        std::snprintf(lbl, sizeof(lbl), "Φόρτωση παλαιότερων  ·  %d ακόμα", remaining);
+        float w = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Button(lbl, ImVec2(w, 34))) {
+            g_dashPageOffset += kDashPageSize;
+        }
+        ImGui::Unindent(kRowIndent);
     }
 
+    // --- Emit the spine line last, on the background channel --------------
     float spineBottomY = ImGui::GetCursorScreenPos().y;
     dl->ChannelsSetCurrent(0);
-    if (spineBottomY > spineTopY) dl->AddLine(ImVec2(spineX, spineTopY), ImVec2(spineX, spineBottomY), spineLineCol, 2.0f);
+    if (spineBottomY > spineTopY) {
+        dl->AddLine(ImVec2(spineX, spineTopY), ImVec2(spineX, spineBottomY), spineLineCol, 2.0f);
+    }
     dl->ChannelsMerge();
 
-    ImGui::PopItemWidth();
-    ImGui::Unindent(indent);
     ImGui::EndChild();
 }
+
 
 // ---------------------------------------------------------------------------
 // NOTES SCREEN ("Σημειώσεις") - standalone sticky-notes scratchpad, not tied
@@ -1915,6 +2230,7 @@ static void DrawDashboardScreen() {
 // confirm-diff popup would be overkill for jotting down a note.
 // ---------------------------------------------------------------------------
 static bool g_showNoteDialog = false;
+static bool g_noteDialogWasOpen = false;
 static bool g_noteDialogIsEdit = false;
 static int g_noteDialogId = -1;
 static char nb_title[128] = "";
@@ -1931,8 +2247,11 @@ static void OpenEditNote(const Note& n) {
 }
 
 static void DrawNoteDialog() {
+    if (g_showNoteDialog && !g_noteDialogWasOpen) {
+        ImGui::OpenPopup("Σημείωση");
+    }
+    g_noteDialogWasOpen = g_showNoteDialog;
     if (!g_showNoteDialog) return;
-    ImGui::OpenPopup("Σημείωση");
     ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Σημείωση", &g_showNoteDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::InputText("Τίτλος", nb_title, sizeof(nb_title));
@@ -2130,7 +2449,7 @@ static void DrawSearchScreen() {
             ImGui::TextWrapped("%s", u.address.c_str());
             if (!u.special_code.empty()) ImGui::TextDisabled("Κωδ.: %s", u.special_code.c_str());
             ImGui::Spacing();
-            if (ImGui::SmallButton("Προφίλ")) g_profileUserId = u.id;
+            if (ImGui::SmallButton("Προφίλ")) OpenUserProfile(u.id);
             EndCard();
             ImGui::PopID();
             CardWrapNext(cardW);
@@ -2144,7 +2463,7 @@ static void DrawSearchScreen() {
             ImGui::TextColored(ImVec4(0.9f,0.9f,0.3f,1), "%s", s.label.c_str());
             if (!s.extra_notes.empty()) ImGui::TextWrapped("%s", s.extra_notes.c_str());
             ImGui::Spacing();
-            if (ImGui::SmallButton("Άνοιγμα")) g_detailServiceId = s.id;
+            if (ImGui::SmallButton("Άνοιγμα")) OpenServiceDetail(s.id);
             EndCard();
             ImGui::PopID();
             CardWrapNext(cardW);
@@ -2165,7 +2484,7 @@ static void DrawSearchScreen() {
             ImGui::TextColored(col, "%s", p.status.c_str());
             ImGui::Text("Οφειλή: %.2f  Πληρωμένο: %.2f", p.amount_due, p.amount_paid);
             if (!p.notes.empty()) ImGui::TextWrapped("%s", p.notes.c_str());
-            if (ImGui::SmallButton("Προβολή")) g_viewPaymentId = p.id;
+            if (ImGui::SmallButton("Προβολή")) OpenPaymentView(p.id);
             EndCard();
             ImGui::PopID();
             CardWrapNext(cardW);

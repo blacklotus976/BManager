@@ -1,18 +1,115 @@
-# Build output
-build/
-dist/
-build.zip
+# # Build output
+# build/
+# dist/
+# build.zip
 
+# # Build log scratch files accumulated during development
+# build_*.txt
+# build_*.log
+
+# # Local runtime data - never commit real client data or machine-specific config
+# data.db
+# config.ini
+
+# # Editor
+# .vscode/
+
+# # Shared external vcpkg tree (lives outside this repo, at the LEPP project path)
+# vcpkg/
+
+
+
+# ============================================================
+# Build output (any depth -- bare name matches nested folders)
+# ============================================================
+build/
+build.zip
+dist/
+out/
+
+# CMake out-of-source trees and generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+Makefile
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+CPackConfig.cmake
+CPackSourceConfig.cmake
+
+# CMake FetchContent clones (glfw, imgui, json)
+_deps/
+
+# vcpkg manifest installs (build\vcpkg_installed)
+vcpkg_installed/
+# Local vcpkg checkout if it ever lands inside the repo
+vcpkg/
+
+# ============================================================
+# Visual Studio
+# ============================================================
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ============================================================
+# Compiled artifacts (in case something leaks out of build/)
+# ============================================================
+*.obj
+*.o
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.exe.manifest
+*.log
+*.tlog
+*.lastbuildstate
+
+# ============================================================
 # Build log scratch files accumulated during development
+# ============================================================
 build_*.txt
 build_*.log
+build_*.json
 
-# Local runtime data - never commit real client data or machine-specific config
+# ============================================================
+# Local runtime data -- never commit real client data or
+# machine-specific config
+# ============================================================
 data.db
+data.db-journal
+data.db-wal
+data.db-shm
 config.ini
+stockviewer_state.json
 
-# Editor
+# ============================================================
+# Editor / IDE
+# ============================================================
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Shared external vcpkg tree (lives outside this repo, at the LEPP project path)
-vcpkg/
+# ============================================================
+# OS cruft
+# ============================================================
+Thumbs.db
+Desktop.ini
+.DS_Store

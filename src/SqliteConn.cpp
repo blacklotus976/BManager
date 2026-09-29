@@ -1290,3 +1290,133 @@ bool SqliteConn::executeRawQuery(const std::string& sql, std::vector<std::string
     return true;
 }
 
+
+// --- PAGED "PHONE BOOK" PICKERS (dashboard filters) ------------------------
+// These fetch only one page at a time. LIKE-based, fully parameterized.
+// The letter filter matches the exact form the caller passes -- for Greek
+// stored in uppercase (the seed convention) the caller passes uppercase, and
+// LIKE is byte-exact for those 2-byte sequences. For ASCII, LIKE is already
+// case-insensitive, so "A%" matches both "ALEX" and "alex".
+
+std::vector<User> SqliteConn::pickerUsers(const std::vector<std::string>& letters,
+                                           const std::string& nameSearch,
+                                           int offset, int limit,
+                                           bool reverseSort) {
+    std::vector<User> results;
+    std::string sql = "SELECT id, full_name, phone, address, area, postal_code, contract_code, created_at, special_code "
+                      "FROM users WHERE 1=1";
+    std::vector<std::string> binds;
+    if (!letters.empty()) {
+        sql += " AND (";
+        for (size_t i = 0; i < letters.size(); i++) {
+            if (i > 0) sql += " OR ";
+            sql += "full_name LIKE ? || '%'";
+            binds.push_back(letters[i]);
+        }
+        sql += ")";
+    }
+    if (!nameSearch.empty()) {
+        sql += " AND LOWER(full_name) LIKE '%' || LOWER(?) || '%'";
+        binds.push_back(nameSearch);
+    }
+    sql += reverseSort ? " ORDER BY full_name DESC" : " ORDER BY full_name ASC";
+    sql += " LIMIT ? OFFSET ?";
+
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, idx++, limit);
+    sqlite3_bind_int(stmt, idx++, offset);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        User u;
+        u.id = sqlite3_column_int(stmt,0);
+        u.full_name = sqlite3_column_text(stmt,1) ? (const char*)sqlite3_column_text(stmt,1) : "";
+        u.phone = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
+        u.address = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
+        u.area = sqlite3_column_text(stmt,4) ? (const char*)sqlite3_column_text(stmt,4) : "";
+        u.postal_code = sqlite3_column_text(stmt,5) ? (const char*)sqlite3_column_text(stmt,5) : "";
+        u.contract_code = sqlite3_column_text(stmt,6) ? (const char*)sqlite3_column_text(stmt,6) : "";
+        u.created_at = sqlite3_column_text(stmt,7) ? (const char*)sqlite3_column_text(stmt,7) : "";
+        u.special_code = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
+        results.push_back(u);
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+int SqliteConn::pickerUsersCount(const std::vector<std::string>& letters,
+                                  const std::string& nameSearch) {
+    std::string sql = "SELECT COUNT(*) FROM users WHERE 1=1";
+    std::vector<std::string> binds;
+    if (!letters.empty()) {
+        sql += " AND (";
+        for (size_t i = 0; i < letters.size(); i++) {
+            if (i > 0) sql += " OR ";
+            sql += "full_name LIKE ? || '%'";
+            binds.push_back(letters[i]);
+        }
+        sql += ")";
+    }
+    if (!nameSearch.empty()) {
+        sql += " AND LOWER(full_name) LIKE '%' || LOWER(?) || '%'";
+        binds.push_back(nameSearch);
+    }
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+
+
+
+
+std::vector<Service> SqliteConn::pickerServices(const std::string& nameSearch,
+                                                 int offset, int limit) {
+    std::vector<Service> results;
+    std::string sql = "SELECT id, label, extra_notes, created_at FROM services WHERE 1=1";
+    std::vector<std::string> binds;
+    if (!nameSearch.empty()) {
+        sql += " AND LOWER(label) LIKE '%' || LOWER(?) || '%'";
+        binds.push_back(nameSearch);
+    }
+    sql += " ORDER BY label ASC LIMIT ? OFFSET ?";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, idx++, limit);
+    sqlite3_bind_int(stmt, idx++, offset);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Service s;
+        s.id = sqlite3_column_int(stmt, 0);
+        s.label = sqlite3_column_text(stmt, 1) ? (const char*)sqlite3_column_text(stmt, 1) : "";
+        s.extra_notes = sqlite3_column_text(stmt, 2) ? (const char*)sqlite3_column_text(stmt, 2) : "";
+        s.created_at = sqlite3_column_text(stmt, 3) ? (const char*)sqlite3_column_text(stmt, 3) : "";
+        results.push_back(s);
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+int SqliteConn::pickerServicesCount(const std::string& nameSearch) {
+    std::string sql = "SELECT COUNT(*) FROM services WHERE 1=1";
+    std::vector<std::string> binds;
+    if (!nameSearch.empty()) {
+        sql += " AND LOWER(label) LIKE '%' || LOWER(?) || '%'";
+        binds.push_back(nameSearch);
+    }
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}

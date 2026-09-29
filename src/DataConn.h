@@ -80,6 +80,11 @@ public:
     // param is not filtered on. year/month/day, idQuery, serviceIdQuery and userIdQuery are
     // all free-text substring matches against the stringified column (LIKE, not exact
     // equality) so half-written numbers behave like half-written text everywhere.
+        // Advanced payment search (Αναζήτηση tab): payment's own fields plus owner-name /
+    // service-label substring match via JOIN against users/services. Any empty string
+    // param is not filtered on. year/month/day, idQuery, serviceIdQuery and userIdQuery are
+    // all free-text substring matches against the stringified column (LIKE, not exact
+    // equality) so half-written numbers behave like half-written text everywhere.
     virtual std::vector<Payment> advancedSearchPayments(const std::string& year, const std::string& month, const std::string& day,
                                                           const std::string& amount_due_query, const std::string& amount_paid_query,
                                                           const std::string& status, const std::string& direction,
@@ -87,6 +92,32 @@ public:
                                                           const std::string& userName, const std::string& serviceLabel,
                                                           const std::string& idQuery = "", const std::string& serviceIdQuery = "",
                                                           const std::string& userIdQuery = "") = 0;
+
+    // --- Paged "phone book" pickers (dashboard filters) -------------------
+    // These fetch only one page of rows at a time -- the dashboard pickers
+    // never load the full users/services table just to render a filter row.
+    //
+    // pickerUsers:
+    //   letterFilter  "" = all rows; "Α" = only names whose first char is Α
+    //                 (uses LIKE '<letter>%'). Matches how the rest of the app
+    //                 treats Greek text -- caller passes the exact letter form
+    //                 that appears in stored data).
+    //   nameSearch    substring match anywhere in full_name (LOWER-matched).
+    //   reverseSort   true = Z→A, false = A→Z.
+    // letters: set of starting-letter prefixes to include (OR-ed together).
+    //          Empty = no letter filtering (all users).
+    //          e.g. {"Α","Π"} matches names starting with Α or Π.
+    virtual std::vector<User> pickerUsers(const std::vector<std::string>& letters,
+                                           const std::string& nameSearch,
+                                           int offset, int limit,
+                                           bool reverseSort) = 0;
+    virtual int pickerUsersCount(const std::vector<std::string>& letters,
+                                  const std::string& nameSearch) = 0;
+
+    // pickerServices: name substring match, always alphabetical by label.
+    virtual std::vector<Service> pickerServices(const std::string& nameSearch,
+                                                 int offset, int limit) = 0;
+    virtual int pickerServicesCount(const std::string& nameSearch) = 0;
 
     // --- Timeline / Audit ---
     // category: "business" for normal-app-flow CRUD on users/services/payments/service_users,

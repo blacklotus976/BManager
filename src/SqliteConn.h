@@ -86,4 +86,15 @@ public:
 
     bool executeRawQuery(const std::string& sql, std::vector<std::string>& outColumns,
                           std::vector<std::vector<std::string>>& outRows, std::string& outError) override;
+
+    // Paged phone-book pickers (dashboard filters) -- see DataConn.h for contract.
+    std::vector<User> pickerUsers(const std::vector<std::string>& letters,
+                                   const std::string& nameSearch,
+                                   int offset, int limit,
+                                   bool reverseSort) override;
+    int pickerUsersCount(const std::vector<std::string>& letters,
+                          const std::string& nameSearch) override;
+    std::vector<Service> pickerServices(const std::string& nameSearch,
+                                         int offset, int limit) override;
+    int pickerServicesCount(const std::string& nameSearch) override;
 };
