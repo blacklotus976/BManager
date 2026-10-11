@@ -270,3 +270,18 @@ Three layers, used in this order:
 Rule of thumb: *attributes of one event* → JSON details; *things that are counted, consumed or scheduled over time* → a table.
 "Never change the DB again" is not a realistic goal; "a new service type needs no DB change, a new *capability* needs
 one well-defined migration" is.
+
+## 14. State after the v7/v8 migrations (2026-10-11)
+
+- **Dates**: `payments.pay_date` (ISO date, CHECKed); all timestamps UTC `YYYY-MM-DD HH:MM:SS`, shown in local time.
+- **Receipts ↔ payments**: separate tables; `payments.receipt_id` (N→1). Several payments share one receipt only if
+  they were created together (`payment_batches`, e.g. a package charge) for the same client; otherwise one each.
+- **Audit log**: written by triggers on every business table (JSON before/after, actor, reason), append-only,
+  SHA-256 hash chain, daily anchors outside the DB, startup quick check + background full verification
+  (chain, trigger integrity, every live row vs its last snapshot). SQL console is read-only.
+  Limits, stated honestly: a person with the file *and* this source code can still rebuild a consistent chain;
+  the anchors (and, later, sending anchors to the server/e-mail) are what make that detectable.
+- **Screens** query SQL (`findPayments`, `paymentTotals`, `paymentTotalsBy`) and cache results until the data
+  changes; nothing loads all payments.
+- Remaining structural gap: bill vs payment are still one row (partial payments against one bill, one transfer
+  for several bills). Next: see `docs/UI_PROPOSALS.md` §3 for scale, and the charges/allocations model in §5.
