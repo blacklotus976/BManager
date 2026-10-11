@@ -46,6 +46,7 @@
 
 
 #include "DatePicker.h"  
+#include "MediaViewer.h"
 
 
 // ---------------------------------------------------------------------------
@@ -351,6 +352,194 @@ template <class T> struct Cached {
         return val;
     }
 };
+
+// =====================================================================================================
+// ATTACHMENTS -- photos / videos / PDFs on receipts, payments, clients, buildings.
+// Files arrive by drag & drop onto a «Συνημμένα» panel or through «Προσθήκη αρχείου…». They are copied into the
+// database folder (content-addressed); the original can be moved or deleted afterwards.
+// =====================================================================================================
+static std::vector<std::string> g_droppedFiles;          // filled by the GLFW drop callback
+static bool g_dropConsumed = false;
+static std::string g_dropHint;
+static double g_dropHintUntil = 0;
+static int g_dropFrame = -1;                              // frame the files arrived in
+
+static void OnFilesDropped(GLFWwindow*, int count, const char** paths) {
+    for (int i = 0; i < count; i++) g_droppedFiles.push_back(paths[i]);
+    g_dropConsumed = false;
+    g_dropFrame = -1;
+}
+
+#ifdef _WIN32
+static std::vector<std::string> PickFilesDialogWin32() {
+    std::vector<std::string> out;
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool weInitialized = SUCCEEDED(hrInit);
+    if (FAILED(hrInit) && hrInit != RPC_E_CHANGED_MODE) return out;
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+        DWORD opts = 0; dlg->GetOptions(&opts);
+        dlg->SetOptions(opts | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+        dlg->SetTitle(L"Επιλογή αρχείων για επισύναψη");
+        if (SUCCEEDED(dlg->Show(nullptr))) {
+            IShellItemArray* items = nullptr;
+            if (SUCCEEDED(dlg->GetResults(&items))) {
+                DWORD n = 0; items->GetCount(&n);
+                for (DWORD i = 0; i < n; i++) {
+                    IShellItem* it = nullptr;
+                    if (FAILED(items->GetItemAt(i, &it))) continue;
+                    PWSTR w = nullptr;
+                    if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &w))) {
+                        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+                        std::string b(len, '\0'); WideCharToMultiByte(CP_UTF8, 0, w, -1, b.data(), len, nullptr, nullptr);
+                        out.push_back(b.c_str());
+                        CoTaskMemFree(w);
+                    }
+                    it->Release();
+                }
+                items->Release();
+            }
+        }
+        dlg->Release();
+    }
+    if (weInitialized) CoUninitialize();
+    return out;
+}
+#endif
+
+// Native file picker. Linux: zenity if installed (ok=false when it isn't, so the caller asks for a path instead).
+static std::vector<std::string> PickFiles(bool& ok) {
+    ok = true;
+#ifdef _WIN32
+    return PickFilesDialogWin32();
+#else
+    std::vector<std::string> out;
+    if (std::system("command -v zenity >/dev/null 2>&1") != 0) { ok = false; return out; }
+    FILE* f = popen("zenity --file-selection --multiple --separator='\n' --title='Επιλογή αρχείων' 2>/dev/null", "r");
+    if (!f) { ok = false; return out; }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) { std::string l = line; while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back(); if (!l.empty()) out.push_back(l); }
+    pclose(f);
+    return out;
+#endif
+}
+
+static Attachment g_viewAttachment;
+static bool g_showAttachmentViewer = false;
+static ImageView g_imageView;
+static VideoView g_videoView;
+static std::string g_viewerError;
+
+static void OpenAttachmentViewer(const Attachment& a) {
+    g_viewAttachment = a; g_showAttachmentViewer = true; g_viewerError.clear();
+    g_imageView.Close(); g_videoView.Close();
+    std::string path = g_app.conn->attachmentFullPath(a);
+    if (a.kind == "image") g_imageView.Open(path, g_viewerError);
+    else if (a.kind == "video" && VideoView::Available()) g_videoView.Open(path, g_viewerError);
+}
+
+static std::string HumanSize(long long b) {
+    char buf[32];
+    if (b < 1024) std::snprintf(buf, sizeof(buf), "%lld B", b);
+    else if (b < 1024 * 1024) std::snprintf(buf, sizeof(buf), "%.0f KB", b / 1024.0);
+    else std::snprintf(buf, sizeof(buf), "%.1f MB", b / (1024.0 * 1024.0));
+    return buf;
+}
+
+// «Συνημμένα» section for one record. Takes dropped files while the mouse is over it.
+static void DrawAttachmentsPanel(const char* entity, int entityId) {
+    if (entityId <= 0) return;
+    ImGui::PushID(entity); ImGui::PushID(entityId);
+    std::vector<Attachment> list = g_app.conn->getAttachments(entity, entityId);   // one indexed query
+    ImGui::SeparatorText(("Συνημμένα (" + std::to_string(list.size()) + ")").c_str());
+    ImGui::BeginChild("attpanel", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem |
+                                          ImGuiHoveredFlags_AllowWhenBlockedByPopup);
+    auto addFiles = [&](const std::vector<std::string>& files) {
+        int ok = 0;
+        for (auto& f : files) if (g_app.conn->addAttachment(entity, entityId, f, "") > 0) ok++;
+        g_dropHint = std::to_string(ok) + " από " + std::to_string(files.size()) + " αρχεία επισυνάφθηκαν";
+        g_dropHintUntil = ImGui::GetTime() + 4;
+    };
+    if (hovered && !g_droppedFiles.empty() && !g_dropConsumed) {
+        std::vector<std::string> files; files.swap(g_droppedFiles);
+        g_dropConsumed = true;
+        addFiles(files);
+    }
+    static TextBuf manualPath; static bool askPath = false;
+    if (ImGui::SmallButton("+ Προσθήκη αρχείου…")) {
+        bool ok = true; auto files = PickFiles(ok);
+        if (!ok) askPath = true; else if (!files.empty()) addFiles(files);
+    }
+    ImGui::SameLine(); ImGui::TextDisabled("ή σύρετε φωτογραφίες / βίντεο / PDF εδώ");
+    if (askPath) {
+        ImGui::SetNextItemWidth(360);
+        ImGui::InputTextWithHint("##path", "διαδρομή αρχείου", manualPath.data, sizeof(manualPath.data));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Επισύναψη") && !manualPath.str().empty()) { addFiles({manualPath.str()}); manualPath.set(""); askPath = false; }
+    }
+    for (auto& a : list) {
+        ImGui::PushID(a.id);
+        const char* tag = a.kind == "image" ? "[εικόνα]" : a.kind == "video" ? "[βίντεο]" : a.kind == "pdf" ? "[PDF]" : "[αρχείο]";
+        ImGui::TextDisabled("%s", tag); ImGui::SameLine();
+        if (ImGui::Selectable(a.file_name.c_str(), false, 0, ImVec2(260, 0))) OpenAttachmentViewer(a);
+        ImGui::SameLine(); ImGui::TextDisabled("%s · %s", HumanSize(a.size_bytes).c_str(), a.created_at.c_str());
+        if (std::string(entity) != "receipt") {                // receipt evidence can't be removed
+            ImGui::SameLine();
+            static TextBuf reason;
+            if (ImGui::SmallButton("Αφαίρεση…")) { reason.set(""); ImGui::OpenPopup("rmatt"); }
+            if (ImGui::BeginPopup("rmatt")) {
+                ImGui::Text("Αφαίρεση «%s»", a.file_name.c_str());
+                ImGui::TextDisabled("Μένει στο ιστορικό. Χρειάζεται αιτιολογία.");
+                ImGui::SetNextItemWidth(300); ImGui::InputText("##why", reason.data, sizeof(reason.data));
+                ImGui::BeginDisabled(reason.str().size() < 3);
+                if (ImGui::Button("Αφαίρεση")) { g_app.conn->removeAttachment(a.id, reason.str()); ImGui::CloseCurrentPopup(); }
+                ImGui::EndDisabled();
+                ImGui::EndPopup();
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::PopID(); ImGui::PopID();
+}
+
+static void DrawAttachmentViewer() {
+    // files dropped outside any «Συνημμένα» panel: after one full frame unclaimed, explain where to drop them
+    if (!g_droppedFiles.empty()) {
+        if (g_dropFrame < 0) g_dropFrame = ImGui::GetFrameCount();
+        else if (ImGui::GetFrameCount() > g_dropFrame + 1) {
+            g_droppedFiles.clear();
+            g_dropHint = "Σύρετε τα αρχεία πάνω σε μια ενότητα «Συνημμένα» (απόδειξη, πληρωμή ή πελάτη).";
+            g_dropHintUntil = ImGui::GetTime() + 5;
+        }
+    }
+    if (!g_dropHint.empty() && ImGui::GetTime() < g_dropHintUntil) {
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + 50), ImGuiCond_Always, ImVec2(0.5f, 0));
+        ImGui::Begin("##drophint", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::TextUnformatted(g_dropHint.c_str());
+        ImGui::End();
+    }
+    if (!g_showAttachmentViewer) { if (g_imageView.IsOpen()) g_imageView.Close(); if (g_videoView.IsOpen()) g_videoView.Close(); return; }
+    const Attachment& a = g_viewAttachment;
+    ImGui::SetNextWindowSize(ImVec2(900, 640), ImGuiCond_FirstUseEver);
+    std::string title = a.file_name + "###attviewer";
+    if (ImGui::Begin(title.c_str(), &g_showAttachmentViewer, ImGuiWindowFlags_NoCollapse)) {
+        std::string path = g_app.conn->attachmentFullPath(a);
+        ImGui::TextDisabled("%s · προστέθηκε %s", HumanSize(a.size_bytes).c_str(), a.created_at.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Άνοιγμα με εφαρμογή συστήματος")) OpenWithSystem(path);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Εμφάνιση στον φάκελο")) RevealInFolder(path);
+        if (!g_viewerError.empty()) ImGui::TextColored(kInvalidMoneyCol, "%s", g_viewerError.c_str());
+        if (a.kind == "image" && g_imageView.IsOpen()) g_imageView.Draw();
+        else if (a.kind == "video" && g_videoView.IsOpen()) g_videoView.Draw(ImGui::GetIO().DeltaTime);
+        else if (a.kind == "video") ImGui::TextWrapped("Η αναπαραγωγή μέσα στην εφαρμογή δεν είναι διαθέσιμη σε αυτή την έκδοση. Χρησιμοποιήστε «Άνοιγμα με εφαρμογή συστήματος».");
+        else ImGui::TextWrapped("Αυτός ο τύπος αρχείου ανοίγει με την εφαρμογή του συστήματος.");
+    }
+    ImGui::End();
+}
 
 // Forward declaration -- StatTile is defined further down but DrawBuildingsScreen
 // (defined above it) needs it.
@@ -3092,6 +3281,7 @@ static void DrawUserProfileWindow() {
         if (ImGui::Button("+ Νέα είσπραξη")) OpenRecordPayment(u.id);
         { double credit = g_app.conn->getClientCredit(u.id);
           if (ToCents(credit) > 0) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1), "Πίστωση: %s €", FormatMoney(credit).c_str()); } }
+        if (ImGui::CollapsingHeader("Συνημμένα πελάτη (συμβόλαια, ταυτότητα, φωτογραφίες)")) DrawAttachmentsPanel("client", u.id);
 
         auto allPayments = g_app.conn->getPaymentsForUser(u.id);
 
@@ -3597,6 +3787,17 @@ static void DrawPaymentViewWindow() {
         if (p.status == "future" && !p.resolution_date.empty()) ImGui::Text("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
         if (!p.resolved_at.empty()) ImGui::TextDisabled("Επιλύθηκε στις: %s", p.resolved_at.c_str());
         if (!p.notes.empty()) ImGui::TextWrapped("Σημειώσεις: %s", p.notes.c_str());
+        // the money behind this line (bills and payments are separate)
+        auto money = g_app.conn->getMoneyForCharge(p.id);
+        if (!money.empty()) {
+            ImGui::SeparatorText("Εισπράξεις / πληρωμές");
+            for (auto& m : money) {
+                ImGui::Text("%s · %s € (εδώ %s €) · %s", m.pay_date.c_str(), FormatMoney(m.amount).c_str(), FormatMoney(m.allocated).c_str(),
+                            m.method == "unspecified" ? "τρόπος —" : ReceiptMethodName(m.method).c_str());
+                if (m.receipt_id > 0) { ImGui::SameLine(); ImGui::PushID(m.id); if (ImGui::SmallButton("Απόδειξη")) OpenReceiptView(m.receipt_id); ImGui::PopID(); }
+            }
+        }
+        DrawAttachmentsPanel("charge", p.id);
         ImGui::End();
 
         if (!open) {
@@ -6901,6 +7102,7 @@ static void DrawReceiptViewWindow() {
     }
     double unallocated = 0;
     for (auto& m : money) unallocated += m.amount - m.allocated;
+    DrawAttachmentsPanel("receipt", r.id);
     ImGui::Text("Σύνολο: %s €", FormatMoney(r.total).c_str());
     if (ToCents(unallocated) > 0) { ImGui::SameLine(); ImGui::TextDisabled("(εκ των οποίων %s € πίστωση πελάτη)", FormatMoney(unallocated).c_str()); }
     ImGui::Spacing();
@@ -7197,6 +7399,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
     if (greekFont) io.FontDefault = greekFont;
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+    glfwSetDropCallback(window, OnFilesDropped);      // drag & drop files onto «Συνημμένα» panels
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     while (!glfwWindowShouldClose(window)) {
@@ -7277,6 +7480,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         DrawResolveDialog();
         DrawReceiptViewWindow();
         DrawRecordPaymentDialog();
+        DrawAttachmentViewer();
         DrawPayOwnerPickPopup();
         DrawNodeGraphOverlay();
         DrawAuditLogWindow();

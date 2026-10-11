@@ -7,6 +7,7 @@
 #include "models/Note.h"
 #include "models/Receipt.h"
 #include "models/MoneyPayment.h"
+#include "models/Attachment.h"
 #include <vector>
 #include <string>
 #include <utility>
@@ -155,6 +156,13 @@ public:
     virtual double getClientCredit(int userId) = 0;                                    // money in not yet allocated
     // Receipt for money already recorded (payment ids, not charge ids). Same rules as issueReceipt.
     virtual int issueReceiptForMoney(const Receipt& r, const std::vector<int>& moneyIds) = 0;
+
+    // --- Attachments (photos, videos, PDFs, ...) ---
+    // Copies the file into the attachments folder (by content hash) and records it. Returns the id or -1.
+    virtual int addAttachment(const std::string& entity, int entityId, const std::string& sourcePath, const std::string& note) = 0;
+    virtual std::vector<Attachment> getAttachments(const std::string& entity, int entityId, bool includeRemoved = false) = 0;
+    virtual bool removeAttachment(int id, const std::string& reason) = 0;   // hides it; refused for receipts
+    virtual std::string attachmentFullPath(const Attachment& a) = 0;          // absolute path of the stored copy
 
     // --- Receipts search (Αποδείξεις screen) ---
     // Conditions over what a receipt covers, combined with ALL (AND) or ANY (OR); each can be negated (NOT).

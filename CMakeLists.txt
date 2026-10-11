@@ -65,7 +65,9 @@ set(SOURCES
     src/SqliteConn.cpp
     src/Seed.cpp
     src/ui/App.cpp
-    src/ui/DatePicker.cpp 
+    src/ui/DatePicker.cpp
+    src/ui/MediaViewer.cpp
+    src/ui/StbImage.cpp
 )
 
 add_executable(PropertyManager WIN32 ${SOURCES})
@@ -76,6 +78,37 @@ target_link_libraries(PropertyManager PRIVATE
     glfw
     OpenGL::GL
 )
+target_include_directories(PropertyManager PRIVATE third_party/stb)
+
+# ---- Optional in-app video playback (FFmpeg). Without it the app still builds and opens videos with the
+#      system's player. Linux: apt install libavformat-dev libavcodec-dev libswscale-dev libavutil-dev.
+#      Windows: vcpkg install ffmpeg:x64-windows-static (then find_package(FFMPEG) below finds it). ----
+option(BMANAGER_VIDEO "In-app video playback with FFmpeg" ON)
+if(BMANAGER_VIDEO)
+    if(WIN32)
+        find_package(FFMPEG QUIET)
+        if(FFMPEG_FOUND)
+            target_include_directories(PropertyManager PRIVATE ${FFMPEG_INCLUDE_DIRS})
+            target_link_directories(PropertyManager PRIVATE ${FFMPEG_LIBRARY_DIRS})
+            target_link_libraries(PropertyManager PRIVATE ${FFMPEG_LIBRARIES})
+            target_compile_definitions(PropertyManager PRIVATE BMANAGER_VIDEO)
+        endif()
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(FFMPEG IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
+            if(FFMPEG_FOUND)
+                target_link_libraries(PropertyManager PRIVATE PkgConfig::FFMPEG)
+                target_compile_definitions(PropertyManager PRIVATE BMANAGER_VIDEO)
+            endif()
+        endif()
+    endif()
+    if(FFMPEG_FOUND)
+        message(STATUS "Video playback: FFmpeg found, in-app player enabled")
+    else()
+        message(STATUS "Video playback: FFmpeg not found, videos open in the system player")
+    endif()
+endif()
 
 if(WIN32)
     target_compile_definitions(PropertyManager PRIVATE _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS NOMINMAX)
@@ -106,3 +139,7 @@ add_test(NAME history COMMAND history_test)
 add_executable(audit_test EXCLUDE_FROM_ALL tests/audit_test.cpp src/SqliteConn.cpp)
 target_link_libraries(audit_test PRIVATE sqlite3_vendored)
 add_test(NAME audit COMMAND audit_test)
+
+add_executable(attachments_test EXCLUDE_FROM_ALL tests/attachments_test.cpp src/SqliteConn.cpp)
+target_link_libraries(attachments_test PRIVATE sqlite3_vendored)
+add_test(NAME attachments COMMAND attachments_test)

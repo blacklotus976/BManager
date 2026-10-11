@@ -173,6 +173,10 @@ public:
     long long countReceipts(const ReceiptQuery& q, double* total = nullptr) override;
     std::vector<ReceiptLine> getReceiptLines(int receiptId) override;
     std::vector<MoneyPayment> getReceiptMoney(int receiptId) override;
+    int addAttachment(const std::string& entity, int entityId, const std::string& sourcePath, const std::string& note) override;
+    std::vector<Attachment> getAttachments(const std::string& entity, int entityId, bool includeRemoved = false) override;
+    bool removeAttachment(int id, const std::string& reason) override;
+    std::string attachmentFullPath(const Attachment& a) override;
     bool editPaymentWithReceipt(int id, const Payment& payment, const Receipt& receipt) override;
     bool voidReceipt(int id, const std::string& reason) override;
     Receipt getReceiptById(int id) override;

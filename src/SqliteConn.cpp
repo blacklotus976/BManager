@@ -151,6 +151,7 @@ static std::string JsonRowExpr(sqlite3* db, const std::string& table, const std:
 static const char* kAuditedTables[] = {
     "buildings", "apartments", "users", "residencies", "services", "service_users", "master_services",
     "master_service_components", "payment_batches", "charges", "payments", "allocations", "receipts", "notes",
+    "attachments",
 };
 
 static bool TableExists(sqlite3* db, const std::string& t) {
@@ -1101,10 +1102,44 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         }
     }
 
+
+    // --- Migration v10: attachments (files live next to the database, the rows are here and audited). ---
+    if (UserVersion(db) < 10) {
+        bool ok = executeQuery(R"(
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS attachments (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity         TEXT    NOT NULL CHECK (entity IN ('receipt','payment','charge','client','building','apartment')),
+                entity_id      INTEGER NOT NULL,
+                sha256         TEXT    NOT NULL CHECK (length(sha256) = 64),
+                file_name      TEXT    NOT NULL,
+                kind           TEXT    NOT NULL CHECK (kind IN ('image','video','pdf','other')),
+                size_bytes     INTEGER NOT NULL CHECK (size_bytes >= 0),
+                stored_path    TEXT    NOT NULL,
+                note           TEXT,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+                removed_at     TEXT,
+                removed_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_attachments_entity ON attachments(entity, entity_id);
+            CREATE TRIGGER IF NOT EXISTS trg_attachments_no_delete BEFORE DELETE ON attachments
+            BEGIN SELECT RAISE(ABORT, 'Τα συνημμένα δεν διαγράφονται - αφαιρέστε τα με αιτιολογία'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_attachments_fixed BEFORE UPDATE ON attachments
+            WHEN NEW.entity IS NOT OLD.entity OR NEW.entity_id IS NOT OLD.entity_id OR NEW.sha256 IS NOT OLD.sha256
+              OR NEW.file_name IS NOT OLD.file_name OR NEW.kind IS NOT OLD.kind OR NEW.size_bytes IS NOT OLD.size_bytes
+              OR NEW.stored_path IS NOT OLD.stored_path OR NEW.created_at IS NOT OLD.created_at
+              OR OLD.removed_at IS NOT NULL
+              OR (NEW.removed_at IS NOT NULL AND (OLD.entity = 'receipt' OR TRIM(COALESCE(NEW.removed_reason,'')) = ''))
+            BEGIN SELECT RAISE(ABORT, 'Το συνημμένο δεν αλλάζει (αφαίρεση μόνο με αιτιολογία, ποτέ από απόδειξη)'); END;
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 10; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v10) απέτυχε: " + why; }
+    }
+
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
     // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
     {
-        bool migratedNow = versionAtOpen < 9;
+        bool migratedNow = versionAtOpen < 10;
         int restored = ensureAuditTriggers();
         if (restored > 0 && !migratedNow) {
             logAction("audit", 0, "TRIGGERS_RESTORED", "", "{\"count\": " + std::to_string(restored) + "}", "db");
@@ -3651,4 +3686,105 @@ long long SqliteConn::countReceipts(const ReceiptQuery& q, double* total) {
     if (sqlite3_step(st) == SQLITE_ROW) { n = sqlite3_column_int64(st, 0); if (total) *total = FromCents((long long)sqlite3_column_double(st, 1)); }
     sqlite3_finalize(st);
     return n;
+}
+
+// --- ATTACHMENTS ------------------------------------------------------------------------------------------
+static std::string LowerExt(const std::string& path) {
+    std::string e = std::filesystem::path(path).extension().string();
+    for (auto& c : e) c = (char)std::tolower((unsigned char)c);
+    return e;
+}
+static std::string KindOf(const std::string& ext) {
+    static const char* img[] = { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tga", ".psd", ".pnm", ".ppm" };
+    static const char* vid[] = { ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp", ".wmv", ".mpg", ".mpeg" };
+    for (auto* e : img) if (ext == e) return "image";
+    for (auto* e : vid) if (ext == e) return "video";
+    if (ext == ".pdf") return "pdf";
+    return "other";
+}
+
+// SHA-256 of a file, read in 1 MB chunks (videos can be large)
+static std::string FileSha256(const std::string& path, long long& size) {
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+    if (!in) return "";
+    Sha256 h; std::vector<char> buf(1 << 20); size = 0;
+    while (in) {
+        in.read(buf.data(), (std::streamsize)buf.size());
+        std::streamsize got = in.gcount();
+        if (got <= 0) break;
+        h.Update(buf.data(), (size_t)got); size += got;
+    }
+    return h.HexDigest();
+}
+
+int SqliteConn::addAttachment(const std::string& entity, int entityId, const std::string& sourcePath, const std::string& note) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_regular_file(fs::u8path(sourcePath), ec)) { lastError_ = "Το αρχείο δεν βρέθηκε: " + sourcePath; return -1; }
+    long long size = 0;
+    std::string hash = FileSha256(sourcePath, size);
+    if (hash.empty()) { lastError_ = "Το αρχείο δεν διαβάζεται: " + sourcePath; return -1; }
+    std::string ext = LowerExt(sourcePath);
+    std::string rel = "attachments/" + hash.substr(0, 2) + "/" + hash + ext;
+    fs::path base = fs::path(dbPath_).parent_path();
+    fs::path dst = base / fs::u8path(rel);
+    fs::create_directories(dst.parent_path(), ec);
+    if (!fs::exists(dst, ec)) {
+        fs::copy_file(fs::u8path(sourcePath), dst, ec);
+        if (ec) { lastError_ = "Αποτυχία αντιγραφής του αρχείου: " + ec.message(); return -1; }
+    }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO attachments (entity, entity_id, sha256, file_name, kind, size_bytes, stored_path, note) VALUES (?,?,?,?,?,?,?,?)", -1, &st, nullptr);
+    std::string name = fs::u8path(sourcePath).filename().u8string();
+    std::string kind = KindOf(ext);
+    sqlite3_bind_text(st, 1, entity.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, entityId);
+    sqlite3_bind_text(st, 3, hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 6, size);
+    sqlite3_bind_text(st, 7, rel.c_str(), -1, SQLITE_TRANSIENT);
+    if (note.empty()) sqlite3_bind_null(st, 8); else sqlite3_bind_text(st, 8, note.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? (int)sqlite3_last_insert_rowid(db) : -1;
+}
+
+std::vector<Attachment> SqliteConn::getAttachments(const std::string& entity, int entityId, bool includeRemoved) {
+    std::vector<Attachment> out;
+    sqlite3_stmt* st = nullptr;
+    std::string sql = "SELECT id, entity, entity_id, sha256, file_name, kind, size_bytes, stored_path, COALESCE(note,''), "
+                      "COALESCE(datetime(created_at,'localtime'),''), COALESCE(datetime(removed_at,'localtime'),''), COALESCE(removed_reason,'') "
+                      "FROM attachments WHERE entity = ? AND entity_id = ?";
+    if (!includeRemoved) sql += " AND removed_at IS NULL";
+    sql += " ORDER BY id";
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, entity.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, entityId);
+    auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        Attachment a;
+        a.id = sqlite3_column_int(st, 0); a.entity = txt(1); a.entity_id = sqlite3_column_int(st, 2); a.sha256 = txt(3);
+        a.file_name = txt(4); a.kind = txt(5); a.size_bytes = sqlite3_column_int64(st, 6); a.stored_path = txt(7);
+        a.note = txt(8); a.created_at = txt(9); a.removed_at = txt(10); a.removed_reason = txt(11);
+        out.push_back(a);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+bool SqliteConn::removeAttachment(int id, const std::string& reason) {
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE attachments SET removed_at = datetime('now'), removed_reason = ? WHERE id = ?", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, id);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE;
+}
+
+std::string SqliteConn::attachmentFullPath(const Attachment& a) {
+    return (std::filesystem::path(dbPath_).parent_path() / std::filesystem::u8path(a.stored_path)).u8string();
 }

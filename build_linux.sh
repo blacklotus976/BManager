@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Linux build of PropertyManager (counterpart of build_imgui.bat).
 # Needs: cmake, g++, libglfw3-dev, libgl-dev  (Debian/Ubuntu: apt install cmake g++ libglfw3-dev libgl-dev)
+# Optional, for the in-app video player: apt install libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
 set -euo pipefail
 cd "$(dirname "$0")"
 IMGUI_DIR="${IMGUI_DIR:-third_party/imgui}"
@@ -10,6 +11,6 @@ if [ ! -f "$IMGUI_DIR/imgui.cpp" ]; then
     git clone --depth 1 -b "$IMGUI_TAG" https://github.com/ocornut/imgui "$IMGUI_DIR"
 fi
 cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release -DIMGUI_DIR="$(realpath "$IMGUI_DIR")"
-cmake --build build-linux --target PropertyManager money_test receipts_test history_test audit_test -j"$(nproc)"
+cmake --build build-linux --target PropertyManager money_test receipts_test history_test audit_test attachments_test -j"$(nproc)"
 ctest --test-dir build-linux --output-on-failure
 echo "--- Built: build-linux/PropertyManager ---"
