@@ -39,6 +39,7 @@ public:
     std::vector<Residency> getUserResidencies(int userId) override;
     bool setResidencyHistory(int userId, const std::vector<Residency>& history) override;
     std::vector<Payment> getPaymentsForApartment(int apartmentId) override;
+    int getApartmentOnDate(int userId, int y, int m, int d) override { return apartmentAt(userId, y, m, d); }
     std::string takeLastError() override;
     // Once a day: copy the database to <db folder>/backups/ (keeps the newest `keep`).
     void autoBackup(int keep = 14);

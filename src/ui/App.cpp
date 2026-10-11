@@ -2204,6 +2204,9 @@ static bool g_paymentDialogWasOpen = false;
 static bool g_paymentDialogIsEdit = false;
 static int g_paymentDialogId = -1;
 static int pb_userId = -1, pb_serviceId = -1;
+// Apartment the payment is FOR. -1 = automatic: the apartment the client lived in on the payment date
+// (residency history). Picked by hand e.g. for arrears of a previous apartment paid after moving.
+static int pb_aptId = -1, pb_aptUser = -1;
 static int pb_direction = 0; // 0 = in (collect from client), 1 = out (manager paid on client's behalf)
 // Simplified status model: a payment is either "future" (scheduled, has a resolution_date,
 // doesn't count in any total) or resolved (status="paid", counts fully). No more
@@ -2232,6 +2235,49 @@ static void OpenAddPayment() {
     pb_dateStr = CurrentDateString();
     pb_due.set("0"); pb_paid.set("0"); pb_notes.set(""); pb_resolutionDate.clear();
     pb_direction = 0; pb_isFuture = false; pb_lockUser = false; pb_lockService = false;
+    pb_aptId = -1; pb_aptUser = -1;
+}
+
+// "Πατησίων 205 – Α1" for an apartment id ("" if unknown). Small query; used by dialogs only.
+static std::string ApartmentName(int aptId) {
+    if (aptId <= 0) return "";
+    std::vector<std::string> c; std::vector<std::vector<std::string>> rows; std::string err;
+    g_app.conn->executeRawQuery("SELECT b.address || ' – ' || a.label FROM apartments a JOIN buildings b ON b.id = a.building_id WHERE a.id = "
+                                + std::to_string(aptId), c, rows, err);
+    return rows.empty() || rows[0].empty() ? "#" + std::to_string(aptId) : rows[0][0];
+}
+
+// Apartment the client lived in on `date` (YYYY-MM-DD) -- same rule the DB uses for new payments.
+static int ApartmentOnDate(int userId, const std::string& date) {
+    int y = 0, m = 0, d = 0;
+    if (userId <= 0 || std::sscanf(date.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return -1;
+    return g_app.conn->getApartmentOnDate(userId, y, m, d);
+}
+
+// Picker for pb_aptId: "automatic" + every apartment the client has lived in (with dates) + their current one.
+static void DrawPaymentApartmentPicker() {
+    if (pb_aptUser != pb_userId) { pb_aptId = -1; pb_aptUser = pb_userId; }   // other client -> back to automatic
+    int autoApt = ApartmentOnDate(pb_userId, pb_dateStr);
+    std::string autoLabel = "Αυτόματα: " + (autoApt > 0 ? ApartmentName(autoApt) : std::string("χωρίς διαμέρισμα"));
+    std::string preview = pb_aptId > 0 ? ApartmentName(pb_aptId) : autoLabel;
+    if (ImGui::BeginCombo("Διαμέρισμα", preview.c_str())) {
+        if (ImGui::Selectable(autoLabel.c_str(), pb_aptId <= 0)) pb_aptId = -1;
+        std::set<int> shown;
+        auto res = g_app.conn->getUserResidencies(pb_userId);
+        for (auto it = res.rbegin(); it != res.rend(); ++it) {
+            if (!shown.insert(it->apartment_id).second) continue;
+            std::string l = ApartmentName(it->apartment_id) + "   (" + it->from_date + " → " + (it->to_date.empty() ? "σήμερα" : it->to_date) + ")";
+            if (ImGui::Selectable(l.c_str(), pb_aptId == it->apartment_id)) pb_aptId = it->apartment_id;
+        }
+        int cur = g_app.conn->getUserById(pb_userId).apartment_id;
+        if (cur > 0 && shown.insert(cur).second && ImGui::Selectable(ApartmentName(cur).c_str(), pb_aptId == cur)) pb_aptId = cur;
+        if (pb_aptId > 0 && shown.insert(pb_aptId).second) ImGui::Selectable(ApartmentName(pb_aptId).c_str(), true);
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Για ποιο διαμέρισμα είναι η πληρωμή. Αυτόματα = όπου έμενε ο πελάτης\n"
+                                                  "την ημερομηνία πληρωμής. Επιλέξτε χειροκίνητα π.χ. για παλιές οφειλές\n"
+                                                  "προηγούμενου διαμερίσματος που εξοφλούνται μετά τη μετακόμιση.");
 }
 
 static void DrawPaymentDialog() {
@@ -2248,6 +2294,8 @@ static void DrawPaymentDialog() {
         DiffAdd(d, "Ημερομηνία", od, pb_dateStr);
         if (o.user_id != pb_userId) d.push_back({"Πελάτης", g_app.userName(o.user_id), g_app.userName(pb_userId)});
         if (o.service_id != pb_serviceId) d.push_back({"Υπηρεσία", g_app.serviceLabel(o.service_id), g_app.serviceLabel(pb_serviceId)});
+        { int na = pb_aptId > 0 ? pb_aptId : ApartmentOnDate(pb_userId, pb_dateStr);
+          if (na != o.apartment_id) d.push_back({"Διαμέρισμα", ApartmentName(o.apartment_id), ApartmentName(na)}); }
         double nd = 0.0, np = 0.0; ParseMoney(pb_due.str(), nd); ParseMoney(pb_paid.str(), np);
         char a[32], b[32];
         if (std::fabs(o.amount_due - nd) > 0.004) { std::snprintf(a, sizeof(a), "%.2f", o.amount_due); std::snprintf(b, sizeof(b), "%.2f", nd); d.push_back({"Οφειλή", a, b}); }
@@ -2275,6 +2323,7 @@ static void DrawPaymentDialog() {
         }
         ImGui::TextUnformatted("Ημερομηνία πληρωμής:");
         DatePicker("paydate", pb_dateStr, ImVec2(0, 1));
+        DrawPaymentApartmentPicker();
         ImGui::Spacing();
         ImGui::TextDisabled("Τύπος:");
         ImGui::RadioButton("Είσπραξη από πελάτη", &pb_direction, 0);
@@ -2319,6 +2368,7 @@ static void DrawPaymentDialog() {
             }
             np.notes = pb_notes.str();
             np.resolution_date = np.status == "future" ? pb_resolutionDate : "";
+            np.apartment_id = pb_aptId > 0 ? pb_aptId : ApartmentOnDate(np.user_id, pb_dateStr);
             if (g_paymentDialogIsEdit) {
                 Payment old = g_app.conn->getPaymentById(g_paymentDialogId);
                 np.resolved_at = old.resolved_at; // editing via the normal dialog never touches resolved_at
@@ -2572,7 +2622,7 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
         ImGui::SameLine();
         if (ImGui::SmallButton("Επεξ.")) {
             g_paymentDialogIsEdit = true; g_paymentDialogId = p.id;
-            pb_userId = p.user_id; pb_serviceId = p.service_id;
+            pb_userId = p.user_id; pb_serviceId = p.service_id; pb_aptId = p.apartment_id; pb_aptUser = p.user_id;
             char db[16];
             std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
             pb_dateStr = db;
@@ -2718,7 +2768,7 @@ static void DrawPaymentsScreen() {
         ImGui::SameLine();
         if (ImGui::SmallButton("Επεξ.")) {
             g_paymentDialogIsEdit = true; g_paymentDialogId = p.id;
-            pb_userId = p.user_id; pb_serviceId = p.service_id;
+            pb_userId = p.user_id; pb_serviceId = p.service_id; pb_aptId = p.apartment_id; pb_aptUser = p.user_id;
                         char db[16];
             std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
             pb_dateStr = db;
@@ -3196,7 +3246,7 @@ static void DrawServiceDetailWindow() {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Επεξ.")) {
                     g_paymentDialogIsEdit = true; g_paymentDialogId = p.id;
-                    pb_userId = p.user_id; pb_serviceId = p.service_id;
+                    pb_userId = p.user_id; pb_serviceId = p.service_id; pb_aptId = p.apartment_id; pb_aptUser = p.user_id;
                     char db[16];
                     std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
                     pb_dateStr = db;

@@ -557,6 +557,36 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         executeQuery("COMMIT;");
     }
 
+    // --- Migration v5: payment <-> apartment history is permanent. A payment records the apartment it
+    // was made for (snapshot at its date, or chosen by hand for e.g. arrears paid after moving out).
+    // Deleting an apartment, building or client that payments point at would erase "who paid for which
+    // apartment", so the DB refuses it; the apartment of a receipted payment is frozen like its amounts. ---
+    if (UserVersion(db) < 5) {
+        executeQuery("BEGIN;");
+        executeQuery(R"(
+            CREATE TRIGGER IF NOT EXISTS trg_apartments_keep_payments BEFORE DELETE ON apartments
+            WHEN EXISTS (SELECT 1 FROM payments WHERE apartment_id = OLD.id)
+            BEGIN SELECT RAISE(ABORT, 'Το διαμέρισμα έχει πληρωμές στο ιστορικό του και δεν διαγράφεται'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_users_keep_payments BEFORE DELETE ON users
+            WHEN EXISTS (SELECT 1 FROM payments WHERE user_id = OLD.id)
+            BEGIN SELECT RAISE(ABORT, 'Ο πελάτης έχει πληρωμές στο ιστορικό του και δεν διαγράφεται'); END;
+
+            DROP TRIGGER IF EXISTS trg_payments_receipted_update;
+            CREATE TRIGGER trg_payments_receipted_update BEFORE UPDATE ON payments
+            WHEN OLD.receipt_id IS NOT NULL
+             AND (SELECT status FROM receipts WHERE id = OLD.receipt_id) = 'issued'
+             AND (NEW.amount_due IS NOT OLD.amount_due OR NEW.amount_paid IS NOT OLD.amount_paid
+                  OR NEW.user_id IS NOT OLD.user_id OR NEW.service_id IS NOT OLD.service_id
+                  OR NEW.apartment_id IS NOT OLD.apartment_id
+                  OR NEW.direction IS NOT OLD.direction OR NEW.status IS NOT OLD.status
+                  OR NEW.receipt_id IS NOT OLD.receipt_id)
+            BEGIN SELECT RAISE(ABORT, 'Η πληρωμή έχει απόδειξη - ακυρώστε πρώτα την απόδειξη για να την αλλάξετε'); END;
+        )");
+        executeQuery("PRAGMA user_version = 5;");
+        executeQuery("COMMIT;");
+    }
+
     greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
     greekHeaders["buildings"] = {"ΚΩΔ", "ΔΙΕΥΘΥΝΣΗ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΑΦΜ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["apartments"] = {"ΚΩΔ", "ΚΩΔ ΚΤΙΡΙΟΥ", "ΔΙΑΜΕΡΙΣΜΑ"};
@@ -716,6 +746,7 @@ bool SqliteConn::removeUser(int id) {
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt, 1, id);
     int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);   // refused: the client has payments (history)
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) { executeQuery("DELETE FROM residencies WHERE user_id = " + std::to_string(id) + ";"); logAction("users", id, "DELETE", "", "", "business"); return true; }
     return false;
@@ -815,12 +846,12 @@ bool SqliteConn::removeBuilding(int id) {
         "BEGIN;"
         "UPDATE users SET apartment_id = NULL WHERE apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ");"
         "DELETE FROM residencies WHERE apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ");"
-        "UPDATE payments SET apartment_id = NULL WHERE apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ");"
         "DELETE FROM apartments WHERE building_id = " + sid + ";"
         "DELETE FROM buildings WHERE id = " + sid + ";"
         "COMMIT;";
     if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "removeBuilding failed: " << (err ? err : "?") << std::endl;
+        lastError_ = err ? err : "removeBuilding failed";
         sqlite3_free(err);
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
@@ -879,11 +910,11 @@ bool SqliteConn::removeApartment(int id) {
         "BEGIN;"
         "UPDATE users SET apartment_id = NULL WHERE apartment_id = " + sid + ";"
         "DELETE FROM residencies WHERE apartment_id = " + sid + ";"
-        "UPDATE payments SET apartment_id = NULL WHERE apartment_id = " + sid + ";"
         "DELETE FROM apartments WHERE id = " + sid + ";"
         "COMMIT;";
     if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "removeApartment failed: " << (err ? err : "?") << std::endl;
+        lastError_ = err ? err : "removeApartment failed";
         sqlite3_free(err);
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
@@ -946,7 +977,9 @@ bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& h
            "SELECT r.apartment_id FROM residencies r WHERE r.user_id = payments.user_id "
            "AND r.from_date <= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day) "
            "AND (r.to_date IS NULL OR r.to_date >= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day)) "
-           "ORDER BY r.from_date DESC, r.id DESC LIMIT 1), apartment_id) WHERE user_id = " + uid + ";COMMIT;";
+           "ORDER BY r.from_date DESC, r.id DESC LIMIT 1), apartment_id) WHERE user_id = " + uid +
+           // receipted payments keep the apartment printed on their receipt
+           " AND (receipt_id IS NULL OR (SELECT status FROM receipts WHERE id = payments.receipt_id) = 'void');COMMIT;";
     if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
         lastError_ = err ? err : "setResidencyHistory failed";
         sqlite3_free(err);

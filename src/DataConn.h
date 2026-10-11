@@ -60,6 +60,9 @@ public:
     // apartment snapshot of that client's payments from the new dates.
     virtual bool setResidencyHistory(int userId, const std::vector<Residency>& history) = 0;
     virtual std::vector<Payment> getPaymentsForApartment(int apartmentId) = 0;
+    // The apartment a client lived in on that date (residency history; falls back to their current
+    // apartment), -1 = none. This is the automatic apartment a new payment is recorded against.
+    virtual int getApartmentOnDate(int userId, int y, int m, int d) = 0;
     // The last database error nobody has looked at yet ("" = none); the UI shows it as a banner.
     virtual std::string takeLastError() = 0;
 
