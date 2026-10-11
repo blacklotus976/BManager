@@ -69,6 +69,16 @@ public:
     std::vector<Payment> getPaymentsForApartment(int apartmentId) override;
     int getApartmentOnDate(int userId, int y, int m, int d) override { return apartmentAt(userId, y, m, d); }
     std::string takeLastError() override;
+    std::string errorLogPath() override;
+    std::vector<JointService> getJointCatalog(bool includeInactive = false) override;
+    int addJointService(const Service& s, const std::string& kind) override;
+    bool editJointService(int id, const Service& s, const std::string& kind, bool active) override;
+    int chargeJoint(const JointOp& op, const std::vector<JointLine>& lines, const std::vector<JointShare>& shares) override;
+    std::vector<JointOp> getJointOps(int buildingId, int offset, int limit) override;
+    int countJointOps(int buildingId) override;
+    JointOp getJointOpById(int id) override;
+    std::vector<JointShare> getJointShares(int opId) override;
+    std::vector<int> getJointOpCharges(int opId) override;
     // Once a day: copy the database to <db folder>/backups/ (keeps the newest `keep`).
     void autoBackup(int keep = 14);
     int addApartment(int buildingId, const std::string& label) override;

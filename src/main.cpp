@@ -2,6 +2,7 @@
 #include <string>
 #include <fstream>
 #include "SqliteConn.h"
+#include "ErrorLog.h"
 #include "Seed.h"
 #include "ui/App.h"
 #include "Config.h"
@@ -110,9 +111,13 @@ int main() {
     // (even empty) file is the user's own and must stay as it is.
     bool dbExisted = false;
     { std::ifstream probe(dbPath, std::ios::binary); dbExisted = probe.good(); }
-    auto conn = std::make_unique<SqliteConn>(dbPath);
-    if (!dbExisted) seedDemoDataIfEmpty(conn.get());
-    conn->autoBackup();   // one copy per day in <db folder>/backups, newest 14 kept
-
-    return RunApp(conn.get(), dbPath);
+    try {
+        auto conn = std::make_unique<SqliteConn>(dbPath);
+        if (!dbExisted) seedDemoDataIfEmpty(conn.get());
+        conn->autoBackup();   // one copy per day in <db folder>/backups, newest 14 kept
+        return RunApp(conn.get(), dbPath);
+    } catch (const std::exception& e) {
+        errlog::Write("crash", e.what());     // logs/errors.csv: what stopped the app, for the next start
+        throw;
+    }
 }

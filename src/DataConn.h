@@ -3,6 +3,7 @@
 #include "models/Building.h"
 #include "models/Service.h"
 #include "models/MasterService.h"
+#include "models/Joint.h"
 #include "models/Payment.h"
 #include "models/Note.h"
 #include "models/Receipt.h"
@@ -67,6 +68,8 @@ public:
     virtual int getApartmentOnDate(int userId, int y, int m, int d) = 0;
     // The last database error nobody has looked at yet ("" = none); the UI shows it as a banner.
     virtual std::string takeLastError() = 0;
+    // Every error the app shows is also appended to <db folder>/logs/errors.csv (time, source, message).
+    virtual std::string errorLogPath() = 0;
 
     // --- Services ---
     // A `services` row is a generic, reusable catalog entry (e.g. "Πετρέλαιο",
@@ -321,7 +324,22 @@ public:
         std::vector<double> userNet;         // per user: paidOut - collected
         double totalNet = 0.0;
     };
-    virtual std::vector<JointServiceSummary> getJointServices() = 0;
+    virtual std::vector<JointServiceSummary> getJointServices() = 0;   // legacy: services shared by several clients
+
+    // --- Κοινόχρηστα: a cost split across a collection of apartments (see models/Joint.h) ---
+    virtual std::vector<JointService> getJointCatalog(bool includeInactive = false) = 0;
+    virtual int addJointService(const Service& s, const std::string& kind) = 0;            // new id or -1
+    virtual bool editJointService(int id, const Service& s, const std::string& kind, bool active) = 0;
+    // Saves the operation, its shares (included and excluded) and one charge per included share and line,
+    // all or nothing. Refused unless: total > 0, the lines add up to the total, at least one share is
+    // included, included shares have a client and a positive amount and add up to the total exactly (cents),
+    // and every excluded share has a reason. Returns the new operation id, -1 + takeLastError() otherwise.
+    virtual int chargeJoint(const JointOp& op, const std::vector<JointLine>& lines, const std::vector<JointShare>& shares) = 0;
+    virtual std::vector<JointOp> getJointOps(int buildingId, int offset, int limit) = 0;    // buildingId -1 = all, newest first
+    virtual int countJointOps(int buildingId) = 0;
+    virtual JointOp getJointOpById(int id) = 0;
+    virtual std::vector<JointShare> getJointShares(int opId) = 0;
+    virtual std::vector<int> getJointOpCharges(int opId) = 0;
 
     // --- Raw SQL console (Settings screen power-user feature) ---
     virtual bool executeRawQuery(const std::string& sql, std::vector<std::string>& outColumns,

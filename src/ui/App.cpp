@@ -45,7 +45,9 @@
 #include <ctime>
 
 
-#include "DatePicker.h"  
+#include "DatePicker.h"
+#include "JointKinds.h"
+#include "ErrorLog.h"  
 #include "MediaViewer.h"
 
 
@@ -54,6 +56,7 @@
 // ---------------------------------------------------------------------------
 static void GlfwErrorCallback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+    errlog::Write("graphics", "GLFW " + std::to_string(error) + ": " + (description ? description : ""));
 }
 
 static std::string CurrentTimestampString() {
@@ -966,6 +969,9 @@ static void DrawBuildingDialogs() {
     }
 }
 
+static void OpenJointCharge(int buildingId, int sourceType = 0, int sourceId = -1);
+static void DrawJointOpsTable(int buildingId, const char* id);
+
 static void DrawBuildingsScreen() {
     if (ImGui::Button("Νέα πολυκατοικία")) {
         g_showBldgDialog = true; g_bldgDialogIsEdit = false; g_bldgDialogId = -1;
@@ -1057,6 +1063,8 @@ static void DrawBuildingsScreen() {
         g_showAptDialog = true; g_aptDialogIsEdit = false; g_aptDialogId = -1;
         g_aptDialogBuilding = b.b.id; ad_label.set("");
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Χρέωση κοινοχρήστου")) OpenJointCharge(b.b.id);
     ImGui::Spacing();
 
     // ---- Logistics: 4 stat tiles (same visual language as profile/dashboard) ----
@@ -1080,8 +1088,10 @@ static void DrawBuildingsScreen() {
     }
 
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "Διαμερίσματα & Κάτοικοι");
-    ImGui::Separator();
+    static Cached<int> jointCount;
+    int nJoint = jointCount.get(std::to_string(b.b.id), [&] { return g_app.conn->countJointOps(b.b.id); });
+    if (!ImGui::BeginTabBar("bldgtabs")) { ImGui::EndChild(); return; }
+    if (ImGui::BeginTabItem("Διαμερίσματα & Κάτοικοι")) {
 
     if (ImGui::BeginTable("bldgapts", 7,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
@@ -1154,6 +1164,16 @@ static void DrawBuildingsScreen() {
         }
         ImGui::EndTable();
     }
+    ImGui::EndTabItem();
+    }
+    std::string jointTab = "Κοινόχρηστα (" + std::to_string(nJoint) + ")###bldgjointtab";
+    if (ImGui::BeginTabItem(jointTab.c_str())) {
+        if (nJoint == 0) ImGui::TextDisabled("Καμία κοινόχρηστη χρέωση σε αυτή την πολυκατοικία — «Χρέωση κοινοχρήστου» για την πρώτη.");
+        else ImGui::TextDisabled("Κάθε χρέωση μοιράστηκε στους ενοίκους· «Άνοιγμα» δείχνει ποιοι χρεώθηκαν και ποιοι εξαιρέθηκαν και γιατί.");
+        DrawJointOpsTable(b.b.id, "bldgjoint");
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
 
     ImGui::EndChild();
 }
@@ -2086,136 +2106,517 @@ static void DrawServicesScreen() {
 }
 
 // ---------------------------------------------------------------------------
-// JOINT SERVICES SCREEN ("Κοινόχρηστες Υπηρεσίες")
+// ΚΟΙΝΟΧΡΗΣΤΑ ("Κοινόχρηστες Υπηρεσίες")
+// A joint charge splits ONE cost over a collection of apartments (normally a building's): every current
+// resident gets their own charge (then their own payment and receipt as usual); excluded apartments are
+// recorded with the reason. The split logic per kind lives in JointKinds.h.
 // ---------------------------------------------------------------------------
-static bool g_showJointDialog = false;
-static bool g_jointDialogWasOpen = false;
-static TextBuf jb_label, jb_notes;
-static std::vector<char> jb_selected; // parallel to g_app.users
-static TextBuf jb_newUserName, jb_newUserPhone;
+static void OpenRecordPayment(int userId);
+static void OpenJointView(int id);
 
-static void OpenAddJoint() {
-    g_showJointDialog = true;
-    jb_label.set(""); jb_notes.set(""); jb_price = 0.0;
-    jb_selected.assign(g_app.users.size(), 0);
-    jb_newUserName.set(""); jb_newUserPhone.set("");
+// ---- catalog dialog (new / edit joint service) ----
+static bool g_showJointSvc = false, g_jointSvcWasOpen = false;
+static int g_jointSvcId = -1;                 // -1 = new
+static TextBuf js_label, js_notes;
+static int js_kind = 0;
+static bool js_active = true;
+
+static int KindIndex(const std::string& id) {
+    for (size_t i = 0; i < JointKinds().size(); i++) if (id == JointKinds()[i].id) return (int)i;
+    return 0;
 }
 
-static void DrawJointDialog() {
-    if (g_showJointDialog && !g_jointDialogWasOpen) {
-        ImGui::OpenPopup("Νέα Κοινόχρηστη Υπηρεσία");
-    }
-    g_jointDialogWasOpen = g_showJointDialog;
-    if (!g_showJointDialog) return;
-    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
-    if (BeginGuardedModal("Νέα Κοινόχρηστη Υπηρεσία", g_showJointDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::InputText("Ετικέτα", jb_label.data, sizeof(jb_label.data));
-        ImGui::InputTextMultiline("Σημειώσεις", jb_notes.data, sizeof(jb_notes.data), ImVec2(0, 50));
-        InputMoney("Προτεινόμενη τιμή (€)", &jb_price);
-        ImGui::Separator();
-        ImGui::Text("Επιλογή συνιδιοκτητών (2+):");
-        if (jb_selected.size() != g_app.users.size()) jb_selected.assign(g_app.users.size(), 0);
-        ImGui::BeginChild("rosterpick", ImVec2(0, 140), true);
-        for (size_t i = 0; i < g_app.users.size(); i++) {
-            bool v = jb_selected[i] != 0;
-            if (ImGui::Checkbox(g_app.users[i].full_name.c_str(), &v)) jb_selected[i] = v ? 1 : 0;
-        }
-        ImGui::EndChild();
+static void OpenJointServiceDialog(const JointService* j) {
+    g_showJointSvc = true;
+    g_jointSvcId = j ? j->id : -1;
+    js_label.set(j ? j->service.label : ""); js_notes.set(j ? j->service.extra_notes : "");
+    js_kind = j ? KindIndex(j->kind) : 0; js_active = j ? j->active : true;
+}
 
-        ImGui::Separator();
-        ImGui::TextDisabled("Γρήγορη προσθήκη νέου χρήστη:");
-        ImGui::SetNextItemWidth(180); ImGui::InputTextWithHint("##nuname", "Ονοματεπώνυμο", jb_newUserName.data, sizeof(jb_newUserName.data));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(140); ImGui::InputTextWithHint("##nuphone", "Τηλέφωνο", jb_newUserPhone.data, sizeof(jb_newUserPhone.data));
-        ImGui::SameLine();
-        if (ImGui::Button("+ Νέος")) {
-            if (jb_newUserName.str().size() > 0) {
-                User nu; nu.full_name = jb_newUserName.str(); nu.phone = jb_newUserPhone.str();
-                g_app.conn->addUser(nu);
-                g_app.reloadUsers();
-                jb_selected.assign(g_app.users.size(), 0);
-                // select the newly-created user (last added, matched by name)
-                for (size_t i = 0; i < g_app.users.size(); i++)
-                    if (g_app.users[i].full_name == nu.full_name) jb_selected[i] = 1;
-                jb_newUserName.set(""); jb_newUserPhone.set("");
-            }
+static void DrawJointServiceDialog() {
+    const char* title = "Κοινόχρηστη υπηρεσία###jointsvc";
+    if (g_showJointSvc && !g_jointSvcWasOpen) ImGui::OpenPopup(title);
+    g_jointSvcWasOpen = g_showJointSvc;
+    if (!g_showJointSvc) return;
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Appearing);
+    if (BeginGuardedModal(title, g_showJointSvc, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("Όνομα", js_label.data, sizeof(js_label.data));
+        ImGui::InputTextMultiline("Σημειώσεις", js_notes.data, sizeof(js_notes.data), ImVec2(0, 50));
+        ImGui::SetNextItemWidth(260);
+        if (ImGui::BeginCombo("Τρόπος κατανομής", JointKinds()[js_kind].name)) {
+            for (size_t i = 0; i < JointKinds().size(); i++)
+                if (ImGui::Selectable(JointKinds()[i].name, (int)i == js_kind)) js_kind = (int)i;
+            ImGui::EndCombo();
         }
-
+        ImGui::PushTextWrapPos(480); ImGui::TextDisabled("%s", JointKinds()[js_kind].help); ImGui::PopTextWrapPos();
+        if (g_jointSvcId > 0) ImGui::Checkbox("Ενεργή (εμφανίζεται στις χρεώσεις)", &js_active);
         ImGui::Spacing();
-        int selCount = 0; for (char c : jb_selected) if (c) selCount++;
-        if (selCount < 2) ImGui::TextColored(ImVec4(1,0.5f,0.3f,1), "Επιλέξτε τουλάχιστον 2 χρήστες.");
-        ImGui::BeginDisabled(selCount < 2 || jb_label.str().empty() || jb_price <= 0.0);
-        if (ImGui::Button("Δημιουργία", ImVec2(150, 0))) {
-            Service ns; ns.label = jb_label.str(); ns.extra_notes = jb_notes.str(); ns.suggested_price = jb_price;
-            std::vector<int> userIds;
-            for (size_t i = 0; i < jb_selected.size(); i++) if (jb_selected[i]) userIds.push_back(g_app.users[i].id);
-            RequestConfirm("Νέα κοινόχρηστη υπηρεσία", { {"Ετικέτα", "-", ns.label}, {"Συνιδιοκτήτες", "-", std::to_string(userIds.size())} },
-                [ns, userIds]() {
-                    int sid = g_app.conn->addServiceGetId(userIds[0], ns);
-                    if (sid >= 0) for (size_t i = 1; i < userIds.size(); i++) g_app.conn->addServiceUser(sid, userIds[i]);
-                    g_app.reloadServices();
-                    g_app.reloadJoint();
-                });
-            g_showJointDialog = false;
-            ImGui::CloseCurrentPopup();
+        ImGui::BeginDisabled(js_label.str().empty());
+        if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) {
+            Service s; s.label = js_label.str(); s.extra_notes = js_notes.str();
+            std::string kind = JointKinds()[js_kind].id;
+            int id = g_jointSvcId; bool active = js_active;
+            if (id < 0) g_app.conn->addJointService(s, kind);
+            else g_app.conn->editJointService(id, s, kind, active);
+            g_app.reloadServices(); g_app.reloadGen++;
+            g_showJointSvc = false; ImGui::CloseCurrentPopup();
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Ακύρωση", ImVec2(150, 0))) { g_showJointDialog = false; ImGui::CloseCurrentPopup(); }
+        if (ImGui::Button("Ακύρωση", ImVec2(150, 0))) { g_showJointSvc = false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
 }
 
-static void DrawJointServicesScreen() {
-    if (ImGui::Button("+ Νέα Κοινόχρηστη Υπηρεσία")) OpenAddJoint();
-    ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) g_app.reloadJoint();
-    ImGui::Separator();
+// ---- charge dialog ----
+struct JointChargeState {
+    bool show = false, wasOpen = false;
+    int sourceType = 0;                       // 0 joint service, 1 package, 2 service
+    int sourceId = -1;
+    int buildingId = -1;
+    int kind = 0;
+    std::string date;
+    TextBuf label, note, svcFilter;
+    JointDraft d;
+    bool manual = false;                      // the person typed a share: stop re-proposing
+    long long proposedFor = -1;               // hash of the inputs the current proposal was made for
+    int loadedBuilding = -1;
+    std::string weightsFrom;                  // "from the charge of dd/mm" hint
+    bool confirming = false;                  // second step: summary + final button
+};
+static JointChargeState g_jc;
+static const char* kJointSourceNames[] = { "Κοινόχρηστη υπηρεσία", "Πακέτο υπηρεσιών", "Υπηρεσία" };
 
-    ImGui::BeginChild("jointcards", ImVec2(0, 0), false);
-    for (auto& j : g_app.jointServices) {
-        ImGui::PushID(j.service.id);
-        // Big and spacious, per the client ("not suppressed and tiny"): a base
-        // height for the title/totals/button block plus a real row height per
-        // roster entry, so a 4-owner service's card is taller than a 2-owner one
-        // and the whole roster is always visible without needing to scroll (cards
-        // have scrolling disabled by BeginCard, so an undersized table silently
-        // hid rows before this fix).
-        float lineH = ImGui::GetTextLineHeightWithSpacing();
-        const float kRosterRowH = 28.0f;
-        const float kRosterHeaderH = 30.0f;
-        const float kBaseH = 3 * lineH /*title/totals/net lines*/ + 30.0f /*Άνοιγμα button*/ + 24.0f /*padding*/;
-        float rosterH = kRosterHeaderH + (float)j.users.size() * kRosterRowH;
-        float cardH = kBaseH + rosterH;
-        BeginCard("card", ImVec2(ImGui::GetContentRegionAvail().x, cardH));
-        ImGui::TextColored(ImVec4(1.0f,0.8f,0.3f,1), "%s  (%zu συνιδιοκτήτες)%s", j.service.label.c_str(), j.users.size(),
-                           j.service.suggested_price > 0.0 ? (std::string("  ·  Προτεινόμενη τιμή: ") + std::to_string((int)(j.service.suggested_price + 0.5)) + " €").c_str() : "");
-        ImGui::Text("Σύνολο οφειλής: %.2f €   Σύνολο πληρωμένο: %.2f €", j.totalDue, j.totalPaid);
-        ImVec4 jNetCol = j.totalNet > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1);
-        ImGui::TextColored(jNetCol, "Υπόλοιπο μέχρι μηδενισμού (πληρώθηκε - εισπράχθηκε): %.2f €", j.totalNet);
-        if (ImGui::SmallButton("Άνοιγμα")) OpenServiceDetail(j.service.id);
-        if (ImGui::BeginTable("roster", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, rosterH))) {
-            ImGui::TableSetupColumn("Χρήστης");
-            ImGui::TableSetupColumn("Οφειλή");
-            ImGui::TableSetupColumn("Πληρωμένο");
-            ImGui::TableSetupColumn("Υπόλοιπο");
+static void OpenJointCharge(int buildingId, int sourceType, int sourceId) {
+    g_jc = JointChargeState{};
+    g_jc.show = true; g_jc.buildingId = buildingId; g_jc.sourceType = sourceType; g_jc.sourceId = sourceId;
+    g_jc.date = CurrentDateString();
+}
+
+// Every apartment of the building, one row per current resident; vacant apartments are excluded rows.
+static void JointLoadRows(const std::string& kindId) {
+    g_jc.d.rows.clear();
+    g_jc.loadedBuilding = g_jc.buildingId;
+    g_jc.manual = false; g_jc.proposedFor = -1; g_jc.weightsFrom.clear();
+    if (g_jc.buildingId <= 0) return;
+    // weights proposed from the latest charge of the same kind in this building
+    std::map<int, double> weights;
+    for (auto& o : g_app.conn->getJointOps(g_jc.buildingId, 0, 50)) {
+        if (o.kind != kindId) continue;
+        weights = JointWeightsFromJson(o.params_json);
+        if (!weights.empty()) { g_jc.weightsFrom = o.label + " (" + o.op_date + ")"; break; }
+    }
+    for (auto& a : g_app.conn->getApartmentsForBuilding(g_jc.buildingId)) {
+        bool any = false;
+        for (auto& u : g_app.users) {
+            if (u.apartment_id != a.id) continue;
+            JointRow r; r.apartment_id = a.id; r.user_id = u.id; r.apt_label = a.label; r.user_name = u.full_name;
+            if (auto w = weights.find(a.id); w != weights.end()) r.weight = w->second;
+            g_jc.d.rows.push_back(r);
+            any = true;
+        }
+        if (!any) {
+            JointRow r; r.apartment_id = a.id; r.apt_label = a.label; r.included = false;
+            std::snprintf(r.reason, sizeof(r.reason), "%s", "Κενό διαμέρισμα");
+            if (auto w = weights.find(a.id); w != weights.end()) r.weight = w->second;
+            g_jc.d.rows.push_back(r);
+        }
+    }
+}
+
+// What the charge splits: one line, or a package's components (the total spread by their catalog prices).
+static std::vector<JointLine> JointLines(std::string* sourceLabel) {
+    std::vector<JointLine> lines;
+    long long total = ToCents(g_jc.d.total);
+    if (g_jc.sourceType == 1) {
+        auto comps = g_app.conn->getMasterServiceComponents(g_jc.sourceId);
+        std::vector<double> w; for (auto& c : comps) w.push_back(c.suggested_price);
+        auto parts = SplitCents(total, w);
+        for (size_t i = 0; i < comps.size(); i++) lines.push_back({comps[i].id, FromCents(parts[i])});
+        if (sourceLabel) for (auto& m : g_app.conn->getMasterServices()) if (m.id == g_jc.sourceId) *sourceLabel = m.label;
+    } else if (g_jc.sourceType == 0) {
+        for (auto& j : g_app.conn->getJointCatalog(true)) if (j.id == g_jc.sourceId) {
+            lines.push_back({j.service.id, g_jc.d.total});
+            if (sourceLabel) *sourceLabel = j.service.label;
+        }
+    } else {
+        lines.push_back({g_jc.sourceId, g_jc.d.total});
+        if (sourceLabel) *sourceLabel = g_app.serviceLabel(g_jc.sourceId);
+    }
+    return lines;
+}
+
+static void JointPropose() {
+    const JointKind& k = JointKinds()[g_jc.kind];
+    std::vector<size_t> idx; std::vector<double> w;
+    for (size_t i = 0; i < g_jc.d.rows.size(); i++) {
+        auto& r = g_jc.d.rows[i];
+        if (!r.included) { r.amount = 0; continue; }
+        idx.push_back(i); w.push_back(k.weightLabel ? r.weight : 1.0);
+    }
+    auto parts = SplitCents(ToCents(g_jc.d.total), w);
+    for (size_t i = 0; i < idx.size(); i++) g_jc.d.rows[idx[i]].amount = FromCents(parts[i]);
+}
+
+static void DrawJointChargeDialog() {
+    const char* title = "Χρέωση κοινοχρήστου###jointcharge";
+    if (g_jc.show && !g_jc.wasOpen) ImGui::OpenPopup(title);
+    g_jc.wasOpen = g_jc.show;
+    if (!g_jc.show) return;
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowSize(ImVec2(std::min(1000.0f, vp->WorkSize.x * 0.95f), vp->WorkSize.y * 0.92f), ImGuiCond_Appearing);
+    if (!BeginGuardedModal(title, g_jc.show, 0)) return;
+
+    // 1. what
+    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "1. Τι χρεώνεται");
+    for (int i = 0; i < 3; i++) {
+        if (i) ImGui::SameLine();
+        if (ImGui::RadioButton(kJointSourceNames[i], g_jc.sourceType == i)) { g_jc.sourceType = i; g_jc.sourceId = -1; }
+    }
+    std::string current = "(επιλέξτε)";
+    ImGui::SetNextItemWidth(420);
+    if (g_jc.sourceType == 0) {
+        static Cached<std::vector<JointService>> catC;
+        const auto& cat = catC.get("", [] { return g_app.conn->getJointCatalog(); });
+        for (auto& j : cat) if (j.id == g_jc.sourceId) current = j.service.label;
+        if (ImGui::BeginCombo("##jsrc", current.c_str())) {
+            for (auto& j : cat)
+                if (ImGui::Selectable((j.service.label + "  ·  " + JointKindById(j.kind).name).c_str(), j.id == g_jc.sourceId)) {
+                    g_jc.sourceId = j.id; g_jc.kind = KindIndex(j.kind); g_jc.loadedBuilding = -1;
+                    g_jc.label.set(j.service.label);
+                }
+            ImGui::EndCombo();
+        }
+        if (cat.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Δεν υπάρχουν — δημιουργήστε από «+ Νέα κοινόχρηστη υπηρεσία»."); }
+    } else if (g_jc.sourceType == 1) {
+        static Cached<std::vector<MasterService>> pkC;
+        const auto& pk = pkC.get("", [] { return g_app.conn->getMasterServices(); });
+        for (auto& m : pk) if (m.id == g_jc.sourceId) current = m.label;
+        if (ImGui::BeginCombo("##jsrc", current.c_str())) {
+            for (auto& m : pk) if (ImGui::Selectable(m.label.c_str(), m.id == g_jc.sourceId)) { g_jc.sourceId = m.id; g_jc.label.set(m.label); }
+            ImGui::EndCombo();
+        }
+    } else {
+        if (g_jc.sourceId > 0) current = g_app.serviceLabel(g_jc.sourceId);
+        if (ImGui::BeginCombo("##jsrc", current.c_str(), ImGuiComboFlags_HeightLarge)) {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##jsvcf", "Φίλτρο...", g_jc.svcFilter.data, sizeof(g_jc.svcFilter.data));
+            int shown = 0;
+            for (auto& s : g_app.services) {
+                if (g_jc.svcFilter.data[0] && !SubstrCI(s.label, g_jc.svcFilter.data)) continue;
+                if (++shown > 300) break;
+                ImGui::PushID(s.id);
+                if (ImGui::Selectable(s.label.c_str(), s.id == g_jc.sourceId)) { g_jc.sourceId = s.id; g_jc.label.set(s.label); }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+    }
+
+    // 2. where
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "2. Σε ποια διαμερίσματα");
+    {
+        static Cached<std::vector<Building>> bC;
+        const auto& blds = bC.get("", [] { return g_app.conn->getBuildings(); });
+        std::string bname = "(επιλέξτε πολυκατοικία)";
+        for (auto& b : blds) if (b.id == g_jc.buildingId) bname = b.address;
+        ImGui::SetNextItemWidth(420);
+        if (ImGui::BeginCombo("Πολυκατοικία", bname.c_str(), ImGuiComboFlags_HeightLarge)) {
+            for (auto& b : blds) if (ImGui::Selectable(b.address.c_str(), b.id == g_jc.buildingId)) g_jc.buildingId = b.id;
+            ImGui::EndCombo();
+        }
+    }
+
+    // 3. how
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "3. Πώς μοιράζεται");
+    ImGui::SetNextItemWidth(260);
+    if (ImGui::BeginCombo("Τρόπος κατανομής", JointKinds()[g_jc.kind].name)) {
+        for (size_t i = 0; i < JointKinds().size(); i++)
+            if (ImGui::Selectable(JointKinds()[i].name, (int)i == g_jc.kind)) { g_jc.kind = (int)i; g_jc.loadedBuilding = -1; g_jc.d.num.clear(); }
+        ImGui::EndCombo();
+    }
+    const JointKind& kind = JointKinds()[g_jc.kind];
+    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kind.help);
+    if (g_jc.loadedBuilding != g_jc.buildingId) JointLoadRows(kind.id);
+
+    kind.drawInputs(g_jc.d);
+    if (!kind.totalFromInputs) { ImGui::SetNextItemWidth(160); InputMoney("Ποσό προς κατανομή (€)", &g_jc.d.total); }
+    ImGui::SetNextItemWidth(160); ImGui::TextUnformatted("Ημερομηνία:"); ImGui::SameLine(); DatePicker("jcdate", g_jc.date, ImVec2(0, 1));
+    ImGui::SameLine(); ImGui::SetNextItemWidth(320); ImGui::InputText("Περιγραφή", g_jc.label.data, sizeof(g_jc.label.data));
+    ImGui::SetNextItemWidth(560); ImGui::InputText("Σημείωση", g_jc.note.data, sizeof(g_jc.note.data));
+    if (kind.weightLabel && !g_jc.weightsFrom.empty()) ImGui::TextDisabled("%s από: %s", kind.weightLabel, g_jc.weightsFrom.c_str());
+
+    // re-propose whenever an input changed (until the person edits a share by hand)
+    long long h = ToCents(g_jc.d.total) * 31 + g_jc.kind;
+    for (auto& r : g_jc.d.rows) h = h * 131 + (r.included ? 7 : 3) + (long long)std::llround(r.weight * 1000);
+    if (!g_jc.manual && h != g_jc.proposedFor) { JointPropose(); g_jc.proposedFor = h; }
+
+    // shares table
+    int nInc = 0; long long sum = 0;
+    for (auto& r : g_jc.d.rows) if (r.included) { nInc++; sum += ToCents(r.amount); }
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "4. Μερίδια (%d χρεώνονται)", nInc);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(kind.weightLabel ? "Επαναφορά πρότασης" : "Ισόποση κατανομή")) { g_jc.manual = false; g_jc.proposedFor = -1; }
+    float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.6f;
+    int ncol = kind.weightLabel ? 5 : 4;
+    if (ImGui::BeginTable("jcrows", ncol, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, std::max(120.0f, tableH)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Χρέωση", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("Διαμέρισμα", ImGuiTableColumnFlags_WidthStretch, 0.7f);
+        ImGui::TableSetupColumn("Ένοικος", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        if (kind.weightLabel) ImGui::TableSetupColumn(kind.weightLabel, ImGuiTableColumnFlags_WidthFixed, 110);
+        ImGui::TableSetupColumn("Μερίδιο (€) / αιτία εξαίρεσης", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < g_jc.d.rows.size(); i++) {
+            auto& r = g_jc.d.rows[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(r.user_id <= 0);
+            ImGui::Checkbox("##inc", &r.included);
+            ImGui::EndDisabled();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(r.apt_label.c_str());
+            ImGui::TableNextColumn();
+            if (r.user_id > 0) ImGui::TextUnformatted(r.user_name.c_str()); else ImGui::TextDisabled("— κενό —");
+            if (kind.weightLabel) {
+                ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1);
+                ImGui::InputDouble("##w", &r.weight, 0, 0, "%.2f");
+                if (r.weight < 0) r.weight = 0;
+            }
+            ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1);
+            if (r.included) {
+                if (InputMoney("##amt", &r.amount)) g_jc.manual = true;
+            } else {
+                ImGui::InputTextWithHint("##why", "Γιατί εξαιρείται (υποχρεωτικό)", r.reason, sizeof(r.reason));
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // checks + save
+    long long diff = ToCents(g_jc.d.total) - sum;
+    bool reasonsOk = true;
+    for (auto& r : g_jc.d.rows) if (!r.included && std::string(r.reason).find_first_not_of(" \t") == std::string::npos) reasonsOk = false;
+    std::string problem;
+    if (g_jc.sourceId <= 0) problem = "Επιλέξτε τι χρεώνεται.";
+    else if (g_jc.buildingId <= 0) problem = "Επιλέξτε πολυκατοικία.";
+    else if (ToCents(g_jc.d.total) <= 0) problem = "Δώστε το ποσό.";
+    else if (nInc == 0) problem = "Κανένας ένοικος δεν χρεώνεται.";
+    else if (diff != 0) problem = "Τα μερίδια αθροίζουν " + FormatMoney(FromCents(sum)) + " € — " +
+                                  (diff > 0 ? "λείπουν " : "περισσεύουν ") + FormatMoney(FromCents(std::llabs(diff))) + " €.";
+    else if (!reasonsOk) problem = "Κάθε εξαίρεση χρειάζεται αιτία.";
+    else for (auto& r : g_jc.d.rows)
+        if (r.included && ToCents(r.amount) <= 0) {
+            problem = "Μερίδιο 0 € για " + r.apt_label + " (" + r.user_name + "): δώστε " +
+                      (kind.weightLabel ? std::string(kind.weightLabel) + " ή ποσό" : std::string("ποσό")) + ", ή εξαιρέστε το.";
+            break;
+        }
+    else if (g_jc.label.str().empty()) problem = "Δώστε περιγραφή.";
+    if (problem.empty()) ImGui::TextColored(ImVec4(0.35f,0.85f,0.45f,1), "Σύνολο %s € σε %d ενοίκους — κάθε ένοικος παίρνει τη δική του χρέωση.", FormatMoney(g_jc.d.total).c_str(), nInc);
+    else ImGui::TextColored(kInvalidMoneyCol, "%s", problem.c_str());
+
+    if (!problem.empty()) g_jc.confirming = false;
+    if (!g_jc.confirming) {
+        ImGui::BeginDisabled(!problem.empty());
+        if (ImGui::Button("Χρέωση...", ImVec2(150, 0))) g_jc.confirming = true;
+        ImGui::EndDisabled();
+    } else {
+        int nExc = 0; for (auto& r : g_jc.d.rows) if (!r.included) nExc++;
+        ImGui::TextColored(ImVec4(1.0f,0.8f,0.3f,1), "Επιβεβαίωση: %d χρεώσεις, %d εξαιρέσεις. Η κατανομή δεν αλλάζει μετά την αποθήκευση.", nInc, nExc);
+        if (ImGui::Button("Επιβεβαίωση χρέωσης", ImVec2(190, 0))) {
+            std::string srcLabel;
+            auto lines = JointLines(&srcLabel);
+            JointOp op;
+            op.building_id = g_jc.buildingId;
+            op.source_type = g_jc.sourceType == 0 ? "joint" : g_jc.sourceType == 1 ? "package" : "service";
+            op.source_id = g_jc.sourceId; op.kind = kind.id; op.label = g_jc.label.str();
+            op.total = g_jc.d.total; op.op_date = g_jc.date; op.params_json = JointParamsJson(g_jc.d, kind); op.note = g_jc.note.str();
+            std::vector<JointShare> shares;
+            for (auto& r : g_jc.d.rows) {
+                JointShare sh; sh.apartment_id = r.apartment_id; sh.user_id = r.user_id; sh.amount = r.amount;
+                sh.included = r.included; sh.exclude_reason = r.reason;
+                shares.push_back(sh);
+            }
+            int opId = g_app.conn->chargeJoint(op, lines, shares);
+            g_jc.confirming = false;
+            if (opId > 0) { g_jc.show = false; g_app.reloadGen++; OpenJointView(opId); }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Πίσω", ImVec2(120, 0))) g_jc.confirming = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Κλείσιμο", ImVec2(150, 0))) { g_jc.show = false; ImGui::CloseCurrentPopup(); }
+    if (!g_jc.show) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+// ---- one operation: who was charged, who was excluded and why ----
+static int g_jointViewId = -1;
+static void OpenJointView(int id) { g_jointViewId = id; }
+
+static void DrawJointViewWindow() {
+    if (g_jointViewId < 0) return;
+    static Cached<std::pair<JointOp, std::vector<JointShare>>> cache;
+    const auto& data = cache.get(std::to_string(g_jointViewId), [] {
+        return std::make_pair(g_app.conn->getJointOpById(g_jointViewId), g_app.conn->getJointShares(g_jointViewId)); });
+    const JointOp& o = data.first;
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(1000, 560), ImGuiCond_Appearing);
+    std::string title = "Κοινόχρηστο: " + o.label + "###jointview";
+    if (ImGui::Begin(title.c_str(), &open)) {
+        ImGui::TextColored(ImVec4(1.0f,0.8f,0.3f,1), "%s", o.label.c_str());
+        ImGui::Text("%s  ·  %s  ·  %s", o.building_address.c_str(), o.op_date.c_str(), JointKindById(o.kind).name);
+        ImGui::Text("Σύνολο %s €  ·  εισπράχθηκαν %s €  ·  υπόλοιπο %s €", FormatMoney(o.total).c_str(), FormatMoney(o.paid).c_str(),
+                    FormatMoney(MoneySub(o.total, o.paid)).c_str());
+        ImGui::TextDisabled("Καταχωρήθηκε %s  ·  %d χρεώθηκαν, %d εξαιρέθηκαν", o.created_at.c_str(), o.included, o.excluded);
+        if (o.kind == "heating_oil")
+            ImGui::TextDisabled("%.0f λίτρα x %.3f €/λίτρο + %.2f € λοιπά", JointNumFromJson(o.params_json, "litres"),
+                                JointNumFromJson(o.params_json, "price_per_litre"), JointNumFromJson(o.params_json, "extra"));
+        if (!o.note.empty()) ImGui::TextWrapped("Σημείωση: %s", o.note.c_str());
+        ImGui::Separator();
+        if (ImGui::BeginTable("jshares", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, -1))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Διαμέρισμα", ImGuiTableColumnFlags_WidthStretch, 0.7f);
+            ImGui::TableSetupColumn("Ένοικος", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+            ImGui::TableSetupColumn("Μερίδιο", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("Πληρωμένο", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("Κατάσταση", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 190);
             ImGui::TableHeadersRow();
-            for (size_t i = 0; i < j.users.size(); i++) {
+            for (auto& s : data.second) {
+                ImGui::PushID(s.id);
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(j.users[i].full_name.c_str());
-                ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", j.userTotalDue[i]);
-                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", j.userTotalPaid[i]);
-                ImGui::TableSetColumnIndex(3);
-                double un = i < j.userNet.size() ? j.userNet[i] : 0.0;
-                ImGui::TextColored(un > 0.005 ? ImVec4(0.95f,0.55f,0.25f,1) : ImVec4(0.35f,0.85f,0.45f,1), "%.2f", un);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(s.apartment_label.c_str());
+                ImGui::TableNextColumn();
+                if (s.user_id > 0) ImGui::TextUnformatted(s.user_name.c_str()); else ImGui::TextDisabled("— κενό —");
+                if (s.included) {
+                    ImGui::TableNextColumn(); ImGui::Text("%s €", FormatMoney(s.amount).c_str());
+                    ImGui::TableNextColumn(); ImGui::Text("%s €", FormatMoney(s.paid).c_str());
+                    ImGui::TableNextColumn();
+                    bool done = ToCents(s.paid) >= ToCents(s.amount);
+                    ImGui::TextColored(done ? ImVec4(0.35f,0.85f,0.45f,1) : ImVec4(0.95f,0.65f,0.25f,1), done ? "Εξοφλήθηκε" : "Χρεώθηκε");
+                    ImGui::TableNextColumn();
+                    if (ImGui::SmallButton("Καρτέλα")) OpenResidentLedger(s.user_id);
+                    if (!done) { ImGui::SameLine(); if (ImGui::SmallButton("Είσπραξη")) OpenRecordPayment(s.user_id); }
+                } else {
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("—");
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("—");
+                    ImGui::TableNextColumn(); ImGui::TextColored(ImVec4(0.75f,0.60f,0.95f,1), "Εξαιρέθηκε: %s", s.exclude_reason.c_str());
+                    ImGui::TableNextColumn();
+                }
+                ImGui::PopID();
             }
             ImGui::EndTable();
         }
-        EndCard();
+    }
+    ImGui::End();
+    if (!open) g_jointViewId = -1;
+}
+
+// ---- list of operations (Joint Services tab: all buildings; Buildings tab: one building) ----
+static void DrawJointOpsTable(int buildingId, const char* id) {
+    static std::map<std::string, Cached<std::vector<JointOp>>> caches;
+    const auto& ops = caches[id].get(std::to_string(buildingId), [buildingId] { return g_app.conn->getJointOps(buildingId, 0, 500); });
+    if (ops.empty()) { ImGui::TextDisabled("Δεν έχουν γίνει κοινόχρηστες χρεώσεις ακόμα."); return; }
+    bool all = buildingId <= 0;
+    if (ImGui::BeginTable(id, all ? 8 : 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, -1))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 90);
+        if (all) ImGui::TableSetupColumn("Πολυκατοικία", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn("Περιγραφή", ImGuiTableColumnFlags_WidthStretch, 2.8f);
+        ImGui::TableSetupColumn("Κατανομή", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Σύνολο", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Εισπράχθηκαν", ImGuiTableColumnFlags_WidthFixed, 100);
+        ImGui::TableSetupColumn("Διαμερίσματα", ImGuiTableColumnFlags_WidthFixed, 230);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableHeadersRow();
+        for (auto& o : ops) {
+            ImGui::PushID(o.id);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(o.op_date.c_str());
+            if (all) { ImGui::TableNextColumn(); ImGui::TextUnformatted(o.building_address.c_str()); }
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(o.label.c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(JointKindById(o.kind).name);
+            ImGui::TableNextColumn(); ImGui::Text("%s €", FormatMoney(o.total).c_str());
+            ImGui::TableNextColumn();
+            bool done = ToCents(o.paid) >= ToCents(o.total);
+            ImGui::TextColored(done ? ImVec4(0.35f,0.85f,0.45f,1) : ImVec4(0.95f,0.65f,0.25f,1), "%s €", FormatMoney(o.paid).c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%d χρεώθηκαν", o.included);
+            if (o.excluded) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.75f,0.60f,0.95f,1), "· %d εξαιρέθηκαν", o.excluded); }
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Άνοιγμα")) OpenJointView(o.id);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+// Old model (before v11): one service shared by several clients. Kept read-only so its history stays visible.
+static void DrawLegacyJointServices() {
+    for (auto& j : g_app.jointServices) {
+        ImGui::PushID(j.service.id);
+        ImGui::Text("%s  (%zu πελάτες)  ·  οφειλή %s €  ·  πληρωμένο %s €", j.service.label.c_str(), j.users.size(),
+                    FormatMoney(j.totalDue).c_str(), FormatMoney(j.totalPaid).c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Άνοιγμα")) OpenServiceDetail(j.service.id);
         ImGui::PopID();
     }
+}
+
+static void DrawJointServicesScreen() {
+    if (ImGui::Button("+ Χρέωση κοινοχρήστου")) OpenJointCharge(-1);
+    ImGui::SameLine();
+    if (ImGui::Button("+ Νέα κοινόχρηστη υπηρεσία")) OpenJointServiceDialog(nullptr);
+    ImGui::SameLine();
+    if (ImGui::Button("Ανανέωση")) { g_app.reloadJoint(); g_app.reloadGen++; }
+    ImGui::TextDisabled("Κοινόχρηστο = ένα κόστος που μοιράζεται στα διαμερίσματα μιας πολυκατοικίας: κάθε ένοικος παίρνει τη δική του χρέωση. Μοιράζει, δεν πολλαπλασιάζει.");
+    ImGui::Separator();
+
+    static Cached<std::vector<JointService>> catCache;
+    const auto& cat = catCache.get("", [] { return g_app.conn->getJointCatalog(true); });
+    float catH = std::min(60.0f + 28.0f * (float)std::max<size_t>(1, cat.size()), ImGui::GetContentRegionAvail().y * 0.35f);
+    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "Κατάλογος κοινοχρήστων (%d)", (int)cat.size());
+    if (ImGui::BeginTable("jointcat", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, catH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Υπηρεσία", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Κατανομή", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Κατάσταση", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 290);
+        ImGui::TableHeadersRow();
+        for (auto& j : cat) {
+            ImGui::PushID(j.id);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(j.service.label.c_str());
+            if (!j.service.extra_notes.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", j.service.extra_notes.c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(JointKindById(j.kind).name);
+            ImGui::TableNextColumn();
+            if (j.active) ImGui::TextUnformatted("Ενεργή"); else ImGui::TextDisabled("Ανενεργή");
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(!j.active);
+            if (ImGui::SmallButton("Χρέωση")) { OpenJointCharge(-1, 0, j.id); g_jc.kind = KindIndex(j.kind); g_jc.label.set(j.service.label); }
+            ImGui::EndDisabled();
+            ImGui::SameLine(); if (ImGui::SmallButton("Επεξεργασία")) OpenJointServiceDialog(&j);
+            ImGui::SameLine(); if (ImGui::SmallButton("Ιστορικό")) OpenServiceDetail(j.service.id);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "Χρεώσεις κοινοχρήστων");
+    float legacyH = g_app.jointServices.empty() ? 0.0f : ImGui::GetFrameHeightWithSpacing() * 1.5f;
+    ImGui::BeginChild("jointops", ImVec2(0, -legacyH), false);
+    DrawJointOpsTable(-1, "jointops_all");
     ImGui::EndChild();
-    DrawJointDialog();
+    if (!g_app.jointServices.empty() && ImGui::CollapsingHeader("Παλαιές κοινές υπηρεσίες πελατών (πριν την αλλαγή, μόνο προβολή)"))
+        DrawLegacyJointServices();
+    DrawJointServiceDialog();
 }
 
 // ---------------------------------------------------------------------------
@@ -6699,6 +7100,50 @@ static char g_dbPathEdit[512] = "";
 static bool g_dbPathEditInit = false;
 static bool g_dbPathSaved = false;
 
+// Settings -> "Αρχείο σφαλμάτων": logs/errors.csv (every error the app showed, plus graphics/crash errors).
+static bool g_showErrorLog = false;
+static long long g_errorLogStamp = -1;
+static void DrawErrorLogWindow() {
+    if (!g_showErrorLog) return;
+    static std::vector<errlog::Row> rows;
+    static char filter[128] = "";
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    long long stamp = (long long)fs::file_size(fs::u8path(errlog::Path()), ec);
+    if (ec) stamp = 0;
+    if (stamp != g_errorLogStamp) { rows = errlog::ReadAll(); g_errorLogStamp = stamp; }
+    ImGui::SetNextWindowSize(ImVec2(900, 500), ImGuiCond_Appearing);
+    if (ImGui::Begin("Αρχείο σφαλμάτων", &g_showErrorLog)) {
+        if (ImGui::SmallButton("Άνοιγμα αρχείου (Excel)")) OpenWithSystem(errlog::Path());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Φάκελος")) RevealInFolder(errlog::Path());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", errlog::Path().c_str());
+        ImGui::SetNextItemWidth(300);
+        ImGui::InputTextWithHint("##errf", "Φίλτρο...", filter, sizeof(filter));
+        ImGui::SameLine(); ImGui::TextDisabled("%d εγγραφές (νεότερες πρώτα)", (int)rows.size());
+        if (rows.empty()) ImGui::TextDisabled("Κανένα σφάλμα δεν έχει καταγραφεί.");
+        else if (ImGui::BeginTable("errlog", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                               ImGuiTableFlags_Resizable, ImVec2(0, -1))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Ώρα", ImGuiTableColumnFlags_WidthFixed, 175);
+            ImGui::TableSetupColumn("Πηγή", ImGuiTableColumnFlags_WidthFixed, 90);
+            ImGui::TableSetupColumn("Μήνυμα", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto& r = rows[i];
+                if (filter[0] && !SubstrCI(r.message, filter) && !SubstrCI(r.source, filter) && !SubstrCI(r.time, filter)) continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(r.time.c_str());
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(r.source.c_str());
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s", r.message.c_str());
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
 static void DrawSettingsScreen() {
     ImGui::Text("Βάση Δεδομένων: %s", g_app.dbPath.c_str());
     if (!g_dbPathEditInit) {
@@ -6735,6 +7180,8 @@ static void DrawSettingsScreen() {
     if (ImGui::Button("Χάρτης Βάσης (Node Graph)")) { InitGraphNodes(); g_showNodeGraph = true; }
     ImGui::SameLine();
     if (ImGui::Button("Χρονολόγιο Ενεργειών")) g_showAuditWindow = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Αρχείο σφαλμάτων")) { g_showErrorLog = true; g_errorLogStamp = -1; }
 
     ImGui::Separator();
     ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Κονσόλα Raw SQL");
@@ -7425,26 +7872,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
             g_tabToApartments = false;
             if (aptTab) { DrawApartmentsScreen(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Υπηρεσίες")) { DrawServicesScreen(); ImGui::EndTabItem(); }
-            // Legacy/deprecated tab: text is dimmed to signal it isn't current,
-            // and selecting it shows a clear notice at the top before the old
-            // screen renders below. Kept around purely as a reference -- the
-            // actual joint/shared services still exist in the data model, they
-            // just no longer have a live editing surface here.
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.60f, 0.75f));
-            bool jointTab = ImGui::BeginTabItem("Κοινόχρηστες Υπηρεσίες");
-            ImGui::PopStyleColor();
-            if (jointTab) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
-                ImGui::TextWrapped("%s",
-                    u8"⚠  ΠΑΛΙΑ ΛΕΙΤΟΥΡΓΙΑ  —  Αυτή η καρτέλα διατηρείται μόνο για αναφορά. "
-                    u8"Η διαχείριση κοινόχρηστων υπηρεσιών δεν χρησιμοποιείται πλέον από την "
-                    u8"καθημερινή ροή της εφαρμογής. Μπορείτε να την δείτε παρακάτω αν χρειαστεί "
-                    u8"να ελέγξετε παλαιότερα δεδομένα, αλλά δεν συνιστάται η επεξεργασία από εδώ.");
-                ImGui::PopStyleColor();
-                ImGui::Separator();
-                DrawJointServicesScreen();
-                ImGui::EndTabItem();
-            }
+            if (ImGui::BeginTabItem("Κοινόχρηστα")) { DrawJointServicesScreen(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Πακέτα Υπηρεσιών")) { DrawMasterServicesScreen(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Πληρωμές")) { DrawPaymentsScreen(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Αποδείξεις")) {
@@ -7474,6 +7902,8 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         DrawErrorBanner();
         PrefsSaveIfChanged();
         DrawPaymentViewWindow();
+        DrawJointViewWindow();
+        DrawJointChargeDialog();
         DrawServiceDialog();
         DrawPaymentDialog();
         DrawPackageChargeDialog();
@@ -7484,6 +7914,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         DrawPayOwnerPickPopup();
         DrawNodeGraphOverlay();
         DrawAuditLogWindow();
+        DrawErrorLogWindow();
         ImGui::End();
 
         ImGui::Render();

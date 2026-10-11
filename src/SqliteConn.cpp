@@ -1,4 +1,5 @@
 ﻿#include "SqliteConn.h"
+#include "ErrorLog.h"
 #include "Platform.h"
 #include "Money.h"
 #include "Rf.h"
@@ -151,7 +152,7 @@ static std::string JsonRowExpr(sqlite3* db, const std::string& table, const std:
 static const char* kAuditedTables[] = {
     "buildings", "apartments", "users", "residencies", "services", "service_users", "master_services",
     "master_service_components", "payment_batches", "charges", "payments", "allocations", "receipts", "notes",
-    "attachments",
+    "attachments", "joint_services", "joint_ops", "joint_shares",
 };
 
 static bool TableExists(sqlite3* db, const std::string& t) {
@@ -175,6 +176,7 @@ static int UserVersion(sqlite3* db) {
 
 SqliteConn::SqliteConn(const std::string& dbPath) {
     dbPath_ = dbPath;
+    errlog::SetFolder(std::filesystem::u8path(dbPath).parent_path().u8string());
     int rc = sqlite3_open(dbPath.c_str(), &db);
     if (rc) {
         std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
@@ -1136,10 +1138,75 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v10) απέτυχε: " + why; }
     }
 
+    // --- Migration v11: Κοινόχρηστα = a cost split across a collection of apartments. ---
+    // joint_services: catalog (a services row + split kind). joint_ops: one charge of a cost to apartments;
+    // joint_shares: every apartment/resident it considered, included with its amount or excluded with a
+    // reason. The included shares' charges carry the op's batch_id and the share's apartment.
+    // Ops and shares are a record of what was decided: never updated or deleted (fix the charges instead).
+    if (UserVersion(db) < 11) {
+        bool ok = executeQuery(R"(
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS joint_services (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER NOT NULL UNIQUE REFERENCES services(id),
+                kind       TEXT    NOT NULL DEFAULT 'equal',
+                active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS joint_ops (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                building_id INTEGER REFERENCES buildings(id),
+                source_type TEXT    NOT NULL CHECK (source_type IN ('joint','service','package')),
+                source_id   INTEGER NOT NULL,
+                kind        TEXT    NOT NULL DEFAULT 'equal',
+                label       TEXT    NOT NULL,
+                total       REAL    NOT NULL CHECK (total > 0),
+                op_date     TEXT    NOT NULL CHECK (op_date IS date(op_date)),
+                params_json TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(params_json)),
+                note        TEXT,
+                batch_id    INTEGER NOT NULL UNIQUE REFERENCES payment_batches(id),
+                created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_joint_ops_building ON joint_ops(building_id, op_date);
+            CREATE TABLE IF NOT EXISTS joint_shares (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id          INTEGER NOT NULL REFERENCES joint_ops(id),
+                apartment_id   INTEGER NOT NULL REFERENCES apartments(id),
+                user_id        INTEGER REFERENCES users(id),
+                amount         REAL    NOT NULL DEFAULT 0,
+                included       INTEGER NOT NULL CHECK (included IN (0,1)),
+                exclude_reason TEXT,
+                CHECK (included = 0 OR (amount > 0 AND user_id IS NOT NULL)),
+                CHECK (included = 1 OR TRIM(COALESCE(exclude_reason,'')) <> '')
+            );
+            CREATE INDEX IF NOT EXISTS idx_joint_shares_op ON joint_shares(op_id);
+            CREATE INDEX IF NOT EXISTS idx_joint_shares_apt ON joint_shares(apartment_id);
+            CREATE TRIGGER IF NOT EXISTS trg_joint_ops_fixed BEFORE UPDATE ON joint_ops
+            BEGIN SELECT RAISE(ABORT, 'Η κοινόχρηστη χρέωση δεν αλλάζει - διορθώστε τις χρεώσεις των ενοίκων'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_joint_ops_no_delete BEFORE DELETE ON joint_ops
+            BEGIN SELECT RAISE(ABORT, 'Η κοινόχρηστη χρέωση δεν διαγράφεται'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_joint_shares_fixed BEFORE UPDATE ON joint_shares
+            BEGIN SELECT RAISE(ABORT, 'Η κατανομή κοινοχρήστων δεν αλλάζει'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_joint_shares_no_delete BEFORE DELETE ON joint_shares
+            BEGIN SELECT RAISE(ABORT, 'Η κατανομή κοινοχρήστων δεν διαγράφεται'); END;
+        )");
+        if (ok) {
+            ensureAuditTriggers();
+            // the old "joint" services (one service shared by several clients) join the catalog; their past
+            // charges stay as they are
+            ok = executeQuery(R"(
+                INSERT OR IGNORE INTO joint_services (service_id, kind)
+                SELECT s.id, CASE WHEN s.label LIKE '%ΠΕΤΡΕΛ%' OR s.label LIKE '%πετρελ%' THEN 'heating_oil' ELSE 'equal' END
+                FROM services s WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) > 1;
+                PRAGMA user_version = 11; COMMIT;)");
+        }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v11) απέτυχε: " + why; }
+    }
+
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
     // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
     {
-        bool migratedNow = versionAtOpen < 10;
+        bool migratedNow = versionAtOpen < 11;
         int restored = ensureAuditTriggers();
         if (restored > 0 && !migratedNow) {
             logAction("audit", 0, "TRIGGERS_RESTORED", "", "{\"count\": " + std::to_string(restored) + "}", "db");
@@ -1580,8 +1647,11 @@ std::vector<Payment> SqliteConn::getPaymentsForApartment(int apartmentId) {
 std::string SqliteConn::takeLastError() {
     std::string e; e.swap(lastError_);
     if (e.empty()) { std::lock_guard<std::mutex> lk(bgMutex_); e.swap(bgMessage_); }
+    if (!e.empty()) errlog::Write("database", e);
     return e;
 }
+
+std::string SqliteConn::errorLogPath() { return errlog::Path(); }
 
 void SqliteConn::autoBackup(int keep) {
     namespace fs = std::filesystem;
@@ -2495,7 +2565,8 @@ std::vector<Service> SqliteConn::pageServices(const std::string& query, int offs
     // them so the pager total reflects only what this tab actually shows.
     std::string sql =
         "SELECT s.id, s.label, s.extra_notes, s.created_at FROM services s "
-        "WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) <= 1";
+        "WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) <= 1 "
+        "AND NOT EXISTS (SELECT 1 FROM joint_services j WHERE j.service_id = s.id)";
     std::vector<std::string> binds;
     if (!query.empty()) {
         sql += " AND (s.label LIKE '%' || ? || '%' OR s.extra_notes LIKE '%' || ? || '%')";
@@ -2525,7 +2596,8 @@ std::vector<Service> SqliteConn::pageServices(const std::string& query, int offs
 int SqliteConn::countServices(const std::string& query) {
     std::string sql =
         "SELECT COUNT(*) FROM services s "
-        "WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) <= 1";
+        "WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) <= 1 "
+        "AND NOT EXISTS (SELECT 1 FROM joint_services j WHERE j.service_id = s.id)";
     std::vector<std::string> binds;
     if (!query.empty()) {
         sql += " AND (s.label LIKE '%' || ? || '%' OR s.extra_notes LIKE '%' || ? || '%')";
@@ -3801,4 +3873,249 @@ bool SqliteConn::removeAttachment(int id, const std::string& reason) {
 
 std::string SqliteConn::attachmentFullPath(const Attachment& a) {
     return (std::filesystem::path(dbPath_).parent_path() / std::filesystem::u8path(a.stored_path)).u8string();
+}
+
+// --- ΚΟΙΝΟΧΡΗΣΤΑ: a cost split across a collection of apartments ------------------------------------------
+std::vector<JointService> SqliteConn::getJointCatalog(bool includeInactive) {
+    std::vector<JointService> out;
+    sqlite3_stmt* st = nullptr;
+    std::string sql = "SELECT j.id, s.id, s.label, s.extra_notes, s.created_at, j.kind, j.active FROM joint_services j "
+                      "JOIN services s ON s.id = j.service_id";
+    if (!includeInactive) sql += " WHERE j.active = 1";
+    sql += " ORDER BY s.label";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        JointService j;
+        j.id = sqlite3_column_int(st, 0);
+        j.service.id = sqlite3_column_int(st, 1);
+        j.service.label = ColText(st, 2); j.service.extra_notes = ColText(st, 3); j.service.created_at = ColText(st, 4);
+        j.kind = ColText(st, 5); j.active = sqlite3_column_int(st, 6) != 0;
+        out.push_back(j);
+    }
+    sqlite3_finalize(st);
+    for (auto& j : out) j.service.suggested_price = priceOf(j.service.id);
+    return out;
+}
+
+int SqliteConn::addJointService(const Service& s, const std::string& kind) {
+    if (s.label.empty()) { lastError_ = "Η κοινόχρηστη υπηρεσία χρειάζεται όνομα."; return -1; }
+    Service in = s;
+    if (in.suggested_price <= 0.0) in.suggested_price = 0.01;   // services carry a price hint; the real total is asked when charging
+    if (!savepoint("joint_svc")) return -1;
+    int sid = addServiceGetId(-1, in);
+    if (sid < 0) { if (lastError_.empty()) lastError_ = sqlite3_errmsg(db); rollbackTo("joint_svc"); return -1; }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO joint_services (service_id, kind) VALUES (?, ?)", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, sid);
+    sqlite3_bind_text(st, 2, kind.empty() ? "equal" : kind.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { rollbackTo("joint_svc"); return -1; }
+    int id = (int)sqlite3_last_insert_rowid(db);
+    if (!release("joint_svc")) { rollbackTo("joint_svc"); return -1; }
+    return id;
+}
+
+bool SqliteConn::editJointService(int id, const Service& s, const std::string& kind, bool active) {
+    int sid = -1;
+    {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT service_id FROM joint_services WHERE id = ?", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, id);
+        if (sqlite3_step(st) == SQLITE_ROW) sid = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (sid < 0) { lastError_ = "Η κοινόχρηστη υπηρεσία δεν υπάρχει."; return false; }
+    if (!savepoint("joint_svc_edit")) return false;
+    Service in = s;
+    if (in.suggested_price <= 0.0) in.suggested_price = 0.01;
+    bool ok = editService(sid, in);
+    if (ok) {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "UPDATE joint_services SET kind = ?, active = ? WHERE id = ?", -1, &st, nullptr);
+        sqlite3_bind_text(st, 1, kind.empty() ? "equal" : kind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, active ? 1 : 0);
+        sqlite3_bind_int(st, 3, id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        if (!ok) lastError_ = sqlite3_errmsg(db);
+        sqlite3_finalize(st);
+    }
+    if (!ok) { rollbackTo("joint_svc_edit"); return false; }
+    return release("joint_svc_edit");
+}
+
+int SqliteConn::chargeJoint(const JointOp& opIn, const std::vector<JointLine>& lines, const std::vector<JointShare>& shares) {
+    JointOp op = opIn;
+    long long total = ToCents(op.total);
+    auto refuse = [&](const std::string& why) { lastError_ = why; return -1; };
+    if (total <= 0) return refuse("Το ποσό του κοινόχρηστου πρέπει να είναι μεγαλύτερο από 0.");
+    if (op.label.empty()) return refuse("Η κοινόχρηστη χρέωση χρειάζεται περιγραφή.");
+    if (op.op_date.size() != 10) return refuse("Μη έγκυρη ημερομηνία χρέωσης.");
+    long long linesSum = 0;
+    for (auto& l : lines) { if (l.service_id <= 0 || ToCents(l.total) < 0) return refuse("Μη έγκυρη γραμμή χρέωσης."); linesSum += ToCents(l.total); }
+    if (lines.empty() || linesSum != total) return refuse("Οι γραμμές της χρέωσης δεν αθροίζουν στο σύνολο.");
+    long long sharesSum = 0; int nIncluded = 0;
+    std::set<std::pair<int,int>> seen;
+    for (auto& sh : shares) {
+        if (sh.apartment_id <= 0) return refuse("Κάθε μερίδιο χρειάζεται διαμέρισμα.");
+        if (!seen.insert({sh.apartment_id, sh.user_id}).second) return refuse("Το ίδιο διαμέρισμα/ένοικος εμφανίζεται δύο φορές.");
+        if (sh.included) {
+            if (sh.user_id <= 0) return refuse("Μερίδιο χωρίς ένοικο δεν μπορεί να χρεωθεί.");
+            if (ToCents(sh.amount) <= 0) return refuse("Κάθε μερίδιο που χρεώνεται πρέπει να είναι μεγαλύτερο από 0.");
+            sharesSum += ToCents(sh.amount); nIncluded++;
+        } else if (sh.exclude_reason.find_first_not_of(" \t") == std::string::npos) {
+            return refuse("Κάθε εξαίρεση χρειάζεται αιτιολογία.");
+        }
+    }
+    if (nIncluded == 0) return refuse("Δεν επιλέχθηκε κανένα διαμέρισμα για χρέωση.");
+    if (sharesSum != total)
+        return refuse("Τα μερίδια αθροίζουν " + FormatMoney(FromCents(sharesSum)) + " € αντί για " + FormatMoney(op.total) +
+                      " €. Το κοινόχρηστο μοιράζεται, δεν πολλαπλασιάζεται.");
+
+    if (!savepoint("joint_charge")) return -1;
+    auto fail = [&]() { rollbackTo("joint_charge"); lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + lastError_; return -1; };
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO payment_batches (label) VALUES (?)", -1, &st, nullptr);
+    std::string batchLabel = "Κοινόχρηστο: " + op.label;
+    sqlite3_bind_text(st, 1, batchLabel.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    int batchId = (int)sqlite3_last_insert_rowid(db);
+
+    sqlite3_prepare_v2(db, "INSERT INTO joint_ops (building_id, source_type, source_id, kind, label, total, op_date, params_json, note, batch_id) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?)", -1, &st, nullptr);
+    if (op.building_id > 0) sqlite3_bind_int(st, 1, op.building_id); else sqlite3_bind_null(st, 1);
+    sqlite3_bind_text(st, 2, op.source_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, op.source_id);
+    sqlite3_bind_text(st, 4, op.kind.empty() ? "equal" : op.kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, op.label.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 6, FromCents(total));
+    sqlite3_bind_text(st, 7, op.op_date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, op.params_json.empty() ? "{}" : op.params_json.c_str(), -1, SQLITE_TRANSIENT);
+    if (op.note.empty()) sqlite3_bind_null(st, 9); else sqlite3_bind_text(st, 9, op.note.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 10, batchId);
+    rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    int opId = (int)sqlite3_last_insert_rowid(db);
+
+    int y = std::atoi(op.op_date.substr(0, 4).c_str()), m = std::atoi(op.op_date.substr(5, 2).c_str()), d = std::atoi(op.op_date.substr(8, 2).c_str());
+    for (auto& sh : shares) {
+        sqlite3_prepare_v2(db, "INSERT INTO joint_shares (op_id, apartment_id, user_id, amount, included, exclude_reason) VALUES (?,?,?,?,?,?)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, opId);
+        sqlite3_bind_int(st, 2, sh.apartment_id);
+        if (sh.user_id > 0) sqlite3_bind_int(st, 3, sh.user_id); else sqlite3_bind_null(st, 3);
+        sqlite3_bind_double(st, 4, sh.included ? RoundMoney(sh.amount) : 0.0);
+        sqlite3_bind_int(st, 5, sh.included ? 1 : 0);
+        if (sh.included || sh.exclude_reason.empty()) sqlite3_bind_null(st, 6); else sqlite3_bind_text(st, 6, sh.exclude_reason.c_str(), -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st); sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+        if (!sh.included) continue;
+
+        // the share is spread over the lines in proportion to their totals, in cents, remainder to the first lines
+        long long shareC = ToCents(sh.amount), given = 0;
+        std::vector<long long> parts(lines.size());
+        for (size_t i = 0; i < lines.size(); i++) { parts[i] = shareC * ToCents(lines[i].total) / total; given += parts[i]; }
+        for (size_t i = 0; given < shareC; i = (i + 1) % lines.size())
+            if (ToCents(lines[i].total) > 0) { parts[i]++; given++; }
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (parts[i] <= 0) continue;
+            Payment p;
+            p.service_id = lines[i].service_id; p.user_id = sh.user_id; p.apartment_id = sh.apartment_id;
+            p.year = y; p.month = m; p.day = d;
+            p.amount_due = FromCents(parts[i]); p.amount_paid = 0.0;
+            p.status = "pending"; p.direction = "in";
+            p.notes = "Κοινόχρηστο: " + op.label;
+            if (insertCharge(p, batchId) < 0) return fail();
+        }
+    }
+    if (!release("joint_charge")) return fail();
+    return opId;
+}
+
+static const char* kJointOpCols =
+    "o.id, COALESCE(o.building_id, -1), o.source_type, o.source_id, o.kind, o.label, o.total, o.op_date, o.params_json, "
+    "COALESCE(o.note,''), o.batch_id, datetime(o.created_at,'localtime'), COALESCE(b.address,''), "
+    "(SELECT COUNT(*) FROM joint_shares s WHERE s.op_id = o.id AND s.included = 1), "
+    "(SELECT COUNT(*) FROM joint_shares s WHERE s.op_id = o.id AND s.included = 0), "
+    "(SELECT COALESCE(SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)), 0) FROM charges c WHERE c.batch_id = o.batch_id) ";
+
+static JointOp ReadJointOp(sqlite3_stmt* st) {
+    JointOp o;
+    o.id = sqlite3_column_int(st, 0); o.building_id = sqlite3_column_int(st, 1);
+    o.source_type = ColText(st, 2); o.source_id = sqlite3_column_int(st, 3); o.kind = ColText(st, 4);
+    o.label = ColText(st, 5); o.total = RoundMoney(sqlite3_column_double(st, 6)); o.op_date = ColText(st, 7);
+    o.params_json = ColText(st, 8); o.note = ColText(st, 9); o.batch_id = sqlite3_column_int(st, 10);
+    o.created_at = ColText(st, 11); o.building_address = ColText(st, 12);
+    o.included = sqlite3_column_int(st, 13); o.excluded = sqlite3_column_int(st, 14);
+    o.paid = FromCents(sqlite3_column_int64(st, 15));
+    return o;
+}
+
+std::vector<JointOp> SqliteConn::getJointOps(int buildingId, int offset, int limit) {
+    std::vector<JointOp> out;
+    std::string sql = std::string("SELECT ") + kJointOpCols + "FROM joint_ops o LEFT JOIN buildings b ON b.id = o.building_id ";
+    if (buildingId > 0) sql += "WHERE o.building_id = ?1 ";
+    sql += "ORDER BY o.op_date DESC, o.id DESC LIMIT ?2 OFFSET ?3";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    if (buildingId > 0) sqlite3_bind_int(st, 1, buildingId);
+    sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadJointOp(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
+int SqliteConn::countJointOps(int buildingId) {
+    sqlite3_stmt* st = nullptr; int n = 0;
+    sqlite3_prepare_v2(db, buildingId > 0 ? "SELECT COUNT(*) FROM joint_ops WHERE building_id = ?" : "SELECT COUNT(*) FROM joint_ops", -1, &st, nullptr);
+    if (buildingId > 0) sqlite3_bind_int(st, 1, buildingId);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+JointOp SqliteConn::getJointOpById(int id) {
+    JointOp o;
+    std::string sql = std::string("SELECT ") + kJointOpCols + "FROM joint_ops o LEFT JOIN buildings b ON b.id = o.building_id WHERE o.id = ?";
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) o = ReadJointOp(st);
+    sqlite3_finalize(st);
+    return o;
+}
+
+std::vector<JointShare> SqliteConn::getJointShares(int opId) {
+    std::vector<JointShare> out;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db,
+        "SELECT s.id, s.op_id, s.apartment_id, COALESCE(s.user_id, -1), s.amount, s.included, COALESCE(s.exclude_reason,''), "
+        "       COALESCE(a.label,''), COALESCE(u.full_name,''), "
+        "       (SELECT COALESCE(SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)), 0) FROM charges c "
+        "        WHERE c.batch_id = o.batch_id AND c.apartment_id = s.apartment_id AND c.user_id IS s.user_id) "
+        "FROM joint_shares s JOIN joint_ops o ON o.id = s.op_id "
+        "LEFT JOIN apartments a ON a.id = s.apartment_id LEFT JOIN users u ON u.id = s.user_id "
+        "WHERE s.op_id = ? ORDER BY s.included DESC, a.label, s.id", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, opId);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        JointShare s;
+        s.id = sqlite3_column_int(st, 0); s.op_id = sqlite3_column_int(st, 1); s.apartment_id = sqlite3_column_int(st, 2);
+        s.user_id = sqlite3_column_int(st, 3); s.amount = RoundMoney(sqlite3_column_double(st, 4));
+        s.included = sqlite3_column_int(st, 5) != 0; s.exclude_reason = ColText(st, 6);
+        s.apartment_label = ColText(st, 7); s.user_name = ColText(st, 8); s.paid = FromCents(sqlite3_column_int64(st, 9));
+        out.push_back(s);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<int> SqliteConn::getJointOpCharges(int opId) {
+    std::vector<int> out;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT c.id FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.id = ? ORDER BY c.id", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, opId);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(sqlite3_column_int(st, 0));
+    sqlite3_finalize(st);
+    return out;
 }

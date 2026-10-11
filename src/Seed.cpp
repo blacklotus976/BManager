@@ -1,4 +1,5 @@
 #include "Seed.h"
+#include "Money.h"
 #include <vector>
 #include <string>
 #include <map>
@@ -475,6 +476,47 @@ void seedDemoDataIfEmpty(DataConn* db) {
             if (name == "ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ")     { h.push_back(stay(uid[i], aptOf(3, "Γ1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
             h.push_back(stay(uid[i], nowApt, from, ""));
             db->setResidencyHistory(uid[i], h);
+        }
+    }
+
+    // Κοινόχρηστα: a small catalog and one heating-oil charge split over the first building's residents
+    // (one apartment excluded, as happens when a flat has its own boiler).
+    {
+        Service oil; oil.label = "ΘΕΡΜΑΝΣΗ – ΠΕΤΡΕΛΑΙΟ ΚΟΙΝΟΧΡΗΣΤΟ";
+        oil.extra_notes = "Προμήθεια πετρελαίου για την κεντρική θέρμανση, κατανομή με χιλιοστά θέρμανσης.";
+        int oilId = db->addJointService(oil, "heating_oil");
+        Service clean; clean.label = "ΚΑΘΑΡΙΟΤΗΤΑ ΚΛΙΜΑΚΟΣ";
+        db->addJointService(clean, "equal");
+        Service lift; lift.label = "ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ";
+        db->addJointService(lift, "millesimal");
+        auto blds = db->getBuildings();
+        auto cat = db->getJointCatalog();
+        if (oilId > 0 && !blds.empty()) {
+            auto users = db->searchUsers("", 0, 1 << 30);
+            JointOp op; op.building_id = blds[0].id; op.source_type = "joint"; op.source_id = oilId; op.kind = "heating_oil";
+            op.label = "ΠΕΤΡΕΛΑΙΟ ΘΕΡΜΑΝΣΗΣ ΟΚΤ. 2026"; op.op_date = "2026-10-05";
+            std::vector<JointShare> shares; std::string weights; bool firstW = true, excludedOne = false;
+            const double w[] = {120, 95, 110, 80, 130, 100, 90, 105};
+            int k = 0;
+            for (auto& a : db->getApartmentsForBuilding(blds[0].id)) {
+                for (auto& u : users) {
+                    if (u.apartment_id != a.id) continue;
+                    JointShare sh; sh.apartment_id = a.id; sh.user_id = u.id;
+                    if (!excludedOne && k == 1) { sh.included = false; sh.exclude_reason = "Αυτόνομη θέρμανση"; excludedOne = true; }
+                    else { sh.amount = w[k % 8]; weights += std::string(firstW ? "" : ",") + "\"" + std::to_string(a.id) + "\":" + std::to_string((int)w[k % 8]); firstW = false; }
+                    shares.push_back(sh); k++;
+                    break;
+                }
+            }
+            // 1000 litres x 1.25 = 1250.00, split by the thousandths above
+            double sumW = 0; for (auto& sh : shares) if (sh.included) sumW += sh.amount;
+            long long total = 125000, given = 0; JointShare* last = nullptr;
+            for (auto& sh : shares) if (sh.included) { long long c = (long long)(total * sh.amount / sumW); sh.amount = c / 100.0; given += c; last = &sh; }
+            if (last) last->amount = (ToCents(last->amount) + total - given) / 100.0;
+            op.total = 1250.00;
+            op.params_json = "{\"extra\":0,\"litres\":1000,\"price_per_litre\":1.25,\"weights\":{" + weights + "}}";
+            int svc = -1; for (auto& j : cat) if (j.id == oilId) svc = j.service.id;
+            if (svc > 0 && last) db->chargeJoint(op, {{svc, 1250.00}}, shares);
         }
     }
 
