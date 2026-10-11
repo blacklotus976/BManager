@@ -10,6 +10,12 @@
 static int fails = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("FAIL line %d: %s\n", __LINE__, #cond); fails++; } } while (0)
 
+static int lastPaymentId(SqliteConn& db) {
+    std::vector<std::string> c; std::vector<std::vector<std::string>> rows; std::string err;
+    db.executeRawQuery("SELECT MAX(id) FROM payments", c, rows, err);
+    return std::atoi(rows[0][0].c_str());
+}
+
 static int addPay(SqliteConn& db, int user, int svc, double due, double paid, const char* status = "paid", const char* dir = "in") {
     Payment p; p.user_id = user; p.service_id = svc; p.year = 2026; p.month = 10; p.day = 1;
     p.amount_due = due; p.amount_paid = paid; p.status = status; p.direction = dir;
@@ -35,8 +41,17 @@ int main() {
         User u; u.full_name = "ΤΕΣΤ ΠΕΛΑΤΗΣ"; db.addUser(u);
         Service s; s.label = "ΠΑΚΕΤΟ BASIC"; s.suggested_price = 15; int svc = db.addServiceGetId(1, s);
 
-        int p1 = addPay(db, 1, svc, 15, 15), p2 = addPay(db, 1, svc, 15, 15), p3 = addPay(db, 1, svc, 15, 10.10);
+        // a package charge: three payments created together (one batch)
+        std::vector<Payment> pkg(3);
+        for (auto& p : pkg) { p.user_id = 1; p.service_id = svc; p.year = 2026; p.month = 10; p.day = 1;
+                              p.amount_due = 15; p.amount_paid = 15; p.status = "paid"; p.direction = "in"; }
+        pkg[2].amount_paid = 10.10;
+        int batch = db.addPaymentBatch(pkg, "ΠΑΚΕΤΟ BASIC");
+        CHECK(batch > 0);
+        int p3 = lastPaymentId(db), p2 = p3 - 1, p1 = p3 - 2;
+        CHECK(db.getPaymentById(p1).batch_id == batch && db.getPaymentById(p3).batch_id == batch);
         int fut = addPay(db, 1, svc, 15, 0, "future"), out = addPay(db, 1, svc, 50, 50, "paid", "out");
+        int lone1 = addPay(db, 1, svc, 20, 20), lone2 = addPay(db, 1, svc, 20, 20);
 
         Receipt r; r.user_id = 1; r.method = "ebanking";
         int rid = db.issueReceipt(r, {p1, p2, p3});
@@ -53,6 +68,10 @@ int main() {
         CHECK(db.issueReceipt(r, {fut}) == -1); db.takeLastError();
         CHECK(db.issueReceipt(r, {out}) == -1); db.takeLastError();
         CHECK(db.issueReceipt(r, {}) == -1); db.takeLastError();
+        // payments created separately can't share a receipt (one each), nor mix with a batch
+        CHECK(db.issueReceipt(r, {lone1, lone2}) == -1); db.takeLastError();
+        CHECK(db.issueReceipt(r, {lone1}) > 0);
+        CHECK(db.issueReceipt(r, {lone2}) > 0);
         Receipt badRf = r; badRf.rf_code = "RF00123";
         CHECK(db.issueReceipt(badRf, {fut}) == -1); db.takeLastError();
 
@@ -63,6 +82,8 @@ int main() {
         CHECK(!db.removePayment(p2)); db.takeLastError();
         std::vector<std::string> c; std::vector<std::vector<std::string>> rows; std::string err;
         CHECK(!db.executeRawQuery("UPDATE payments SET amount_paid = 0 WHERE id = " + std::to_string(p1), c, rows, err));
+        CHECK(!db.executeRawQuery("DELETE FROM audit_log", c, rows, err));
+        CHECK(!db.executeRawQuery("DROP TRIGGER audit_payments_upd", c, rows, err));
         CHECK(!db.executeRawQuery("DELETE FROM receipts", c, rows, err));
         CHECK(!db.executeRawQuery("UPDATE receipts SET total = 1", c, rows, err));
         CHECK(!db.executeRawQuery("UPDATE receipts SET status = 'void'", c, rows, err));   // no reason
@@ -78,7 +99,7 @@ int main() {
         ed = db.getPaymentById(p3); ed.amount_paid = 15;
         CHECK(db.editPayment(p3, ed));
         int rid2 = db.issueReceipt(r, {p1, p2, p3});
-        CHECK(rid2 > 0 && db.getReceiptById(rid2).number == 2 && ToCents(db.getReceiptById(rid2).total) == 4500);
+        CHECK(rid2 > 0 && db.getReceiptById(rid2).number == 4 && ToCents(db.getReceiptById(rid2).total) == 4500);
         CHECK(db.getReceiptPaymentIds(rid).empty());
         CHECK(!db.executeRawQuery("UPDATE receipts SET notes='x' WHERE id = " + std::to_string(rid), c, rows, err)); // void is final
     }

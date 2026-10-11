@@ -2495,6 +2495,8 @@ static void DrawPackageChargeDialog() {
             RequestConfirm("Χρέωση πακέτου", { {"Πελάτης", "-", g_app.userName(uid)}, {"Πακέτο", "-", pkgName},
                                                  {"Πληρωμές", "-", std::to_string(charge.size()) + " / " + std::to_string((int)(total + 0.5)) + " €"} },
                 [=]() {
+                    // one action -> one batch: all-or-nothing, and these payments may share one receipt
+                    std::vector<Payment> batch;
                     for (auto& s : charge) {
                         Payment p;
                         p.user_id = uid; p.service_id = s.id;
@@ -2506,8 +2508,9 @@ static void DrawPackageChargeDialog() {
                         p.direction = dir;
                         p.resolution_date = fut ? res : "";
                         p.notes = note;
-                        g_app.conn->addPayment(p);
+                        batch.push_back(p);
                     }
+                    g_app.conn->addPaymentBatch(batch, note);
                     g_app.reloadAll();
                 });
             g_showPkgChargeDialog = false;

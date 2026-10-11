@@ -102,3 +102,7 @@ add_test(NAME receipts COMMAND receipts_test)
 add_executable(history_test EXCLUDE_FROM_ALL tests/history_test.cpp src/SqliteConn.cpp)
 target_link_libraries(history_test PRIVATE sqlite3_vendored)
 add_test(NAME history COMMAND history_test)
+
+add_executable(audit_test EXCLUDE_FROM_ALL tests/audit_test.cpp src/SqliteConn.cpp)
+target_link_libraries(audit_test PRIVATE sqlite3_vendored)
+add_test(NAME audit COMMAND audit_test)

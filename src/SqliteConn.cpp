@@ -2,6 +2,13 @@
 #include "Platform.h"
 #include "Money.h"
 #include "Rf.h"
+#include "Sha256.h"
+#include <map>
+#include <set>
+#include <cstdlib>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
@@ -79,9 +86,68 @@ static std::string NormalizeDirection(const char* raw) {
     return d;
 }
 
+// One column list + one reader for every payment query, so no function depends on the table's physical
+// column order (they used SELECT * with hard-coded positions). Timestamps are stored UTC and returned in
+// local time; the date is one ISO column split back into the parts the UI uses.
+static const char* kPaymentCols =
+    "p.id, p.service_id, p.user_id, p.apartment_id, p.pay_date, p.amount_due, p.amount_paid, p.balance, "
+    "p.status, p.direction, p.notes, COALESCE(p.resolution_date,''), "
+    "COALESCE(datetime(p.resolved_at,'localtime'),''), COALESCE(datetime(p.created_at,'localtime'),''), "
+    "COALESCE(p.receipt_id,-1), COALESCE(p.batch_id,-1)";
+
+static Payment ReadPayment(sqlite3_stmt* st) {
+    auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
+    auto optInt = [&](int c) { return sqlite3_column_type(st, c) == SQLITE_NULL ? -1 : sqlite3_column_int(st, c); };
+    Payment p;
+    p.id = sqlite3_column_int(st, 0);
+    p.service_id = sqlite3_column_int(st, 1);
+    p.user_id = optInt(2);
+    p.apartment_id = optInt(3);
+    std::sscanf(txt(4).c_str(), "%d-%d-%d", &p.year, &p.month, &p.day);
+    p.amount_due = sqlite3_column_double(st, 5);
+    p.amount_paid = sqlite3_column_double(st, 6);
+    p.balance = sqlite3_column_double(st, 7);
+    p.status = txt(8);
+    p.direction = NormalizeDirection(sqlite3_column_type(st, 9) == SQLITE_NULL ? "in" : txt(9).c_str());
+    p.notes = txt(10);
+    p.resolution_date = txt(11);
+    p.resolved_at = txt(12);
+    p.created_at = txt(13);
+    p.receipt_id = sqlite3_column_int(st, 14);
+    p.batch_id = sqlite3_column_int(st, 15);
+    return p;
+}
+
+static std::string PayDate(const Payment& p) {
+    char d[16]; std::snprintf(d, sizeof(d), "%04d-%02d-%02d", p.year, p.month, p.day);
+    return d;
+}
+
+// Runs a payment query (sql must select kPaymentCols FROM payments p ...) with int binds.
+static std::vector<Payment> QueryPayments(sqlite3* db, const std::string& sql, std::initializer_list<int> binds = {}) {
+    std::vector<Payment> out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { std::cerr << "SQL: " << sqlite3_errmsg(db) << "\n"; return out; }
+    int i = 1;
+    for (int b : binds) sqlite3_bind_int(st, i++, b);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadPayment(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
 static std::string paymentToJson(const Payment& p) {
     return "{ \"id\": " + std::to_string(p.id) + ", \"service_id\": " + std::to_string(p.service_id) + ", \"user_id\": " + std::to_string(p.user_id) + ", \"year\": " + std::to_string(p.year) + ", \"month\": " + std::to_string(p.month) + ", \"amount_due\": " + FormatMoney(p.amount_due) + ", \"amount_paid\": " + FormatMoney(p.amount_paid) + ", \"status\": \"" + p.status + "\", \"direction\": \"" + p.direction + "\", \"resolution_date\": \"" + p.resolution_date + "\", \"resolved_at\": \"" + p.resolved_at + "\" }";
 }
+
+static std::string AuditCanonical(const std::string& prev, const std::string& id, const std::string& at,
+                                  const std::string& actor, const std::string& table, const std::string& recordId,
+                                  const std::string& action, const std::string& oldData, const std::string& newData,
+                                  const std::string& reason, const std::string& category);
+static std::string JsonRowExpr(sqlite3* db, const std::string& table, const std::string& prefix);
+static const char* kAuditedTables[] = {
+    "buildings", "apartments", "users", "residencies", "services", "service_users", "master_services",
+    "master_service_components", "payment_batches", "payments", "receipts", "notes",
+};
 
 static int UserVersion(sqlite3* db) {
     int v = 0; sqlite3_stmt* st = nullptr;
@@ -97,6 +163,8 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
         return;
     }
+    registerSqlFunctions();   // audit_hash / app_actor / app_reason -- the audit triggers need them
+    const int versionAtOpen = UserVersion(db);
 
     // Create tables if not exist
     std::string schema = R"(
@@ -445,7 +513,7 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
     // --- Migration: apartment history. residencies = who lived where and when; payments get the
     // apartment they were made from (snapshot at the payment's date) and the minute they were
     // entered. Done once; old data is back-filled from the current assignments. ---
-    {
+    if (UserVersion(db) < 2) {
         executeQuery("CREATE TABLE IF NOT EXISTS residencies ("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, apartment_id INTEGER NOT NULL, "
                      "from_date TEXT NOT NULL, to_date TEXT);"
@@ -599,6 +667,212 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
             "PRAGMA user_version = 6;");
     }
 
+    // --- Migration v7: real date/datetime columns, payment batches, trustworthy audit log. ---
+    //  * payments.year/month/day -> pay_date ('YYYY-MM-DD', CHECKed); timestamps stored UTC ('YYYY-MM-DD HH:MM:SS')
+    //    and shown in local time; the table is rebuilt with an explicit column order.
+    //  * payment_batches + payments.batch_id: payments created together (a package charge).
+    //  * receipts rebuilt the same way (UTC timestamps, ISO date CHECK).
+    //  * audit_log rebuilt with actor / reason / prev_hash / hash; legacy entries kept and chained, then one
+    //    BASELINE snapshot per existing row so every row has a known starting state.
+    if (UserVersion(db) < 7) {
+        executeQuery("BEGIN;");
+        executeQuery(
+            "DROP TRIGGER IF EXISTS trg_payments_receipted_update;"
+            "DROP TRIGGER IF EXISTS trg_payments_receipted_delete;"
+            "DROP TRIGGER IF EXISTS trg_receipts_locked;"
+            "DROP TRIGGER IF EXISTS trg_receipts_no_delete;"
+            "DROP TRIGGER IF EXISTS trg_apartments_keep_payments;"
+            "DROP TRIGGER IF EXISTS trg_users_keep_payments;"
+            "CREATE TABLE IF NOT EXISTS payment_batches ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  label TEXT,"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')) CHECK (created_at IS datetime(created_at)));");
+
+        executeQuery(R"(
+            CREATE TABLE receipts_v7 (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                series      TEXT    NOT NULL DEFAULT 'A',
+                number      INTEGER NOT NULL,
+                issue_date  TEXT    NOT NULL CHECK (issue_date IS date(issue_date)),
+                user_id     INTEGER REFERENCES users(id),
+                building_id INTEGER REFERENCES buildings(id),
+                total       REAL    NOT NULL CHECK (total > 0),
+                method      TEXT    NOT NULL CHECK (method IN ('cash','collector','bank','ebanking','card','iris','other')),
+                rf_code     TEXT,
+                paper_ref   TEXT,
+                bank_ref    TEXT,
+                notes       TEXT,
+                status      TEXT    NOT NULL DEFAULT 'issued' CHECK (status IN ('issued','void')),
+                void_reason TEXT,
+                voided_at   TEXT CHECK (voided_at IS NULL OR voided_at IS datetime(voided_at)),
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')) CHECK (created_at IS datetime(created_at)),
+                UNIQUE (series, number)
+            );
+            INSERT INTO receipts_v7 SELECT id, series, number, issue_date, user_id, building_id, total, method, rf_code, paper_ref,
+                   bank_ref, notes, status, void_reason, datetime(voided_at, 'utc'), COALESCE(datetime(created_at, 'utc'), datetime('now'))
+            FROM receipts;
+            DROP TABLE receipts;
+            ALTER TABLE receipts_v7 RENAME TO receipts;
+            CREATE INDEX IF NOT EXISTS idx_receipts_user ON receipts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(issue_date);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_rf ON receipts(rf_code) WHERE rf_code IS NOT NULL AND status = 'issued';
+        )");
+
+        int fixedDates = 0;
+        { sqlite3_stmt* st = nullptr;
+          sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM payments WHERE date(printf('%04d-%02d-%02d', year, month, day)) IS NOT printf('%04d-%02d-%02d', year, month, day)", -1, &st, nullptr);
+          if (sqlite3_step(st) == SQLITE_ROW) fixedDates = sqlite3_column_int(st, 0);
+          sqlite3_finalize(st); }
+        executeQuery(R"(
+            CREATE TABLE payments_v7 (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id      INTEGER NOT NULL REFERENCES services(id),
+                user_id         INTEGER REFERENCES users(id),
+                apartment_id    INTEGER REFERENCES apartments(id),
+                pay_date        TEXT    NOT NULL CHECK (pay_date IS date(pay_date)),
+                amount_due      REAL    NOT NULL DEFAULT 0,
+                amount_paid     REAL    NOT NULL DEFAULT 0,
+                balance         REAL    NOT NULL DEFAULT 0,
+                status          TEXT    NOT NULL DEFAULT 'paid',
+                direction       TEXT    NOT NULL DEFAULT 'in' CHECK (direction IN ('in','out')),
+                notes           TEXT,
+                resolution_date TEXT CHECK (resolution_date IS NULL OR resolution_date IS date(resolution_date)),
+                resolved_at     TEXT CHECK (resolved_at IS NULL OR resolved_at IS datetime(resolved_at)),
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')) CHECK (created_at IS datetime(created_at)),
+                receipt_id      INTEGER REFERENCES receipts(id),
+                batch_id        INTEGER REFERENCES payment_batches(id)
+            );
+            INSERT INTO payments_v7
+            SELECT id, service_id, user_id, apartment_id,
+                   COALESCE(date(printf('%04d-%02d-%02d', year, month, day)), '1970-01-01'),
+                   COALESCE(amount_due, 0), COALESCE(amount_paid, 0), COALESCE(balance, 0),
+                   COALESCE(status, 'paid'),
+                   CASE WHEN direction IN ('in','out') THEN direction ELSE 'in' END,
+                   notes,
+                   date(NULLIF(resolution_date, '')),
+                   datetime(NULLIF(resolved_at, ''), 'utc'),
+                   COALESCE(datetime(created_at, 'utc'), datetime(printf('%04d-%02d-%02d', year, month, day)), datetime('now')),
+                   receipt_id, NULL
+            FROM payments;
+            DROP TABLE payments;
+            ALTER TABLE payments_v7 RENAME TO payments;
+            CREATE INDEX IF NOT EXISTS idx_payments_date      ON payments(pay_date);
+            CREATE INDEX IF NOT EXISTS idx_payments_user_date ON payments(user_id, pay_date);
+            CREATE INDEX IF NOT EXISTS idx_payments_service   ON payments(service_id);
+            CREATE INDEX IF NOT EXISTS idx_payments_apartment ON payments(apartment_id);
+            CREATE INDEX IF NOT EXISTS idx_payments_receipt   ON payments(receipt_id);
+            CREATE INDEX IF NOT EXISTS idx_payments_batch     ON payments(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_payments_status    ON payments(status, pay_date);
+
+            CREATE TRIGGER trg_receipts_no_delete BEFORE DELETE ON receipts
+            BEGIN SELECT RAISE(ABORT, 'Οι αποδείξεις δεν διαγράφονται - ακυρώστε την απόδειξη'); END;
+
+            CREATE TRIGGER trg_receipts_locked BEFORE UPDATE ON receipts
+            WHEN OLD.status = 'void'
+              OR NEW.series IS NOT OLD.series OR NEW.number IS NOT OLD.number OR NEW.issue_date IS NOT OLD.issue_date
+              OR NEW.user_id IS NOT OLD.user_id OR NEW.building_id IS NOT OLD.building_id OR NEW.total IS NOT OLD.total
+              OR NEW.method IS NOT OLD.method OR NEW.rf_code IS NOT OLD.rf_code OR NEW.created_at IS NOT OLD.created_at
+              OR (NEW.status = 'void' AND TRIM(COALESCE(NEW.void_reason,'')) = '')
+            BEGIN SELECT RAISE(ABORT, 'Η απόδειξη έχει εκδοθεί και δεν αλλάζει - μόνο ακύρωση με αιτιολογία'); END;
+
+            CREATE TRIGGER trg_payments_receipted_update BEFORE UPDATE ON payments
+            WHEN OLD.receipt_id IS NOT NULL
+             AND (SELECT status FROM receipts WHERE id = OLD.receipt_id) = 'issued'
+             AND (NEW.amount_due IS NOT OLD.amount_due OR NEW.amount_paid IS NOT OLD.amount_paid
+                  OR NEW.user_id IS NOT OLD.user_id OR NEW.service_id IS NOT OLD.service_id
+                  OR NEW.apartment_id IS NOT OLD.apartment_id OR NEW.pay_date IS NOT OLD.pay_date
+                  OR NEW.direction IS NOT OLD.direction OR NEW.status IS NOT OLD.status
+                  OR NEW.receipt_id IS NOT OLD.receipt_id OR NEW.batch_id IS NOT OLD.batch_id)
+            BEGIN SELECT RAISE(ABORT, 'Η πληρωμή έχει απόδειξη - ακυρώστε πρώτα την απόδειξη για να την αλλάξετε'); END;
+
+            CREATE TRIGGER trg_payments_receipted_delete BEFORE DELETE ON payments
+            WHEN OLD.receipt_id IS NOT NULL AND (SELECT status FROM receipts WHERE id = OLD.receipt_id) = 'issued'
+            BEGIN SELECT RAISE(ABORT, 'Η πληρωμή έχει απόδειξη - ακυρώστε πρώτα την απόδειξη για να τη διαγράψετε'); END;
+
+            CREATE TRIGGER trg_payments_batch_fixed BEFORE UPDATE OF batch_id ON payments
+            WHEN NEW.batch_id IS NOT OLD.batch_id
+            BEGIN SELECT RAISE(ABORT, 'Η ομάδα μιας πληρωμής ορίζεται μόνο κατά τη δημιουργία της'); END;
+
+            CREATE TRIGGER trg_apartments_keep_payments BEFORE DELETE ON apartments
+            WHEN EXISTS (SELECT 1 FROM payments WHERE apartment_id = OLD.id)
+            BEGIN SELECT RAISE(ABORT, 'Το διαμέρισμα έχει πληρωμές στο ιστορικό του και δεν διαγράφεται'); END;
+
+            CREATE TRIGGER trg_users_keep_payments BEFORE DELETE ON users
+            WHEN EXISTS (SELECT 1 FROM payments WHERE user_id = OLD.id)
+            BEGIN SELECT RAISE(ABORT, 'Ο πελάτης έχει πληρωμές στο ιστορικό του και δεν διαγράφεται'); END;
+        )");
+
+        // audit_log: rebuild with the trust columns, keep legacy rows
+        executeQuery(R"(
+            CREATE TABLE audit_log_v7 (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                changed_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                actor       TEXT    NOT NULL DEFAULT '',
+                table_name  TEXT    NOT NULL,
+                record_id   INTEGER,
+                action_type TEXT    NOT NULL,
+                old_data    TEXT,
+                new_data    TEXT,
+                reason      TEXT    NOT NULL DEFAULT '',
+                category    TEXT    NOT NULL DEFAULT 'business',
+                prev_hash   TEXT,
+                hash        TEXT
+            );
+            INSERT INTO audit_log_v7 (id, changed_at, actor, table_name, record_id, action_type, old_data, new_data, reason, category)
+            SELECT id, COALESCE(datetime(changed_at), datetime('now')), 'πριν την v7', COALESCE(table_name, ''), record_id,
+                   COALESCE(action_type, ''), old_data, new_data, '', COALESCE(category, 'db')
+            FROM audit_log ORDER BY id;
+            DROP TABLE audit_log;
+            ALTER TABLE audit_log_v7 RENAME TO audit_log;
+            CREATE INDEX IF NOT EXISTS idx_audit_changed ON audit_log(changed_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_record  ON audit_log(table_name, record_id, id);
+        )");
+        for (const char* t : kAuditedTables) {
+            executeQuery(std::string("INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                         "SELECT '") + t + "', rowid, 'BASELINE', NULL, " + JsonRowExpr(db, t, "") + ", 'db', 'migration v7', "
+                         "'Αρχική κατάσταση κατά την ενεργοποίηση του αμετάβλητου ιστορικού' FROM " + t + ";");
+        }
+        // chain everything that exists so far, in order
+        {
+            sqlite3_stmt* rd = nullptr; sqlite3_stmt* up = nullptr;
+            sqlite3_prepare_v2(db, "SELECT id, changed_at, actor, table_name, record_id, action_type, old_data, new_data, reason, category "
+                                   "FROM audit_log ORDER BY id", -1, &rd, nullptr);
+            sqlite3_prepare_v2(db, "UPDATE audit_log SET prev_hash = ?, hash = ? WHERE id = ?", -1, &up, nullptr);
+            auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(rd, c); return std::string(t ? (const char*)t : ""); };
+            std::string prev;
+            while (sqlite3_step(rd) == SQLITE_ROW) {
+                std::string h = Sha256Hex(AuditCanonical(prev, txt(0), txt(1), txt(2), txt(3), txt(4), txt(5), txt(6), txt(7), txt(8), txt(9)));
+                sqlite3_bind_text(up, 1, prev.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(up, 2, h.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(up, 3, sqlite3_column_int64(rd, 0));
+                sqlite3_step(up); sqlite3_reset(up);
+                prev = h;
+            }
+            sqlite3_finalize(rd); sqlite3_finalize(up);
+        }
+        ensureAuditTriggers();
+        logAction("migration", 7, "SCHEMA_V7", "",
+                  "{\"pay_date\": true, \"utc_timestamps\": true, \"audit_chain\": true, \"normalized_invalid_dates\": " + std::to_string(fixedDates) + "}", "db");
+        executeQuery("PRAGMA user_version = 7;");
+        if (!executeQuery("COMMIT;")) { executeQuery("ROLLBACK;"); std::cerr << "migration v7 failed\n"; }
+    }
+
+    // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
+    // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
+    {
+        bool migratedNow = versionAtOpen < 7;
+        int restored = ensureAuditTriggers();
+        if (restored > 0 && !migratedNow) {
+            logAction("audit", 0, "TRIGGERS_RESTORED", "", "{\"count\": " + std::to_string(restored) + "}", "db");
+            lastError_ = "Ο μηχανισμός καταγραφής ιστορικού είχε αφαιρεθεί ή αλλοιωθεί και αποκαταστάθηκε (" +
+                         std::to_string(restored) + "). Ελέγξτε το ιστορικό αλλαγών.";
+        }
+        AuditCheck chk = verifyAuditLog();
+        if (!chk.ok) lastError_ = "Έλεγχος ακεραιότητας ιστορικού: " + chk.problems.front() +
+                                  (chk.problems.size() > 1 ? " (+" + std::to_string(chk.problems.size() - 1) + " ακόμη)" : "");
+        writeAuditAnchor();
+    }
+
     greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
     greekHeaders["buildings"] = {"ΚΩΔ", "ΔΙΕΥΘΥΝΣΗ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΑΦΜ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["apartments"] = {"ΚΩΔ", "ΚΩΔ ΚΤΙΡΙΟΥ", "ΔΙΑΜΕΡΙΣΜΑ"};
@@ -632,7 +906,8 @@ bool SqliteConn::executeQuery(const std::string& sql) {
 }
 
 void SqliteConn::logAction(const std::string& table, int recordId, const std::string& action, const std::string& oldData, const std::string& newData, const std::string& category) {
-    std::string sql = "INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category) VALUES (?, ?, ?, ?, ?, ?)";
+    std::string sql = "INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                      "VALUES (?, ?, ?, ?, ?, ?, app_actor(), app_reason())";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, table.c_str(), -1, SQLITE_STATIC);
@@ -722,7 +997,6 @@ bool SqliteConn::addUser(const User& u) {
         int newId = (int)sqlite3_last_insert_rowid(db);
         if (u.apartment_id > 0)
             executeQuery("INSERT INTO residencies (user_id, apartment_id, from_date) VALUES (" + std::to_string(newId) + "," + std::to_string(u.apartment_id) + ", date('now','localtime'));");
-        logAction("users", newId, "INSERT", "", userToJson(u), "business");
         return true;
     }
     return false;
@@ -746,7 +1020,7 @@ bool SqliteConn::editUser(int id, const User& u) {
             if (u.apartment_id > 0)
                 executeQuery("INSERT INTO residencies (user_id, apartment_id, from_date) VALUES (" + std::to_string(id) + "," + std::to_string(u.apartment_id) + ", date('now','localtime'));");
         }
-        logAction("users", id, "UPDATE", userToJson(old), userToJson(u), "business"); return true;
+         return true;
     }
     return false;
 }
@@ -760,7 +1034,7 @@ bool SqliteConn::removeUser(int id) {
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);   // refused: the client has payments (history)
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { executeQuery("DELETE FROM residencies WHERE user_id = " + std::to_string(id) + ";"); logAction("users", id, "DELETE", "", "", "business"); return true; }
+    if (rc == SQLITE_DONE) { executeQuery("DELETE FROM residencies WHERE user_id = " + std::to_string(id) + ";");  return true; }
     return false;
 }
 
@@ -827,7 +1101,6 @@ int SqliteConn::addBuilding(const Building& b) {
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return -1;
     int id = (int)sqlite3_last_insert_rowid(db);
-    logAction("buildings", id, "INSERT", "", BuildingToJson(b), "business");
     return id;
 }
 
@@ -843,7 +1116,6 @@ bool SqliteConn::editBuilding(int id, const Building& b) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return false;
-    logAction("buildings", id, "UPDATE", BuildingToJson(old), BuildingToJson(b), "business");
     return true;
 }
 
@@ -868,7 +1140,6 @@ bool SqliteConn::removeBuilding(int id) {
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
     }
-    logAction("buildings", id, "DELETE", BuildingToJson(old), "", "business");
     return true;
 }
 
@@ -897,8 +1168,6 @@ int SqliteConn::addApartment(int buildingId, const std::string& label) {
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return -1;
     int id = (int)sqlite3_last_insert_rowid(db);
-    logAction("apartments", id, "INSERT", "",
-              "{ \"id\": " + std::to_string(id) + ", \"building_id\": " + std::to_string(buildingId) + ", \"label\": \"" + label + "\" }", "business");
     return id;
 }
 
@@ -910,7 +1179,6 @@ bool SqliteConn::editApartment(int id, const std::string& label) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return false;
-    logAction("apartments", id, "UPDATE", "", "{ \"id\": " + std::to_string(id) + ", \"label\": \"" + label + "\" }", "business");
     return true;
 }
 
@@ -931,7 +1199,6 @@ bool SqliteConn::removeApartment(int id) {
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
     }
-    logAction("apartments", id, "DELETE", "", "", "business");
     return true;
 }
 
@@ -987,8 +1254,8 @@ bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& h
     sql += "UPDATE users SET apartment_id = " + (currentApt > 0 ? std::to_string(currentApt) : std::string("NULL")) + " WHERE id = " + uid + ";";
     sql += "UPDATE payments SET apartment_id = COALESCE(("
            "SELECT r.apartment_id FROM residencies r WHERE r.user_id = payments.user_id "
-           "AND r.from_date <= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day) "
-           "AND (r.to_date IS NULL OR r.to_date >= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day)) "
+           "AND r.from_date <= payments.pay_date "
+           "AND (r.to_date IS NULL OR r.to_date >= payments.pay_date) "
            "ORDER BY r.from_date DESC, r.id DESC LIMIT 1), apartment_id) WHERE user_id = " + uid +
            // receipted payments keep the apartment printed on their receipt
            " AND (receipt_id IS NULL OR (SELECT status FROM receipts WHERE id = payments.receipt_id) = 'void');COMMIT;";
@@ -998,30 +1265,11 @@ bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& h
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
     }
-    logAction("residencies", userId, "UPDATE", "", "history replaced", "business");
     return true;
 }
 
 std::vector<Payment> SqliteConn::getPaymentsForApartment(int apartmentId) {
-    std::vector<Payment> out;
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db, "SELECT id, service_id, year, month, day, amount_due, amount_paid, balance, status, notes, user_id, direction, "
-                           "resolution_date, resolved_at, apartment_id, created_at FROM payments WHERE apartment_id=? ORDER BY year, month, day, id", -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt, 1, apartmentId);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt, 0); p.service_id = sqlite3_column_int(stmt, 1);
-        p.year = sqlite3_column_int(stmt, 2); p.month = sqlite3_column_int(stmt, 3); p.day = sqlite3_column_int(stmt, 4);
-        p.amount_due = sqlite3_column_double(stmt, 5); p.amount_paid = sqlite3_column_double(stmt, 6); p.balance = sqlite3_column_double(stmt, 7);
-        p.status = ColText(stmt, 8); p.notes = ColText(stmt, 9);
-        p.user_id = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt, 10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt, 11));
-        p.resolution_date = ColText(stmt, 12); p.resolved_at = ColText(stmt, 13);
-        p.apartment_id = apartmentId; p.created_at = ColText(stmt, 15);
-        out.push_back(p);
-    }
-    sqlite3_finalize(stmt);
-    return out;
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.apartment_id = ? ORDER BY p.pay_date, p.id", {apartmentId});
 }
 
 std::string SqliteConn::takeLastError() { std::string e; e.swap(lastError_); return e; }
@@ -1125,7 +1373,6 @@ int SqliteConn::addServiceGetId(int userId, const Service& in) {
     if(rc != SQLITE_DONE) return -1;
     int id = sqlite3_last_insert_rowid(db);
     s.id = id;
-    logAction("services", id, "INSERT", "", serviceToJson(s), "business");
     if (userId >= 0 && !addServiceUser(id, userId)) return -1;   // userId < 0: independent service, no roster row
     return id;
 }
@@ -1138,7 +1385,7 @@ bool SqliteConn::addServiceUser(int serviceId, int userId) {
     sqlite3_bind_int(stmt,2,userId);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("service_users", serviceId, "INSERT", "", "{ \"user_id\": " + std::to_string(userId) + " }", "business"); return true; }
+    if(rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
@@ -1167,7 +1414,7 @@ bool SqliteConn::editService(int id, const Service& in) {
     sqlite3_bind_int(stmt,4,id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("services", id, "UPDATE", serviceToJson(old), serviceToJson(s), "business"); return true; }
+    if(rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
@@ -1178,7 +1425,7 @@ bool SqliteConn::removeService(int id) {
     sqlite3_bind_int(stmt,1,id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("services", id, "DELETE", "", "", "business"); return true; }
+    if(rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
@@ -1263,7 +1510,6 @@ int SqliteConn::addMasterService(const std::string& label) {
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return -1;
     int id = sqlite3_last_insert_rowid(db);
-    logAction("master_services", id, "INSERT", "", "{ \"label\": \"" + label + "\" }", "business");
     return id;
 }
 
@@ -1276,7 +1522,6 @@ bool SqliteConn::addMasterServiceComponent(int masterServiceId, int serviceId) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
-        logAction("master_service_components", masterServiceId, "INSERT", "", "{ \"service_id\": " + std::to_string(serviceId) + " }", "business");
         return true;
     }
     return false;
@@ -1291,7 +1536,6 @@ bool SqliteConn::removeMasterServiceComponent(int masterServiceId, int serviceId
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
-        logAction("master_service_components", masterServiceId, "DELETE", "", "{ \"service_id\": " + std::to_string(serviceId) + " }", "business");
         return true;
     }
     return false;
@@ -1304,7 +1548,7 @@ bool SqliteConn::removeMasterService(int id) {
     sqlite3_bind_int(stmt,1,id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { logAction("master_services", id, "DELETE", "", "", "business"); return true; }
+    if (rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
@@ -1324,28 +1568,58 @@ std::vector<DataConn::MasterServiceSummary> SqliteConn::getMasterServiceSummarie
 
 // --- PAYMENTS (Including Future) ---
 bool SqliteConn::addPayment(const Payment& in) {
-    Payment p = in;                                   // money snapped to cents; balance always due - paid
+    return insertPayment(in, -1) > 0;
+}
+
+// Inserts one payment (money snapped to cents, balance = due - paid) and returns its id, -1 on failure.
+int SqliteConn::insertPayment(const Payment& in, int batchId) {
+    Payment p = in;
     p.amount_due = RoundMoney(p.amount_due);
     p.amount_paid = RoundMoney(p.amount_paid);
     p.balance = MoneySub(p.amount_due, p.amount_paid);
     int aptId = p.apartment_id >= 0 ? p.apartment_id : apartmentAt(p.user_id, p.year, p.month, p.day);
-    std::string sql = "INSERT INTO payments (service_id, year, month, day, amount_due, amount_paid, balance, status, notes, user_id, direction, resolution_date, resolved_at, apartment_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(?15, datetime('now','localtime')))";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,p.service_id); sqlite3_bind_int(stmt,2,p.year); sqlite3_bind_int(stmt,3,p.month); sqlite3_bind_int(stmt,4,p.day);
-    sqlite3_bind_double(stmt,5,p.amount_due); sqlite3_bind_double(stmt,6,p.amount_paid); sqlite3_bind_double(stmt,7,p.balance);
-    sqlite3_bind_text(stmt,8,p.status.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,9,p.notes.c_str(),-1,SQLITE_STATIC);
-    if (p.user_id > 0) sqlite3_bind_int(stmt,10,p.user_id); else sqlite3_bind_null(stmt,10);
-    sqlite3_bind_text(stmt,11,p.direction.empty() ? "in" : p.direction.c_str(),-1,SQLITE_STATIC);
-    if (p.resolution_date.empty()) sqlite3_bind_null(stmt,12); else sqlite3_bind_text(stmt,12,p.resolution_date.c_str(),-1,SQLITE_STATIC);
-    if (p.resolved_at.empty()) sqlite3_bind_null(stmt,13); else sqlite3_bind_text(stmt,13,p.resolved_at.c_str(),-1,SQLITE_STATIC);
-    if (aptId > 0) sqlite3_bind_int(stmt,14,aptId); else sqlite3_bind_null(stmt,14);
-    if (p.created_at.empty()) sqlite3_bind_null(stmt,15); else sqlite3_bind_text(stmt,15,p.created_at.c_str(),-1,SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { int id = sqlite3_last_insert_rowid(db); p.id = id; logAction("payments", id, "INSERT", "", paymentToJson(p), "business"); return true; }
-    return false;
+    std::string date = PayDate(p);
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO payments (service_id, user_id, apartment_id, pay_date, amount_due, amount_paid, balance, status, "
+                           "direction, notes, resolution_date, resolved_at, created_at, batch_id) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?,?, datetime(?12,'utc'), COALESCE(datetime(?13,'utc'), datetime('now')), ?14)", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, p.service_id);
+    if (p.user_id > 0) sqlite3_bind_int(st, 2, p.user_id); else sqlite3_bind_null(st, 2);
+    if (aptId > 0) sqlite3_bind_int(st, 3, aptId); else sqlite3_bind_null(st, 3);
+    sqlite3_bind_text(st, 4, date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 5, p.amount_due); sqlite3_bind_double(st, 6, p.amount_paid); sqlite3_bind_double(st, 7, p.balance);
+    sqlite3_bind_text(st, 8, p.status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, p.direction.empty() ? "in" : p.direction.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 10, p.notes.c_str(), -1, SQLITE_TRANSIENT);
+    if (p.resolution_date.empty()) sqlite3_bind_null(st, 11); else sqlite3_bind_text(st, 11, p.resolution_date.c_str(), -1, SQLITE_TRANSIENT);
+    if (p.resolved_at.empty()) sqlite3_bind_null(st, 12); else sqlite3_bind_text(st, 12, p.resolved_at.c_str(), -1, SQLITE_TRANSIENT);
+    if (p.created_at.empty()) sqlite3_bind_null(st, 13); else sqlite3_bind_text(st, 13, p.created_at.c_str(), -1, SQLITE_TRANSIENT);
+    if (batchId > 0) sqlite3_bind_int(st, 14, batchId); else sqlite3_bind_null(st, 14);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? (int)sqlite3_last_insert_rowid(db) : -1;
+}
+
+int SqliteConn::addPaymentBatch(const std::vector<Payment>& payments, const std::string& label) {
+    if (payments.empty()) { lastError_ = "Δεν υπάρχουν πληρωμές για καταχώριση."; return -1; }
+    if (!executeQuery("BEGIN IMMEDIATE;")) return -1;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO payment_batches (label) VALUES (?)", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, label.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    int batchId = rc == SQLITE_DONE ? (int)sqlite3_last_insert_rowid(db) : -1;
+    for (const auto& p : payments) {
+        if (batchId < 0 || insertPayment(p, batchId) < 0) {
+            std::string why = lastError_;
+            executeQuery("ROLLBACK;");
+            lastError_ = "Η ομαδική καταχώριση απέτυχε, δεν αποθηκεύτηκε καμία πληρωμή: " + why;
+            return -1;
+        }
+    }
+    if (!executeQuery("COMMIT;")) { executeQuery("ROLLBACK;"); return -1; }
+    return batchId;
 }
 
 // NOTE: STUB (not present in transcript) — added to satisfy DataConn interface.
@@ -1360,24 +1634,24 @@ bool SqliteConn::editPayment(int id, const Payment& in) {
         bool moved = old.user_id != p.user_id || old.year != p.year || old.month != p.month || old.day != p.day;
         aptId = moved ? apartmentAt(p.user_id, p.year, p.month, p.day) : old.apartment_id;
     }
-    std::string sql = "UPDATE payments SET year=?, month=?, day=?, amount_due=?, amount_paid=?, balance=?, status=?, notes=?, user_id=?, direction=?, resolution_date=?, resolved_at=?, apartment_id=? WHERE id=?";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,p.year); sqlite3_bind_int(stmt,2,p.month); sqlite3_bind_int(stmt,3,p.day);
-    sqlite3_bind_double(stmt,4,p.amount_due); sqlite3_bind_double(stmt,5,p.amount_paid); sqlite3_bind_double(stmt,6,p.balance);
-    sqlite3_bind_text(stmt,7,p.status.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,8,p.notes.c_str(),-1,SQLITE_STATIC);
-    if (p.user_id > 0) sqlite3_bind_int(stmt,9,p.user_id); else sqlite3_bind_null(stmt,9);
-    sqlite3_bind_text(stmt,10,p.direction.empty() ? "in" : p.direction.c_str(),-1,SQLITE_STATIC);
-    if (p.resolution_date.empty()) sqlite3_bind_null(stmt,11); else sqlite3_bind_text(stmt,11,p.resolution_date.c_str(),-1,SQLITE_STATIC);
-    if (p.resolved_at.empty()) sqlite3_bind_null(stmt,12); else sqlite3_bind_text(stmt,12,p.resolved_at.c_str(),-1,SQLITE_STATIC);
-    if (aptId > 0) sqlite3_bind_int(stmt,13,aptId); else sqlite3_bind_null(stmt,13);
-    sqlite3_bind_int(stmt,14,id);
+    std::string date = PayDate(p);
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE payments SET pay_date=?, amount_due=?, amount_paid=?, balance=?, status=?, notes=?, user_id=?, direction=?, "
+                           "resolution_date=?, resolved_at=datetime(?10,'utc'), apartment_id=? WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 2, p.amount_due); sqlite3_bind_double(stmt, 3, p.amount_paid); sqlite3_bind_double(stmt, 4, p.balance);
+    sqlite3_bind_text(stmt, 5, p.status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, p.notes.c_str(), -1, SQLITE_TRANSIENT);
+    if (p.user_id > 0) sqlite3_bind_int(stmt, 7, p.user_id); else sqlite3_bind_null(stmt, 7);
+    sqlite3_bind_text(stmt, 8, p.direction.empty() ? "in" : p.direction.c_str(), -1, SQLITE_TRANSIENT);
+    if (p.resolution_date.empty()) sqlite3_bind_null(stmt, 9); else sqlite3_bind_text(stmt, 9, p.resolution_date.c_str(), -1, SQLITE_TRANSIENT);
+    if (p.resolved_at.empty()) sqlite3_bind_null(stmt, 10); else sqlite3_bind_text(stmt, 10, p.resolved_at.c_str(), -1, SQLITE_TRANSIENT);
+    if (aptId > 0) sqlite3_bind_int(stmt, 11, aptId); else sqlite3_bind_null(stmt, 11);
+    sqlite3_bind_int(stmt, 12, id);
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);   // e.g. refused: payment is on an issued receipt
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { p.id = id; logAction("payments", id, "UPDATE", paymentToJson(old), paymentToJson(p), "business"); return true; }
-    return false;
+    return rc == SQLITE_DONE;
 }
 
 // NOTE: STUB (not present in transcript).
@@ -1389,130 +1663,25 @@ bool SqliteConn::removePayment(int id) {
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);   // e.g. refused: payment is on an issued receipt
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("payments", id, "DELETE", "", "", "business"); return true; }
+    if(rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
-// NOTE: STUB (not present in transcript).
 Payment SqliteConn::getPaymentById(int id) {
-    Payment p; std::string sql = "SELECT * FROM payments WHERE id=?";
-    sqlite3_stmt* stmt; sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr); sqlite3_bind_int(stmt,1,id);
-    if(sqlite3_step(stmt) == SQLITE_ROW) {
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-    }
-    sqlite3_finalize(stmt);
-    return p;
+    auto v = QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.id = ?", {id});
+    return v.empty() ? Payment{} : v[0];
 }
 
-// NOTE: STUB (not present in transcript).
 std::vector<Payment> SqliteConn::getPaymentsForService(int serviceId) {
-    std::vector<Payment> results;
-    std::string sql = "SELECT * FROM payments WHERE service_id=?";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,serviceId);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
-    sqlite3_finalize(stmt);
-    return results;
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.service_id = ? ORDER BY p.pay_date, p.id", {serviceId});
 }
 
-// NOTE: STUB (not present in transcript).
 std::vector<Payment> SqliteConn::getPaymentsForUser(int userId) {
-    std::vector<Payment> results;
-    // payments.user_id records which specific owner this payment is for, so this is
-    // correct even for a shared service (unlike summing all payments on that service).
-    std::string sql = "SELECT * FROM payments WHERE user_id=?";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,userId);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
-    sqlite3_finalize(stmt);
-    return results;
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.user_id = ? ORDER BY p.pay_date, p.id", {userId});
 }
 
 std::vector<Payment> SqliteConn::getRecentPayments(int limit) {
-    std::vector<Payment> results;
-    // Non-future payments, most recent first -- the "past/current" half of the dashboard's
-    // bank-statement view. Future ones are covered separately by getFuturePayments().
-    std::string sql = "SELECT * FROM payments WHERE status != 'future' ORDER BY year DESC, month DESC, day DESC, id DESC LIMIT ?";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt, 1, limit);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
-    sqlite3_finalize(stmt);
-    return results;
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.status != 'future' ORDER BY p.pay_date DESC, p.id DESC LIMIT ?", {limit});
 }
 
 // Relational search: payment's own columns plus a JOIN against users/services so the
@@ -1528,9 +1697,7 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
                                                           const std::string& userIdQuery) {
     std::vector<Payment> results;
     std::string sql =
-        "SELECT p.id, p.service_id, p.year, p.month, p.day, p.amount_due, p.amount_paid, p.balance, "
-        "p.status, p.notes, p.user_id, p.direction, p.resolution_date, p.resolved_at "
-        "FROM payments p "
+        std::string("SELECT ") + kPaymentCols + " FROM payments p "
         "LEFT JOIN users u ON u.id = p.user_id "
         "LEFT JOIN services s ON s.id = p.service_id "
         "WHERE 1=1";
@@ -1544,9 +1711,9 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
         params.push_back(val);
     };
     addTextClause("CAST(p.id AS TEXT)", idQuery);
-    addTextClause("CAST(p.year AS TEXT)", year);
-    addTextClause("CAST(p.month AS TEXT)", month);
-    addTextClause("CAST(p.day AS TEXT)", day);
+    addTextClause("CAST(CAST(strftime('%Y', p.pay_date) AS INTEGER) AS TEXT)", year);
+    addTextClause("CAST(CAST(strftime('%m', p.pay_date) AS INTEGER) AS TEXT)", month);
+    addTextClause("CAST(CAST(strftime('%d', p.pay_date) AS INTEGER) AS TEXT)", day);
     addTextClause("CAST(p.amount_due AS TEXT)", amount_due_query);
     addTextClause("CAST(p.amount_paid AS TEXT)", amount_paid_query);
     addTextClause("p.status", status);
@@ -1557,93 +1724,24 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
     addTextClause("s.label", serviceLabel);
     addTextClause("CAST(p.service_id AS TEXT)", serviceIdQuery);
     addTextClause("CAST(p.user_id AS TEXT)", userIdQuery);
-    sql += " ORDER BY p.year DESC, p.month DESC, p.day DESC, p.id DESC LIMIT 2000";
+    sql += " ORDER BY p.pay_date DESC, p.id DESC LIMIT 2000";
 
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     for (size_t i = 0; i < params.size(); i++) {
         sqlite3_bind_text(stmt, (int)i + 1, params[i].c_str(), -1, SQLITE_TRANSIENT);
     }
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(ReadPayment(stmt));
     sqlite3_finalize(stmt);
     return results;
 }
 
 std::vector<Payment> SqliteConn::getAllPayments() {
-    std::vector<Payment> results;
-    std::string sql = "SELECT * FROM payments ORDER BY year, month, day, id";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
-    sqlite3_finalize(stmt);
-    return results;
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p ORDER BY p.pay_date, p.id");
 }
 
 std::vector<Payment> SqliteConn::getFuturePayments() {
-    std::vector<Payment> results;
-    std::string sql = "SELECT * FROM payments WHERE status = 'future'";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        p.notes = sqlite3_column_text(stmt,9) ? (const char*)sqlite3_column_text(stmt,9) : "";
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
-        p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
-        p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
-    sqlite3_finalize(stmt);
-    return results;
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.status = 'future' ORDER BY p.pay_date, p.id");
 }
 
 // --- TIMELINE ---
@@ -1662,7 +1760,8 @@ static std::string friendlyNotice(const std::string& table, const std::string& a
 std::vector<std::string> SqliteConn::getTimelineActions(const std::string& dateFilter, int offset, int limit,
                                                           const std::string& category, bool friendly) {
     std::vector<std::string> actions;
-    std::string sql = "SELECT changed_at, table_name, action_type, old_data, new_data, record_id, category FROM audit_log WHERE changed_at GLOB ?";   // GLOB prefix* can use idx_audit_changed; LIKE can't
+    // stored UTC, shown local; the optional filter is a UTC prefix (only "" is used today)
+    std::string sql = "SELECT datetime(changed_at, 'localtime'), table_name, action_type, old_data, new_data, record_id, category FROM audit_log WHERE changed_at GLOB ?";
     if (!category.empty()) sql += " AND category = ?";
     sql += " ORDER BY changed_at DESC LIMIT ? OFFSET ?";
     sqlite3_stmt* stmt;
@@ -1691,12 +1790,13 @@ std::vector<std::string> SqliteConn::getTimelineActions(const std::string& dateF
 // --- METRICS ---
 double SqliteConn::getTotalPaid(int year, int month, int userId, int serviceId) {
     double total = 0;
-    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM payments WHERE year=? AND month=? AND status != 'future'";
+    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM payments WHERE pay_date >= ?1 AND pay_date < date(?1, '+1 month') AND status != 'future'";
     if(userId != -1) sql += " AND user_id=" + std::to_string(userId);
     if(serviceId != -1) sql += " AND service_id=" + std::to_string(serviceId);
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,year); sqlite3_bind_int(stmt,2,month);
+    char first[16]; std::snprintf(first, sizeof(first), "%04d-%02d-01", year, month);
+    sqlite3_bind_text(stmt, 1, first, -1, SQLITE_TRANSIENT);
     if(sqlite3_step(stmt) == SQLITE_ROW) total = sqlite3_column_double(stmt,0);
     sqlite3_finalize(stmt);
     return total;
@@ -1704,12 +1804,13 @@ double SqliteConn::getTotalPaid(int year, int month, int userId, int serviceId) 
 
 double SqliteConn::getTotalPending(int year, int month, int userId, int serviceId) {
     double total = 0;
-    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_due*100) AS INTEGER) - CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM payments WHERE year=? AND month=? AND status='pending'";
+    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_due*100) AS INTEGER) - CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM payments WHERE pay_date >= ?1 AND pay_date < date(?1, '+1 month') AND status='pending'";
     if(userId != -1) sql += " AND user_id=" + std::to_string(userId);
     if(serviceId != -1) sql += " AND service_id=" + std::to_string(serviceId);
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,year); sqlite3_bind_int(stmt,2,month);
+    char first[16]; std::snprintf(first, sizeof(first), "%04d-%02d-01", year, month);
+    sqlite3_bind_text(stmt, 1, first, -1, SQLITE_TRANSIENT);
     if(sqlite3_step(stmt) == SQLITE_ROW) total = sqlite3_column_double(stmt,0);
     sqlite3_finalize(stmt);
     return total;
@@ -1743,7 +1844,6 @@ bool SqliteConn::addNote(const Note& n) {
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
         int id = sqlite3_last_insert_rowid(db);
-        logAction("notes", id, "INSERT", "", "{ \"title\": \"" + n.title + "\" }", "business");
         return true;
     }
     return false;
@@ -1758,7 +1858,7 @@ bool SqliteConn::editNote(int id, const Note& n) {
     sqlite3_bind_int(stmt, 3, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { logAction("notes", id, "UPDATE", "", "{ \"title\": \"" + n.title + "\" }", "business"); return true; }
+    if (rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
@@ -1769,7 +1869,7 @@ bool SqliteConn::removeNote(int id) {
     sqlite3_bind_int(stmt, 1, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { logAction("notes", id, "DELETE", "", "", "business"); return true; }
+    if (rc == SQLITE_DONE) {  return true; }
     return false;
 }
 
@@ -1900,6 +2000,13 @@ bool SqliteConn::executeRawQuery(const std::string& sql, std::vector<std::string
         outError = sqlite3_errmsg(db);
         return false;
     }
+    // Read-only by design: writes here would bypass the app's rules and are what an audit trail must not
+    // allow (DROP TRIGGER, editing history). Every change goes through the app's own screens.
+    if (!sqlite3_stmt_readonly(stmt)) {
+        outError = "Η κονσόλα SQL είναι μόνο για ανάγνωση (SELECT). Οι αλλαγές γίνονται από τις οθόνες της εφαρμογής.";
+        sqlite3_finalize(stmt);
+        return false;
+    }
     int colCount = sqlite3_column_count(stmt);
     for (int i = 0; i < colCount; i++) {
         const char* name = sqlite3_column_name(stmt, i);
@@ -1926,11 +2033,6 @@ bool SqliteConn::executeRawQuery(const std::string& sql, std::vector<std::string
         std::vector<std::string> row;
         row.push_back(std::to_string(changes) + " row(s) affected");
         outRows.push_back(row);
-    }
-    if (changes > 0) {
-        // Raw SQL console writes are logged unconditionally as 'db' category -
-        // never 'business', regardless of which table they touched.
-        logAction("raw_sql", 0, "EXEC", "", sql, "db");
     }
     return true;
 }
@@ -2232,11 +2334,11 @@ static std::string BuildPaymentPageWhere(const std::string& startDate, const std
                                           std::vector<int>& intBinds) {
     std::string where = " WHERE 1=1";
     if (!startDate.empty()) {
-        where += " AND printf('%04d-%02d-%02d', year, month, day) >= ?";
+        where += " AND pay_date >= ?";
         textBinds.push_back(startDate);
     }
     if (!endDate.empty()) {
-        where += " AND printf('%04d-%02d-%02d', year, month, day) <= ?";
+        where += " AND pay_date <= ?";
         textBinds.push_back(endDate);
     }
     // Placeholder order must equal bind order: every text placeholder first (dates, direction),
@@ -2269,9 +2371,9 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
         std::string part;
         switch (k.first) {
             case 0: part = "id" + d; break;
-            case 1: part = "year" + d + ", month" + d + ", day" + d; break;
-            case 2: part = "(SELECT full_name FROM users WHERE users.id = payments.user_id)" + d; break;
-            case 3: part = "(SELECT label FROM services WHERE services.id = payments.service_id)" + d; break;
+            case 1: part = "pay_date" + d; break;
+            case 2: part = "(SELECT full_name FROM users WHERE users.id = p.user_id)" + d; break;
+            case 3: part = "(SELECT label FROM services WHERE services.id = p.service_id)" + d; break;
             case 4: part = "direction" + d; break;
             case 5: part = "status" + d; break;
             case 6: part = "amount_due" + d; break;
@@ -2281,9 +2383,9 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
         }
         if (!part.empty()) order += std::string(order.empty() ? "" : ", ") + part;
     }
-    if (order.empty()) order = "year DESC, month DESC, day DESC";
+    if (order.empty()) order = "pay_date DESC";
     order += ", id DESC";
-    std::string sql = "SELECT * FROM payments" + where + " ORDER BY " + order + " LIMIT ? OFFSET ?";
+    std::string sql = std::string("SELECT ") + kPaymentCols + " FROM payments p" + where + " ORDER BY " + order + " LIMIT ? OFFSET ?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     int idx = 1;
@@ -2292,26 +2394,7 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
     sqlite3_bind_int(stmt, idx++, limit);
     sqlite3_bind_int(stmt, idx++, offset);
     std::vector<Payment> results;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        Payment p;
-        p.id = sqlite3_column_int(stmt,0);
-        p.service_id = sqlite3_column_int(stmt,1);
-        p.year = sqlite3_column_int(stmt,2);
-        p.month = sqlite3_column_int(stmt,3);
-        p.day = sqlite3_column_int(stmt,4);
-        p.amount_due = sqlite3_column_double(stmt,5);
-        p.amount_paid = sqlite3_column_double(stmt,6);
-        p.balance = sqlite3_column_double(stmt,7);
-        p.status = ColText(stmt,8);
-        p.notes = ColText(stmt,9);
-        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
-        p.direction = NormalizeDirection(sqlite3_column_text(stmt,11) ? (const char*)sqlite3_column_text(stmt,11) : "in");
-        p.resolution_date = ColText(stmt,12);
-        p.resolved_at = ColText(stmt,13);
-        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
-        p.created_at = ColText(stmt,15);
-        results.push_back(p);
-    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(ReadPayment(stmt));
     sqlite3_finalize(stmt);
     return results;
 }
@@ -2339,7 +2422,7 @@ int SqliteConn::countPayments(const std::string& startDate, const std::string& e
 static const char* kReceiptCols =
     "id, series, number, issue_date, COALESCE(user_id,-1), COALESCE(building_id,-1), total, method, "
     "COALESCE(rf_code,''), COALESCE(paper_ref,''), COALESCE(bank_ref,''), COALESCE(notes,''), status, "
-    "COALESCE(void_reason,''), COALESCE(voided_at,''), COALESCE(created_at,'')";
+    "COALESCE(void_reason,''), COALESCE(datetime(voided_at,'localtime'),''), COALESCE(datetime(created_at,'localtime'),'')";
 
 static Receipt ReadReceipt(sqlite3_stmt* st) {
     auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
@@ -2395,9 +2478,12 @@ int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentI
     auto rollback = [&](const std::string& why) { executeQuery("ROLLBACK;"); lastError_ = why; return -1; };
 
     long long totalCents = 0;
+    std::set<int> batches, users;
+    bool anyUnbatched = false;
     for (int pid : paymentIds) {
         sqlite3_stmt* st = nullptr;
-        sqlite3_prepare_v2(db, "SELECT p.status, COALESCE(p.direction,'in'), p.amount_paid, COALESCE(r.status,'') "
+        sqlite3_prepare_v2(db, "SELECT p.status, COALESCE(p.direction,'in'), p.amount_paid, COALESCE(r.status,''), "
+                               "COALESCE(p.batch_id,-1), COALESCE(p.user_id,-1) "
                                "FROM payments p LEFT JOIN receipts r ON r.id = p.receipt_id WHERE p.id = ?", -1, &st, nullptr);
         sqlite3_bind_int(st, 1, pid);
         if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return rollback("Η πληρωμή #" + std::to_string(pid) + " δεν υπάρχει."); }
@@ -2405,6 +2491,9 @@ int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentI
         std::string direction = (const char*)sqlite3_column_text(st, 1);
         double paid = sqlite3_column_double(st, 2);
         std::string onReceipt = (const char*)sqlite3_column_text(st, 3);
+        int batch = sqlite3_column_int(st, 4);
+        users.insert(sqlite3_column_int(st, 5));
+        if (batch > 0) batches.insert(batch); else anyUnbatched = true;
         sqlite3_finalize(st);
         if (status == "future")    return rollback("Η πληρωμή #" + std::to_string(pid) + " είναι μελλοντική - επιλύστε την πρώτα.");
         if (direction != "in")     return rollback("Η πληρωμή #" + std::to_string(pid) + " είναι πληρωμή προς τρίτους, όχι είσπραξη.");
@@ -2412,6 +2501,10 @@ int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentI
         totalCents += ToCents(paid);
     }
     if (totalCents <= 0) return rollback("Το σύνολο της απόδειξης πρέπει να είναι μεγαλύτερο από 0.");
+    // One receipt = one payment, except payments that were created together in one action (same batch,
+    // e.g. a package charge) for the same client, which may share it.
+    if (paymentIds.size() > 1 && (anyUnbatched || batches.size() != 1 || users.size() != 1))
+        return rollback("Κοινή απόδειξη επιτρέπεται μόνο για πληρωμές που καταχωρίστηκαν μαζί (π.χ. χρέωση πακέτου) για τον ίδιο πελάτη.");
 
     int number = 1;
     {
@@ -2459,7 +2552,6 @@ int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentI
         sqlite3_finalize(up);
         if (rc != SQLITE_DONE) return rollback(std::string("Αποτυχία σύνδεσης πληρωμής: ") + sqlite3_errmsg(db));
     }
-    logAction("receipts", r.id, "INSERT", "", receiptToJson(r, paymentIds), "business");
     if (!executeQuery("COMMIT;")) return rollback("Αποτυχία ολοκλήρωσης της απόδειξης.");
     return r.id;
 }
@@ -2473,7 +2565,7 @@ bool SqliteConn::voidReceipt(int id, const std::string& reason) {
     if (old.status == "void") { lastError_ = "Η απόδειξη είναι ήδη ακυρωμένη."; return false; }
 
     sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "UPDATE receipts SET status='void', void_reason=?, voided_at=datetime('now','localtime') WHERE id=?", -1, &st, nullptr);
+    sqlite3_prepare_v2(db, "UPDATE receipts SET status='void', void_reason=?, voided_at=datetime('now') WHERE id=?", -1, &st, nullptr);
     sqlite3_bind_text(st, 1, why.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, id);
     int rc = sqlite3_step(st);
@@ -2481,7 +2573,6 @@ bool SqliteConn::voidReceipt(int id, const std::string& reason) {
     if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return false; }
     auto ids = getReceiptPaymentIds(id);
     Receipt now = getReceiptById(id);
-    logAction("receipts", id, "VOID", receiptToJson(old, ids), receiptToJson(now, ids), "business");
     return true;
 }
 
@@ -2533,4 +2624,216 @@ int SqliteConn::getReceiptIdForPayment(int paymentId) {
     if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     return id;
+}
+
+// --- AUDIT TRUST ------------------------------------------------------------------------------------
+// The audit log is written by triggers inside the database, so every write path is covered (app code,
+// SQL console, a future server). Rows are append-only (UPDATE/DELETE refused) and hash-chained:
+//   hash = SHA-256(prev_hash ␟ id ␟ changed_at ␟ actor ␟ table ␟ record_id ␟ action ␟ old ␟ new ␟ reason ␟ category)
+// so changing or removing any past entry breaks every hash after it. verifyAuditLog() also compares each
+// live row with its last audited snapshot, which catches changes made after someone removed the triggers.
+
+
+static std::string AuditCanonical(const std::string& prev, const std::string& id, const std::string& at,
+                                  const std::string& actor, const std::string& table, const std::string& recordId,
+                                  const std::string& action, const std::string& oldData, const std::string& newData,
+                                  const std::string& reason, const std::string& category) {
+    const char US = '\x1f';
+    return prev + US + id + US + at + US + actor + US + table + US + recordId + US + action + US +
+           oldData + US + newData + US + reason + US + category;
+}
+
+static void SqlAuditHash(sqlite3_context* ctx, int, sqlite3_value** argv) {
+    const unsigned char* t = sqlite3_value_text(argv[0]);
+    std::string h = Sha256Hex(t ? std::string((const char*)t, sqlite3_value_bytes(argv[0])) : std::string());
+    sqlite3_result_text(ctx, h.c_str(), -1, SQLITE_TRANSIENT);
+}
+static void SqlAppActor(sqlite3_context* ctx, int, sqlite3_value**) {
+    auto* self = static_cast<SqliteConn*>(sqlite3_user_data(ctx));
+    sqlite3_result_text(ctx, self->auditActor_.c_str(), -1, SQLITE_TRANSIENT);
+}
+static void SqlAppReason(sqlite3_context* ctx, int, sqlite3_value**) {
+    auto* self = static_cast<SqliteConn*>(sqlite3_user_data(ctx));
+    sqlite3_result_text(ctx, self->auditReason_.c_str(), -1, SQLITE_TRANSIENT);
+}
+
+static std::string DefaultActor() {
+    const char* u = std::getenv("USERNAME"); if (!u) u = std::getenv("USER");
+    const char* h = std::getenv("COMPUTERNAME"); if (!h) h = std::getenv("HOSTNAME");
+    std::string host = h ? h : "";
+#ifndef _WIN32
+    if (host.empty()) { char b[256] = {0}; if (gethostname(b, sizeof(b) - 1) == 0) host = b; }
+#endif
+    return std::string(u ? u : "unknown") + "@" + (host.empty() ? "unknown" : host);
+}
+
+void SqliteConn::registerSqlFunctions() {
+    if (auditActor_.empty()) auditActor_ = DefaultActor();
+    sqlite3_create_function_v2(db, "audit_hash", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr, SqlAuditHash, nullptr, nullptr, nullptr);
+    sqlite3_create_function_v2(db, "app_actor", 0, SQLITE_UTF8, this, SqlAppActor, nullptr, nullptr, nullptr);
+    sqlite3_create_function_v2(db, "app_reason", 0, SQLITE_UTF8, this, SqlAppReason, nullptr, nullptr, nullptr);
+}
+
+// json_object('c1', X."c1", ...) over the table's current columns.
+static std::string JsonRowExpr(sqlite3* db, const std::string& table, const std::string& prefix) {
+    std::string cols;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, ("PRAGMA table_info(" + table + ")").c_str(), -1, &st, nullptr);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        std::string c = (const char*)sqlite3_column_text(st, 1);
+        cols += (cols.empty() ? "" : ", ") + std::string("'") + c + "', " + prefix + "\"" + c + "\"";
+    }
+    sqlite3_finalize(st);
+    return "json_object(" + cols + ")";
+}
+
+static std::map<std::string, std::string> ExpectedAuditTriggers(sqlite3* db) {
+    std::map<std::string, std::string> out;
+    for (const char* t : kAuditedTables) {
+        std::string T = t, oldJ = JsonRowExpr(db, T, "OLD."), newJ = JsonRowExpr(db, T, "NEW.");
+        auto ins = [&](const std::string& action, const std::string& rid, const std::string& o, const std::string& n) {
+            return "INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                   "VALUES ('" + T + "', " + rid + ", '" + action + "', " + o + ", " + n + ", 'business', app_actor(), app_reason());";
+        };
+        out["audit_" + T + "_ins"] = "CREATE TRIGGER audit_" + T + "_ins AFTER INSERT ON " + T + " BEGIN " + ins("INSERT", "NEW.rowid", "NULL", newJ) + " END";
+        out["audit_" + T + "_upd"] = "CREATE TRIGGER audit_" + T + "_upd AFTER UPDATE ON " + T + " WHEN " + oldJ + " IS NOT " + newJ +
+                                     " BEGIN " + ins("UPDATE", "NEW.rowid", oldJ, newJ) + " END";
+        out["audit_" + T + "_del"] = "CREATE TRIGGER audit_" + T + "_del AFTER DELETE ON " + T + " BEGIN " + ins("DELETE", "OLD.rowid", oldJ, "NULL") + " END";
+    }
+    // the log itself: hash-chain each new entry; nothing may be edited or removed afterwards
+    out["audit_log_chain"] =
+        "CREATE TRIGGER audit_log_chain AFTER INSERT ON audit_log BEGIN "
+        "UPDATE audit_log SET prev_hash = COALESCE((SELECT hash FROM audit_log WHERE id < NEW.id ORDER BY id DESC LIMIT 1), ''), "
+        "hash = audit_hash(COALESCE((SELECT hash FROM audit_log WHERE id < NEW.id ORDER BY id DESC LIMIT 1), '') || char(31) || NEW.id || char(31) || "
+        "COALESCE(NEW.changed_at,'') || char(31) || COALESCE(NEW.actor,'') || char(31) || COALESCE(NEW.table_name,'') || char(31) || "
+        "COALESCE(NEW.record_id,'') || char(31) || COALESCE(NEW.action_type,'') || char(31) || COALESCE(NEW.old_data,'') || char(31) || "
+        "COALESCE(NEW.new_data,'') || char(31) || COALESCE(NEW.reason,'') || char(31) || COALESCE(NEW.category,'')) "
+        "WHERE id = NEW.id; END";
+    out["audit_log_no_forged_hash"] =
+        "CREATE TRIGGER audit_log_no_forged_hash BEFORE INSERT ON audit_log WHEN NEW.hash IS NOT NULL OR NEW.prev_hash IS NOT NULL "
+        "BEGIN SELECT RAISE(ABORT, 'Το ιστορικό αλλαγών συμπληρώνεται μόνο από τη βάση'); END";
+    out["audit_log_append_only"] =
+        "CREATE TRIGGER audit_log_append_only BEFORE UPDATE ON audit_log WHEN OLD.hash IS NOT NULL "
+        "OR NEW.id IS NOT OLD.id OR NEW.changed_at IS NOT OLD.changed_at OR NEW.actor IS NOT OLD.actor "
+        "OR NEW.table_name IS NOT OLD.table_name OR NEW.record_id IS NOT OLD.record_id OR NEW.action_type IS NOT OLD.action_type "
+        "OR NEW.old_data IS NOT OLD.old_data OR NEW.new_data IS NOT OLD.new_data OR NEW.reason IS NOT OLD.reason "
+        "OR NEW.category IS NOT OLD.category "
+        "BEGIN SELECT RAISE(ABORT, 'Το ιστορικό αλλαγών δεν τροποποιείται'); END";
+    out["audit_log_no_delete"] =
+        "CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log "
+        "BEGIN SELECT RAISE(ABORT, 'Το ιστορικό αλλαγών δεν διαγράφεται'); END";
+    return out;
+}
+
+int SqliteConn::ensureAuditTriggers() {
+    int fixed = 0;
+    for (auto& [name, sql] : ExpectedAuditTriggers(db)) {
+        std::string current;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", -1, &st, nullptr);
+        sqlite3_bind_text(st, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) current = (const char*)sqlite3_column_text(st, 0);
+        sqlite3_finalize(st);
+        if (current == sql) continue;
+        fixed++;
+        executeQuery("DROP TRIGGER IF EXISTS " + name + ";");
+        executeQuery(sql + ";");
+    }
+    return fixed;
+}
+
+// Appends "<local date> <last audit id> <its hash>" to backups/audit_anchor.txt once a day. The file lives
+// outside the database, so rewriting the whole chain inside the DB no longer matches the anchors.
+void SqliteConn::writeAuditAnchor() {
+    namespace fs = std::filesystem;
+    try {
+        fs::path dir = fs::path(dbPath_).parent_path() / "backups";
+        fs::create_directories(dir);
+        fs::path anchor = dir / (fs::path(dbPath_).stem().string() + "_audit_anchor.txt");
+        auto t = std::time(nullptr); std::tm tmv{}; localtime_s(&tmv, &t);
+        char today[16]; std::strftime(today, sizeof(today), "%Y-%m-%d", &tmv);
+        std::string last;
+        { std::ifstream in(anchor); std::string line; while (std::getline(in, line)) if (!line.empty()) last = line; }
+        if (last.rfind(today, 0) == 0) return;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT id, hash FROM audit_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1", -1, &st, nullptr);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            std::ofstream out(anchor, std::ios::app);
+            out << today << " " << sqlite3_column_int64(st, 0) << " " << (const char*)sqlite3_column_text(st, 1) << "\n";
+        }
+        sqlite3_finalize(st);
+    } catch (const std::exception&) {}
+}
+
+DataConn::AuditCheck SqliteConn::verifyAuditLog() {
+    AuditCheck r;
+    auto problem = [&](const std::string& p) { r.ok = false; if (r.problems.size() < 50) r.problems.push_back(p); };
+
+    // 1. triggers present and exactly as installed
+    for (auto& [name, sql] : ExpectedAuditTriggers(db)) {
+        sqlite3_stmt* st = nullptr; std::string current;
+        sqlite3_prepare_v2(db, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", -1, &st, nullptr);
+        sqlite3_bind_text(st, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) current = (const char*)sqlite3_column_text(st, 0);
+        sqlite3_finalize(st);
+        if (current != sql) problem("Ο μηχανισμός καταγραφής " + name + (current.empty() ? " λείπει" : " έχει αλλοιωθεί"));
+    }
+
+    // 2. hash chain
+    {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT id, changed_at, actor, table_name, record_id, action_type, old_data, new_data, reason, category, "
+                               "prev_hash, hash FROM audit_log ORDER BY id", -1, &st, nullptr);
+        auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
+        std::string prev;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            r.entries++;
+            std::string id = txt(0), prevHash = txt(10), hash = txt(11);
+            std::string expect = Sha256Hex(AuditCanonical(prev, id, txt(1), txt(2), txt(3), txt(4), txt(5), txt(6), txt(7), txt(8), txt(9)));
+            if (prevHash != prev || hash != expect) { problem("Η αλυσίδα του ιστορικού σπάει στην εγγραφή #" + id); break; }
+            prev = hash;
+        }
+        sqlite3_finalize(st);
+    }
+
+    // 3. every live row equals its last audited snapshot; nothing vanished without a DELETE entry
+    long long sinceId = 0;
+    {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT COALESCE(MIN(id), 0) FROM audit_log WHERE action_type = 'BASELINE'", -1, &st, nullptr);
+        if (sqlite3_step(st) == SQLITE_ROW) sinceId = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    for (const char* t : kAuditedTables) {
+        std::string T = t;
+        std::string sql =
+            "SELECT x.rowid FROM " + T + " x WHERE " + JsonRowExpr(db, T, "x.") + " IS NOT "
+            "(SELECT new_data FROM audit_log a WHERE a.table_name = '" + T + "' AND a.record_id = x.rowid ORDER BY a.id DESC LIMIT 1) "
+            "UNION ALL "
+            // only entries written by the triggers (from the v7 baseline on): older app-written entries used
+            // record_id loosely (a client id for residencies, a service id for service_users)
+            "SELECT a.record_id FROM audit_log a WHERE a.table_name = '" + T + "' AND a.id >= " + std::to_string(sinceId) + " AND a.id = (SELECT MAX(id) FROM audit_log b "
+            "WHERE b.table_name = a.table_name AND b.record_id = a.record_id) AND a.action_type != 'DELETE' "
+            "AND NOT EXISTS (SELECT 1 FROM " + T + " y WHERE y.rowid = a.record_id) LIMIT 20";
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { problem("Έλεγχος " + T + ": " + sqlite3_errmsg(db)); continue; }
+        while (sqlite3_step(st) == SQLITE_ROW)
+            problem("Η εγγραφή " + T + " #" + std::to_string(sqlite3_column_int64(st, 0)) + " άλλαξε χωρίς καταγραφή στο ιστορικό");
+        sqlite3_finalize(st);
+    }
+
+    // 4. daily anchors written outside the database still match
+    namespace fs = std::filesystem;
+    fs::path anchor = fs::path(dbPath_).parent_path() / "backups" / (fs::path(dbPath_).stem().string() + "_audit_anchor.txt");
+    std::ifstream in(anchor);
+    std::string date, hash; long long id = 0;
+    while (in >> date >> id >> hash) {
+        sqlite3_stmt* st = nullptr; std::string have;
+        sqlite3_prepare_v2(db, "SELECT hash FROM audit_log WHERE id = ?", -1, &st, nullptr);
+        sqlite3_bind_int64(st, 1, id);
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) have = (const char*)sqlite3_column_text(st, 0);
+        sqlite3_finalize(st);
+        if (have != hash) problem("Το σημείο ελέγχου της " + date + " (εγγραφή #" + std::to_string(id) + ") δεν ταιριάζει με το ιστορικό");
+    }
+    return r;
 }

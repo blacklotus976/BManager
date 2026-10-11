@@ -16,6 +16,17 @@ private:
     double priceOf(int serviceId);
     std::string toJson(const std::vector<std::string>& cols, const std::vector<std::string>& vals);
     std::vector<std::string> getColumnNames(const std::string& table);
+    int insertPayment(const Payment& p, int batchId);
+    void registerSqlFunctions();
+    // (Re)creates the per-table audit triggers from the tables' current columns. Returns how many were
+    // missing or altered (tampering signal once they have been installed).
+    int ensureAuditTriggers();
+    void writeAuditAnchor();
+
+public:
+    std::string auditActor_;     // read by the app_actor() SQL function
+    std::string auditReason_;    // read by the app_reason() SQL function
+private:
 
 public:
     SqliteConn(const std::string& dbPath);
@@ -68,6 +79,10 @@ public:
     std::vector<DataConn::MasterServiceSummary> getMasterServiceSummaries() override;
 
     bool addPayment(const Payment& payment) override;
+    int addPaymentBatch(const std::vector<Payment>& payments, const std::string& label) override;
+    void setAuditActor(const std::string& actor) override { auditActor_ = actor; }
+    void setAuditReason(const std::string& reason) override { auditReason_ = reason; }
+    AuditCheck verifyAuditLog() override;
     bool editPayment(int id, const Payment& payment) override;
     bool removePayment(int id) override;
     Payment getPaymentById(int id) override;

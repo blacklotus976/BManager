@@ -108,6 +108,10 @@ public:
 
     // --- Payments ---
     virtual bool addPayment(const Payment& payment) = 0;
+    // Several payments created together as ONE action (e.g. charging a package: one payment per
+    // component service). All or nothing, in one transaction; they share a new batch id, which is what
+    // later allows them -- and only them -- to be put on one shared receipt. Returns the batch id or -1.
+    virtual int addPaymentBatch(const std::vector<Payment>& payments, const std::string& label) = 0;
     virtual bool editPayment(int id, const Payment& payment) = 0;
     virtual bool removePayment(int id) = 0;
     virtual Payment getPaymentById(int id) = 0;
@@ -179,6 +183,22 @@ public:
     virtual std::vector<Service> pickerServices(const std::string& nameSearch,
                                                  int offset, int limit) = 0;
     virtual int pickerServicesCount(const std::string& nameSearch) = 0;
+
+    // --- Audit trust ---
+    // Every insert/update/delete on business tables is recorded by DATABASE TRIGGERS (not by app code),
+    // as JSON snapshots, with who did it (actor) and an optional reason, in an append-only, hash-chained
+    // audit_log. The actor defaults to "<os user>@<machine>"; set it to the logged-in user once logins
+    // exist. The reason applies to every write until it is set again ("" = none).
+    virtual void setAuditActor(const std::string& actor) = 0;
+    virtual void setAuditReason(const std::string& reason) = 0;
+    struct AuditCheck {
+        bool ok = true;
+        long long entries = 0;
+        std::vector<std::string> problems;   // human-readable, Greek
+    };
+    // Full integrity check: audit triggers present and unmodified, hash chain unbroken, every current row
+    // equal to its last audited snapshot (catches edits made with the triggers removed), daily anchors match.
+    virtual AuditCheck verifyAuditLog() = 0;
 
     // --- Timeline / Audit ---
     // category: "business" for normal-app-flow CRUD on users/services/payments/service_users,

@@ -5,6 +5,8 @@ struct Payment {
     int id = -1;
     int service_id = -1;
     int user_id = -1;
+    // The payment date. Stored in the DB as one ISO date column (payments.pay_date = "YYYY-MM-DD");
+    // kept split here because the UI works with the parts.
     int year = 0;
     int month = 0;
     int day = 1;
@@ -33,5 +35,10 @@ struct Payment {
     // from the residency history when the payment is saved, so moving a client later does not
     // re-attribute old payments). -1 = unknown. created_at = when the row was entered (minute precision).
     int apartment_id = -1;
-    std::string created_at;
+    std::string created_at;        // local time, "YYYY-MM-DD HH:MM:SS" (stored UTC in the DB)
+    // The receipt covering this payment (-1 = none). Several payments share a receipt only when they
+    // were created together (same batch_id, e.g. one package purchase); otherwise one each.
+    int receipt_id = -1;
+    // Payments created together in one action (a package charge) share a batch (-1 = created alone).
+    int batch_id = -1;
 };
