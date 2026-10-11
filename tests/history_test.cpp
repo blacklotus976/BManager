@@ -51,6 +51,10 @@ int main() {
         for (auto& p : db.getPaymentsForApartment(a1)) (p.user_id == u1 ? byOld : byNew)++;
         CHECK(byOld == 2 && byNew == 1);
 
+        // list filter "client + type" (placeholders used to be bound out of order -> always 0 rows)
+        CHECK(db.pagePayments("", "", u1, -1, "", "in", 0, 100).size() == 3);
+        CHECK(db.countPayments("2026-08-01", "2026-12-31", u1, svc, "", "in") == 2);
+
         // history can't be erased by deleting things
         CHECK(!db.removeApartment(a1)); CHECK(!db.takeLastError().empty());
         CHECK(!db.removeBuilding(bid)); db.takeLastError();

@@ -587,6 +587,18 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         executeQuery("COMMIT;");
     }
 
+    // --- Migration v6: indexes for the queries the screens actually run (verified with EXPLAIN QUERY PLAN):
+    // the payments date-range filter (expression must match BuildPaymentPageWhere's text exactly), the
+    // timeline by date, "history of record X", and residency-on-date lookups. ---
+    if (UserVersion(db) < 6) {
+        executeQuery(
+            "CREATE INDEX IF NOT EXISTS idx_payments_isodate ON payments(printf('%04d-%02d-%02d', year, month, day));"
+            "CREATE INDEX IF NOT EXISTS idx_audit_changed ON audit_log(changed_at);"
+            "CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_log(table_name, record_id);"
+            "CREATE INDEX IF NOT EXISTS idx_res_user_from ON residencies(user_id, from_date);"
+            "PRAGMA user_version = 6;");
+    }
+
     greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
     greekHeaders["buildings"] = {"ΚΩΔ", "ΔΙΕΥΘΥΝΣΗ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΑΦΜ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["apartments"] = {"ΚΩΔ", "ΚΩΔ ΚΤΙΡΙΟΥ", "ΔΙΑΜΕΡΙΣΜΑ"};
@@ -1650,12 +1662,12 @@ static std::string friendlyNotice(const std::string& table, const std::string& a
 std::vector<std::string> SqliteConn::getTimelineActions(const std::string& dateFilter, int offset, int limit,
                                                           const std::string& category, bool friendly) {
     std::vector<std::string> actions;
-    std::string sql = "SELECT changed_at, table_name, action_type, old_data, new_data, record_id, category FROM audit_log WHERE changed_at LIKE ?";
+    std::string sql = "SELECT changed_at, table_name, action_type, old_data, new_data, record_id, category FROM audit_log WHERE changed_at GLOB ?";   // GLOB prefix* can use idx_audit_changed; LIKE can't
     if (!category.empty()) sql += " AND category = ?";
     sql += " ORDER BY changed_at DESC LIMIT ? OFFSET ?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    std::string filter = dateFilter.empty() ? "%" : dateFilter + "%";
+    std::string filter = dateFilter.empty() ? "*" : dateFilter + "*";
     int idx = 1;
     sqlite3_bind_text(stmt, idx++, filter.c_str(), -1, SQLITE_STATIC);
     if (!category.empty()) sqlite3_bind_text(stmt, idx++, category.c_str(), -1, SQLITE_STATIC);
@@ -2227,14 +2239,17 @@ static std::string BuildPaymentPageWhere(const std::string& startDate, const std
         where += " AND printf('%04d-%02d-%02d', year, month, day) <= ?";
         textBinds.push_back(endDate);
     }
-    if (userId >= 0)    { where += " AND user_id = ?";    intBinds.push_back(userId); }
-    if (serviceId >= 0) { where += " AND service_id = ?"; intBinds.push_back(serviceId); }
-    if (status == "future")        where += " AND status = 'future'";
-    else if (status == "resolved") where += " AND status != 'future'";
+    // Placeholder order must equal bind order: every text placeholder first (dates, direction),
+    // then the int ones -- direction used to come after user/service, so "client + type" bound
+    // 'in' to user_id and matched nothing.
     if (direction == "in" || direction == "out") {
         where += " AND direction = ?";
         textBinds.push_back(direction);
     }
+    if (status == "future")        where += " AND status = 'future'";
+    else if (status == "resolved") where += " AND status != 'future'";
+    if (userId >= 0)    { where += " AND user_id = ?";    intBinds.push_back(userId); }
+    if (serviceId >= 0) { where += " AND service_id = ?"; intBinds.push_back(serviceId); }
     return where;
 }
 
