@@ -5,6 +5,7 @@
 #include "models/MasterService.h"
 #include "models/Payment.h"
 #include "models/Note.h"
+#include "models/Receipt.h"
 #include <vector>
 #include <string>
 #include <utility>
@@ -131,6 +132,24 @@ public:
                                                           const std::string& userName, const std::string& serviceLabel,
                                                           const std::string& idQuery = "", const std::string& serviceIdQuery = "",
                                                           const std::string& userIdQuery = "") = 0;
+
+    // --- Receipts (N payments -> 1 receipt) ---
+    // issueReceipt links the given payments to one new receipt and returns its id (-1 + takeLastError()
+    // on refusal). Rules: at least one payment; each one exists, is resolved (not 'future'), is a
+    // collection (direction 'in') and is not already on an ISSUED receipt. total = sum of their
+    // amount_paid (in cents) and must be > 0. number is the next one in r.series. rf_code is kept if
+    // given (must be a valid RF) or generated from series+number. Everything happens in one transaction.
+    // Once issued, the DB itself refuses to change/delete those payments' amounts, client, service or
+    // receipt link, and refuses any edit of the receipt except voiding it.
+    virtual int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) = 0;
+    // Voids an issued receipt (reason required). Its payments become free to edit or re-receipt;
+    // they keep pointing at the voided receipt until they are put on a new one, so history stays.
+    virtual bool voidReceipt(int id, const std::string& reason) = 0;
+    virtual Receipt getReceiptById(int id) = 0;
+    virtual std::vector<Receipt> getReceipts(int offset, int limit) = 0;   // newest first
+    virtual std::vector<Receipt> getReceiptsForUser(int userId) = 0;
+    virtual std::vector<int> getReceiptPaymentIds(int receiptId) = 0;
+    virtual int getReceiptIdForPayment(int paymentId) = 0;                 // -1 = none
 
     // --- Paged "phone book" pickers (dashboard filters) -------------------
     // These fetch only one page of rows at a time -- the dashboard pickers

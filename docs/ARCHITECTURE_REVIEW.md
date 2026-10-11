@@ -222,3 +222,51 @@ portfolio of **70,000 buildings** in greater Athens. Phones 210 625 1962-6, 210 
 11. **Approvals**: extraordinary expenses need the building administrator's approval (record who/when); big works need a general-assembly decision.
 12. **Collection channels**: collector visits on scheduled dates (cash, receipt book), bank deposit, e-banking (→ RF codes), card.
 13. **Scale**: 70k buildings × apartments is far beyond a single-user desktop SQLite — confirms the server/PostgreSQL target; the desktop should be designed as a client of that from now on.
+
+## 12. Receipts (implemented, migration v4)
+
+`receipts` table + `payments.receipt_id`. N payments → 1 receipt; one column on the payment means a payment can
+never be on two receipts. Rules enforced **by SQLite triggers** (so the SQL console can't bypass them either):
+- receipts are never deleted, never edited; the only change allowed is `issued → void` with a reason;
+- while a payment is on an issued receipt, its amounts, client, service, direction, status and receipt link are frozen
+  (notes stay editable); voiding the receipt unlocks them; re-receipting gives the next number in the series;
+- numbers are sequential per series (`UNIQUE(series, number)`), allocated under `BEGIN IMMEDIATE`;
+- only resolved, incoming (`direction='in'`) payments with total > 0 can be receipted;
+- `rf_code` is validated as ISO 11649 (`src/Rf.h`), or generated from series+number when left empty.
+API: `issueReceipt`, `voidReceipt`, `getReceiptById`, `getReceipts`, `getReceiptsForUser`, `getReceiptPaymentIds`,
+`getReceiptIdForPayment`. Tests: `tests/receipts_test.cpp`. No UI yet.
+
+Note on RF: an RF code really belongs to the *request* for payment (the notice/ειδοποιητήριο the customer pays
+against). Storing it on the receipt records what the payment carried; when payment notices are added, generate the
+RF there and copy it onto the receipt that settles it.
+
+## 13. Extensibility: oil (litres) and future service types without schema churn
+
+Three layers, used in this order:
+
+1. **Service kind + JSON details (no DB change per new kind).**
+   - `services.kind TEXT` (`generic`, `heating_oil`, `pest_control`, `extinguisher`, `drain`, …).
+   - `payments.details TEXT` (JSON) holding kind-specific fields, e.g. heating oil
+     `{"litres": 1000, "price_per_litre": 0.89, "order_code": "…", "delivery_date": "…", "tank_before": 460}`;
+     extinguisher `{"units": 3, "type": "ABC 6kg", "serial": ["…"], "next_check": "2027-10"}`.
+   - SQLite's `json_extract()` (and PostgreSQL `jsonb` later) query it; an expression index can be added for a hot field.
+   - C++ side: a `ServiceKind` registry — each kind provides `DrawDetailsEditor(json&)`, `Validate(json)`,
+     `ComputeAmount(json) -> cents` (litres × price), `Summary(json)`. Adding a kind = one new C++ file + one registry line,
+     zero migrations. Unknown kinds fall back to the generic editor, so old/new app versions coexist.
+   - A `service_kinds` reference table (kind, label, JSON schema version) keeps the list visible in the DB.
+
+2. **Dedicated tables when the data has its own life across rows** — JSON is per-payment; it cannot model stock or
+   time series. Heating oil needs exactly this:
+   - `fuel_lots(id, building_id, purchase_date, litres, price_per_litre, supplier, document_no, payment_id)` — FIFO stock;
+   - `tank_readings(id, building_id, date, litres_remaining)`;
+   - `meter_readings(id, apartment_id, period, kind[hours|units|gas], value)`;
+   - allocation run = consume lots FIFO between two tank readings, split by the heating formula and ‰ shares
+     (the website's own example: 460 L × 0.90 + 380 L × 0.89).
+   These are generic to "metered consumable" (oil, gas), not oil-specific.
+
+3. **Domain tables everyone needs anyway** (not per-service): `contracts`, `entitlements`, `promotions`,
+   `apartment_shares(apartment_id, category, permille)`, `expense_documents`, `compliance_tasks`.
+
+Rule of thumb: *attributes of one event* → JSON details; *things that are counted, consumed or scheduled over time* → a table.
+"Never change the DB again" is not a realistic goal; "a new service type needs no DB change, a new *capability* needs
+one well-defined migration" is.

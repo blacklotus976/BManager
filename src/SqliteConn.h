@@ -124,6 +124,14 @@ public:
                        int userId, int serviceId,
                        const std::string& status, const std::string& direction) override;
 
+    int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) override;
+    bool voidReceipt(int id, const std::string& reason) override;
+    Receipt getReceiptById(int id) override;
+    std::vector<Receipt> getReceipts(int offset, int limit) override;
+    std::vector<Receipt> getReceiptsForUser(int userId) override;
+    std::vector<int> getReceiptPaymentIds(int receiptId) override;
+    int getReceiptIdForPayment(int paymentId) override;
+
     // Paged phone-book pickers (dashboard filters) -- see DataConn.h for contract.
     std::vector<User> pickerUsers(const std::vector<std::string>& letters,
                                    const std::string& nameSearch,

@@ -1,6 +1,7 @@
 ﻿#include "SqliteConn.h"
 #include "Platform.h"
 #include "Money.h"
+#include "Rf.h"
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
@@ -494,6 +495,68 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
                       "{ \"payments_fixed\": " + std::to_string(nPay) + ", \"services_fixed\": " + std::to_string(nSvc) + " }", "db");
     }
 
+    // --- Migration v4: receipts. N payments -> 1 receipt via payments.receipt_id (one column, so a
+    // payment can never be on two receipts). Triggers make an ISSUED receipt and the money on its
+    // payments unchangeable from anywhere, the SQL console included; the only way out is voiding. ---
+    if (UserVersion(db) < 4) {
+        executeQuery("BEGIN;");
+        executeQuery(R"(
+            CREATE TABLE IF NOT EXISTS receipts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                series      TEXT    NOT NULL DEFAULT 'A',
+                number      INTEGER NOT NULL,
+                issue_date  TEXT    NOT NULL,
+                user_id     INTEGER REFERENCES users(id),
+                building_id INTEGER REFERENCES buildings(id),
+                total       REAL    NOT NULL CHECK (total > 0),
+                method      TEXT    NOT NULL CHECK (method IN ('cash','collector','bank','ebanking','card','iris','other')),
+                rf_code     TEXT,
+                paper_ref   TEXT,
+                bank_ref    TEXT,
+                notes       TEXT,
+                status      TEXT    NOT NULL DEFAULT 'issued' CHECK (status IN ('issued','void')),
+                void_reason TEXT,
+                voided_at   TEXT,
+                created_at  TEXT    DEFAULT (datetime('now','localtime')),
+                UNIQUE (series, number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_receipts_user ON receipts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(issue_date);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_rf ON receipts(rf_code) WHERE rf_code IS NOT NULL AND status = 'issued';
+
+            CREATE TRIGGER IF NOT EXISTS trg_receipts_no_delete BEFORE DELETE ON receipts
+            BEGIN SELECT RAISE(ABORT, 'Οι αποδείξεις δεν διαγράφονται - ακυρώστε την απόδειξη'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_receipts_locked BEFORE UPDATE ON receipts
+            WHEN OLD.status = 'void'
+              OR NEW.series IS NOT OLD.series OR NEW.number IS NOT OLD.number OR NEW.issue_date IS NOT OLD.issue_date
+              OR NEW.user_id IS NOT OLD.user_id OR NEW.building_id IS NOT OLD.building_id OR NEW.total IS NOT OLD.total
+              OR NEW.method IS NOT OLD.method OR NEW.rf_code IS NOT OLD.rf_code OR NEW.created_at IS NOT OLD.created_at
+              OR (NEW.status = 'void' AND TRIM(COALESCE(NEW.void_reason,'')) = '')
+            BEGIN SELECT RAISE(ABORT, 'Η απόδειξη έχει εκδοθεί και δεν αλλάζει - μόνο ακύρωση με αιτιολογία'); END;
+        )");
+        if (!ColumnExists(db, "payments", "receipt_id"))
+            executeQuery("ALTER TABLE payments ADD COLUMN receipt_id INTEGER REFERENCES receipts(id);");
+        executeQuery(R"(
+            CREATE INDEX IF NOT EXISTS idx_payments_receipt ON payments(receipt_id);
+
+            CREATE TRIGGER IF NOT EXISTS trg_payments_receipted_update BEFORE UPDATE ON payments
+            WHEN OLD.receipt_id IS NOT NULL
+             AND (SELECT status FROM receipts WHERE id = OLD.receipt_id) = 'issued'
+             AND (NEW.amount_due IS NOT OLD.amount_due OR NEW.amount_paid IS NOT OLD.amount_paid
+                  OR NEW.user_id IS NOT OLD.user_id OR NEW.service_id IS NOT OLD.service_id
+                  OR NEW.direction IS NOT OLD.direction OR NEW.status IS NOT OLD.status
+                  OR NEW.receipt_id IS NOT OLD.receipt_id)
+            BEGIN SELECT RAISE(ABORT, 'Η πληρωμή έχει απόδειξη - ακυρώστε πρώτα την απόδειξη για να την αλλάξετε'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_payments_receipted_delete BEFORE DELETE ON payments
+            WHEN OLD.receipt_id IS NOT NULL AND (SELECT status FROM receipts WHERE id = OLD.receipt_id) = 'issued'
+            BEGIN SELECT RAISE(ABORT, 'Η πληρωμή έχει απόδειξη - ακυρώστε πρώτα την απόδειξη για να τη διαγράψετε'); END;
+        )");
+        executeQuery("PRAGMA user_version = 4;");
+        executeQuery("COMMIT;");
+    }
+
     greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
     greekHeaders["buildings"] = {"ΚΩΔ", "ΔΙΕΥΘΥΝΣΗ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΑΦΜ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["apartments"] = {"ΚΩΔ", "ΚΩΔ ΚΤΙΡΙΟΥ", "ΔΙΑΜΕΡΙΣΜΑ"};
@@ -502,6 +565,9 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
     greekHeaders["payments"] = {"ΚΩΔ ΠΛΗΡ.", "ΚΩΔ ΥΠΗΡ.", "ΕΤΟΣ", "ΜΗΝΑΣ", "ΗΜΕΡΑ", "ΠΟΣΟ ΟΦΕΙΛ.", "ΠΟΣΟ ΠΛΗΡ.", "ΥΠΟΛΟΙΠΟ", "ΚΑΤΑΣΤΑΣΗ", "ΣΧΟΛΙΑ", "ΚΩΔ ΧΡΗΣΤΗ", "ΤΥΠΟΣ", "ΗΜ/ΝΙΑ ΕΠΙΛΥΣΗΣ", "ΕΠΙΛΥΘΗΚΕ ΣΤΙΣ"};
     greekHeaders["master_services"] = {"ΚΩΔ", "ΕΤΙΚΕΤΑ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["master_service_components"] = {"ΚΩΔ ΠΑΚΕΤΟΥ", "ΚΩΔ ΥΠΗΡ."};
+    greekHeaders["receipts"] = {"ΚΩΔ", "ΣΕΙΡΑ", "ΑΡΙΘΜΟΣ", "ΗΜ/ΝΙΑ ΕΚΔ.", "ΚΩΔ ΧΡΗΣΤΗ", "ΚΩΔ ΚΤΙΡΙΟΥ", "ΣΥΝΟΛΟ",
+                                "ΤΡΟΠΟΣ", "ΚΩΔ. RF", "ΑΡ. ΧΑΡΤΙΝΗΣ", "ΤΡΑΠ. ΑΝΑΦΟΡΑ", "ΣΗΜΕΙΩΣΕΙΣ", "ΚΑΤΑΣΤΑΣΗ",
+                                "ΑΙΤΙΑ ΑΚΥΡΩΣΗΣ", "ΑΚΥΡΩΘΗΚΕ ΣΤΙΣ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["notes"] = {"ΚΩΔ", "ΤΙΤΛΟΣ", "ΠΕΡΙΕΧΟΜΕΝΟ", "ΗΜ/ΝΙΑ ΔΗΜ."};
 }
 
@@ -1263,6 +1329,7 @@ bool SqliteConn::editPayment(int id, const Payment& in) {
     if (aptId > 0) sqlite3_bind_int(stmt,13,aptId); else sqlite3_bind_null(stmt,13);
     sqlite3_bind_int(stmt,14,id);
     int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);   // e.g. refused: payment is on an issued receipt
     sqlite3_finalize(stmt);
     if(rc == SQLITE_DONE) { p.id = id; logAction("payments", id, "UPDATE", paymentToJson(old), paymentToJson(p), "business"); return true; }
     return false;
@@ -1275,6 +1342,7 @@ bool SqliteConn::removePayment(int id) {
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,id);
     int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);   // e.g. refused: payment is on an issued receipt
     sqlite3_finalize(stmt);
     if(rc == SQLITE_DONE) { logAction("payments", id, "DELETE", "", "", "business"); return true; }
     return false;
@@ -1662,14 +1730,15 @@ bool SqliteConn::removeNote(int id) {
 
 // --- BACKUP ---
 bool SqliteConn::exportAllTablesToCSV(const std::string& folder) {
-    std::vector<std::string> tables = {"buildings", "apartments", "users", "services", "service_users", "master_services", "master_service_components", "payments", "notes"};
+    std::vector<std::string> tables = {"buildings", "apartments", "users", "services", "service_users", "master_services", "master_service_components", "payments", "receipts", "notes"};
     for(const auto& t : tables) {
         std::string path = folder + "/" + t + "_backup.csv";
         std::ofstream file(path);
         if(!file.is_open()) return false;
         auto cols = getTableColumns(t);
         auto greek = greekHeaders[t];
-        for(size_t i=0; i<greek.size(); ++i) file << (i?",":"") << "\"" << greek[i] << "\"";
+        // one header per real column: Greek name where we have one, the column name otherwise
+        for(size_t i=0; i<cols.size(); ++i) file << (i?",":"") << "\"" << (i < greek.size() ? greek[i] : cols[i]) << "\"";
         file << "\n";
         auto rows = getPaginatedData(t, 0, 999999); // get all
         for(auto& row : rows) {
@@ -2216,4 +2285,204 @@ int SqliteConn::countPayments(const std::string& startDate, const std::string& e
     if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
     return count;
+}
+
+// --- RECEIPTS -------------------------------------------------------------
+static const char* kReceiptCols =
+    "id, series, number, issue_date, COALESCE(user_id,-1), COALESCE(building_id,-1), total, method, "
+    "COALESCE(rf_code,''), COALESCE(paper_ref,''), COALESCE(bank_ref,''), COALESCE(notes,''), status, "
+    "COALESCE(void_reason,''), COALESCE(voided_at,''), COALESCE(created_at,'')";
+
+static Receipt ReadReceipt(sqlite3_stmt* st) {
+    auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
+    Receipt r;
+    r.id = sqlite3_column_int(st, 0);       r.series = txt(1);               r.number = sqlite3_column_int(st, 2);
+    r.issue_date = txt(3);                  r.user_id = sqlite3_column_int(st, 4);
+    r.building_id = sqlite3_column_int(st, 5);
+    r.total = RoundMoney(sqlite3_column_double(st, 6));
+    r.method = txt(7); r.rf_code = txt(8); r.paper_ref = txt(9); r.bank_ref = txt(10); r.notes = txt(11);
+    r.status = txt(12); r.void_reason = txt(13); r.voided_at = txt(14); r.created_at = txt(15);
+    return r;
+}
+
+static std::string JsonEsc(const std::string& in) {
+    std::string o;
+    for (char c : in) {
+        switch (c) {
+            case '"': o += "\\\""; break;  case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;  case '\r': o += "\\r"; break;  case '\t': o += "\\t"; break;
+            default: if ((unsigned char)c < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", c); o += b; } else o += c;
+        }
+    }
+    return o;
+}
+
+static std::string receiptToJson(const Receipt& r, const std::vector<int>& paymentIds) {
+    std::string ids;
+    for (size_t i = 0; i < paymentIds.size(); i++) ids += (i ? "," : "") + std::to_string(paymentIds[i]);
+    return "{ \"id\": " + std::to_string(r.id) + ", \"series\": \"" + JsonEsc(r.series) + "\", \"number\": " + std::to_string(r.number) +
+           ", \"issue_date\": \"" + JsonEsc(r.issue_date) + "\", \"user_id\": " + std::to_string(r.user_id) +
+           ", \"building_id\": " + std::to_string(r.building_id) + ", \"total\": " + FormatMoney(r.total) +
+           ", \"method\": \"" + JsonEsc(r.method) + "\", \"rf_code\": \"" + JsonEsc(r.rf_code) +
+           "\", \"paper_ref\": \"" + JsonEsc(r.paper_ref) + "\", \"bank_ref\": \"" + JsonEsc(r.bank_ref) +
+           "\", \"status\": \"" + JsonEsc(r.status) + "\", \"payments\": [" + ids + "] }";
+}
+
+int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentIdsIn) {
+    auto refuse = [&](const std::string& why) { lastError_ = why; return -1; };
+    std::vector<int> paymentIds = paymentIdsIn;
+    std::sort(paymentIds.begin(), paymentIds.end());
+    paymentIds.erase(std::unique(paymentIds.begin(), paymentIds.end()), paymentIds.end());
+    if (paymentIds.empty()) return refuse("Επιλέξτε τουλάχιστον μία πληρωμή για την απόδειξη.");
+
+    static const char* kMethods[] = {"cash", "collector", "bank", "ebanking", "card", "iris", "other"};
+    if (std::none_of(std::begin(kMethods), std::end(kMethods), [&](const char* m) { return in.method == m; }))
+        return refuse("Άγνωστος τρόπος πληρωμής: " + in.method);
+    std::string series = in.series.empty() ? "A" : in.series;
+    std::string rf = NormalizeRfCode(in.rf_code);
+    if (!rf.empty() && !IsValidRfCode(rf)) return refuse("Μη έγκυρος κωδικός RF: " + in.rf_code);
+
+    // BEGIN IMMEDIATE: takes the write lock now, so the receipt number cannot be handed out twice.
+    if (!executeQuery("BEGIN IMMEDIATE;")) return -1;
+    auto rollback = [&](const std::string& why) { executeQuery("ROLLBACK;"); lastError_ = why; return -1; };
+
+    long long totalCents = 0;
+    for (int pid : paymentIds) {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT p.status, COALESCE(p.direction,'in'), p.amount_paid, COALESCE(r.status,'') "
+                               "FROM payments p LEFT JOIN receipts r ON r.id = p.receipt_id WHERE p.id = ?", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, pid);
+        if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return rollback("Η πληρωμή #" + std::to_string(pid) + " δεν υπάρχει."); }
+        std::string status = (const char*)sqlite3_column_text(st, 0);
+        std::string direction = (const char*)sqlite3_column_text(st, 1);
+        double paid = sqlite3_column_double(st, 2);
+        std::string onReceipt = (const char*)sqlite3_column_text(st, 3);
+        sqlite3_finalize(st);
+        if (status == "future")    return rollback("Η πληρωμή #" + std::to_string(pid) + " είναι μελλοντική - επιλύστε την πρώτα.");
+        if (direction != "in")     return rollback("Η πληρωμή #" + std::to_string(pid) + " είναι πληρωμή προς τρίτους, όχι είσπραξη.");
+        if (onReceipt == "issued") return rollback("Η πληρωμή #" + std::to_string(pid) + " έχει ήδη απόδειξη.");
+        totalCents += ToCents(paid);
+    }
+    if (totalCents <= 0) return rollback("Το σύνολο της απόδειξης πρέπει να είναι μεγαλύτερο από 0.");
+
+    int number = 1;
+    {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(number),0) + 1 FROM receipts WHERE series = ?", -1, &st, nullptr);
+        sqlite3_bind_text(st, 1, series.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) number = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (rf.empty()) {
+        char ref[32]; std::snprintf(ref, sizeof(ref), "%s%07d", series.c_str(), number);
+        rf = MakeRfCode(ref);
+    }
+
+    Receipt r = in;
+    r.series = series; r.number = number; r.total = FromCents(totalCents); r.rf_code = rf; r.status = "issued";
+    if (r.issue_date.empty()) {
+        std::time_t t = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &t);
+        char d[16]; std::strftime(d, sizeof(d), "%Y-%m-%d", &tm); r.issue_date = d;
+    }
+
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO receipts (series, number, issue_date, user_id, building_id, total, method, rf_code, paper_ref, bank_ref, notes) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?,?)", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, r.series.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (st, 2, r.number);
+    sqlite3_bind_text(st, 3, r.issue_date.c_str(), -1, SQLITE_TRANSIENT);
+    if (r.user_id > 0) sqlite3_bind_int(st, 4, r.user_id); else sqlite3_bind_null(st, 4);
+    if (r.building_id > 0) sqlite3_bind_int(st, 5, r.building_id); else sqlite3_bind_null(st, 5);
+    sqlite3_bind_double(st, 6, r.total);
+    sqlite3_bind_text(st, 7, r.method.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, r.rf_code.c_str(), -1, SQLITE_TRANSIENT);
+    auto bindOpt = [&](int i, const std::string& v) { if (v.empty()) sqlite3_bind_null(st, i); else sqlite3_bind_text(st, i, v.c_str(), -1, SQLITE_TRANSIENT); };
+    bindOpt(9, r.paper_ref); bindOpt(10, r.bank_ref); bindOpt(11, r.notes);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return rollback(std::string("Αποτυχία έκδοσης απόδειξης: ") + sqlite3_errmsg(db));
+    r.id = (int)sqlite3_last_insert_rowid(db);
+
+    for (int pid : paymentIds) {
+        sqlite3_stmt* up = nullptr;
+        sqlite3_prepare_v2(db, "UPDATE payments SET receipt_id = ? WHERE id = ?", -1, &up, nullptr);
+        sqlite3_bind_int(up, 1, r.id); sqlite3_bind_int(up, 2, pid);
+        rc = sqlite3_step(up);
+        sqlite3_finalize(up);
+        if (rc != SQLITE_DONE) return rollback(std::string("Αποτυχία σύνδεσης πληρωμής: ") + sqlite3_errmsg(db));
+    }
+    logAction("receipts", r.id, "INSERT", "", receiptToJson(r, paymentIds), "business");
+    if (!executeQuery("COMMIT;")) return rollback("Αποτυχία ολοκλήρωσης της απόδειξης.");
+    return r.id;
+}
+
+bool SqliteConn::voidReceipt(int id, const std::string& reason) {
+    std::string why = reason;
+    while (!why.empty() && std::isspace((unsigned char)why.back())) why.pop_back();
+    if (why.empty()) { lastError_ = "Η ακύρωση απόδειξης χρειάζεται αιτιολογία."; return false; }
+    Receipt old = getReceiptById(id);
+    if (old.id < 0) { lastError_ = "Η απόδειξη δεν υπάρχει."; return false; }
+    if (old.status == "void") { lastError_ = "Η απόδειξη είναι ήδη ακυρωμένη."; return false; }
+
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE receipts SET status='void', void_reason=?, voided_at=datetime('now','localtime') WHERE id=?", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, why.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return false; }
+    auto ids = getReceiptPaymentIds(id);
+    Receipt now = getReceiptById(id);
+    logAction("receipts", id, "VOID", receiptToJson(old, ids), receiptToJson(now, ids), "business");
+    return true;
+}
+
+Receipt SqliteConn::getReceiptById(int id) {
+    Receipt r;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kReceiptCols + " FROM receipts WHERE id = ?").c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) r = ReadReceipt(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
+std::vector<Receipt> SqliteConn::getReceipts(int offset, int limit) {
+    std::vector<Receipt> out;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kReceiptCols + " FROM receipts ORDER BY issue_date DESC, id DESC LIMIT ? OFFSET ?").c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, limit); sqlite3_bind_int(st, 2, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadReceipt(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<Receipt> SqliteConn::getReceiptsForUser(int userId) {
+    std::vector<Receipt> out;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kReceiptCols + " FROM receipts WHERE user_id = ? ORDER BY issue_date DESC, id DESC").c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, userId);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadReceipt(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<int> SqliteConn::getReceiptPaymentIds(int receiptId) {
+    std::vector<int> out;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT id FROM payments WHERE receipt_id = ? ORDER BY id", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, receiptId);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(sqlite3_column_int(st, 0));
+    sqlite3_finalize(st);
+    return out;
+}
+
+int SqliteConn::getReceiptIdForPayment(int paymentId) {
+    int id = -1;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT COALESCE(receipt_id,-1) FROM payments WHERE id = ?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, paymentId);
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return id;
 }
