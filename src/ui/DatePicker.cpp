@@ -1,3 +1,4 @@
+#include "Platform.h"
 #include "DatePicker.h"
 #include <cstdio>
 #include <ctime>

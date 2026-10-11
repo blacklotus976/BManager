@@ -113,3 +113,5 @@ stockviewer_state.json
 Thumbs.db
 Desktop.ini
 .DS_Store
+build-linux/
+third_party/imgui/

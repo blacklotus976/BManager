@@ -24,6 +24,21 @@ static std::string DirNextToExe() {
     if (slash == std::string::npos) return "";
     return path.substr(0, slash + 1);
 }
+#else
+#include <unistd.h>
+#include <climits>
+
+// Linux: same idea, the exe's real folder via /proc/self/exe.
+static std::string DirNextToExe() {
+    char exePath[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath));
+    if (len <= 0) return "";
+    std::string path(exePath, (size_t)len);
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return "";
+    return path.substr(0, slash + 1);
+}
+#endif
 
 // Config file lives next to the exe (not AppData) so copying the whole app
 // folder to a USB stick / another PC / a shared release .zip carries the DB
@@ -39,7 +54,11 @@ static std::string DirNextToExe() {
 // doesn't force one.
 static std::string ConfigPath() { return DirNextToExe() + "config.ini"; }
 static bool IsAbsolutePath(const std::string& p) {
+#ifdef _WIN32
     return p.size() >= 2 && ((p[1] == ':') || (p[0] == '\\' && p[1] == '\\'));
+#else
+    return !p.empty() && p[0] == '/';
+#endif
 }
 
 static std::string ReadConfiguredDbPath() {
@@ -72,7 +91,11 @@ void WriteConfiguredDbPath(const std::string& path) {
     if (f.is_open()) f << "db_path=" << toStore << "\n";
 }
 
+#ifdef _WIN32
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+#else
+int main() {
+#endif
     std::string dbPath = ReadConfiguredDbPath();
     if (dbPath.empty()) {
         // No config yet (first run, or a fresh unzip of a shared release with no
@@ -83,10 +106,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         WriteConfiguredDbPath("data.db");
         dbPath = DirNextToExe() + "data.db";
     }
-#else
-int main() {
-    std::string dbPath = "data.db";
-#endif
     // Demo data only for a database file that did not exist yet; an existing
     // (even empty) file is the user's own and must stay as it is.
     bool dbExisted = false;

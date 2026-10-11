@@ -3,6 +3,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "Platform.h"
 #include "App.h"
 #include "DataConn.h"
 #include "SqliteConn.h"
@@ -6522,9 +6523,17 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
     ImFontConfig fontCfg;
     fontCfg.OversampleH = 2;
     fontCfg.OversampleV = 2;
-    ImFont* greekFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f, &fontCfg, greekRanges);
-    if (!greekFont) {
-        greekFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 18.0f, &fontCfg, greekRanges);
+    // First font file that exists wins (ImGui asserts on a missing file, so probe first).
+    static const char* kFontCandidates[] = {
+        "C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    };
+    ImFont* greekFont = nullptr;
+    for (const char* f : kFontCandidates) {
+        if (!std::ifstream(f).good()) continue;
+        greekFont = io.Fonts->AddFontFromFileTTF(f, 18.0f, &fontCfg, greekRanges);
+        if (greekFont) break;
     }
     if (greekFont) io.FontDefault = greekFont;
 

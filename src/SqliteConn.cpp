@@ -1,4 +1,5 @@
 ﻿#include "SqliteConn.h"
+#include "Platform.h"
 #include <iostream>
 #include <filesystem>
 #include <algorithm>

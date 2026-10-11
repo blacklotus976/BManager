@@ -28,10 +28,26 @@ endif()
 if(NOT DEFINED VCPKG_TARGET_TRIPLET)
     set(VCPKG_TARGET_TRIPLET "x64-windows-static")
 endif()
-find_package(imgui CONFIG REQUIRED)
-find_package(glfw3 CONFIG REQUIRED)
+if(WIN32)
+    find_package(imgui CONFIG REQUIRED)
+    find_package(glfw3 CONFIG REQUIRED)
+    find_package(nlohmann_json CONFIG REQUIRED)
+else()
+    # Linux/macOS: system GLFW (libglfw3-dev) + Dear ImGui built from a source
+    # checkout pointed to by IMGUI_DIR (see build_linux.sh).
+    find_package(glfw3 REQUIRED)
+    if(NOT IMGUI_DIR)
+        message(FATAL_ERROR "Set -DIMGUI_DIR=<path to a Dear ImGui checkout>")
+    endif()
+    add_library(imgui_src STATIC
+        ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp ${IMGUI_DIR}/imgui_demo.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
+    target_include_directories(imgui_src PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+    target_link_libraries(imgui_src PUBLIC glfw)
+    add_library(imgui::imgui ALIAS imgui_src)
+endif()
 find_package(OpenGL REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
 
 # ---- Vendored sqlite3 amalgamation (no vcpkg) ----
 add_library(sqlite3_vendored STATIC third_party/sqlite3/sqlite3.c)
