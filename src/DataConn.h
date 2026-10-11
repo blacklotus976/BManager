@@ -235,7 +235,7 @@ public:
         double futureIn = 0, futureOut = 0;     // future: amount_due by direction
         double dueAll = 0, paidAll = 0;         // every matching row
     };
-    enum class PayGroup { User, Service, Apartment, Day, UserService };
+    enum class PayGroup { User, Service, Apartment, Day, UserService, ApartmentUser };   // ApartmentUser key: "apt|user"
     struct GroupedTotals { std::string key; MoneyTotals t; };   // key: id ("12"), date, or "user|service"
     enum class PayOrder { DateDesc, DateAsc, ResolutionDesc };
     virtual std::vector<Payment> findPayments(const PaymentFilter& f, PayOrder order, int offset, int limit) = 0;
@@ -340,6 +340,9 @@ public:
     virtual JointOp getJointOpById(int id) = 0;
     virtual std::vector<JointShare> getJointShares(int opId) = 0;
     virtual std::vector<int> getJointOpCharges(int opId) = 0;
+    // A client's (userId) or an apartment's (apartmentId) shares across all joint charges, newest first,
+    // excluded ones too. Pass -1 for the side you don't filter on.
+    virtual std::vector<JointShare> getJointSharesFor(int userId, int apartmentId) = 0;
 
     // --- Raw SQL console (Settings screen power-user feature) ---
     virtual bool executeRawQuery(const std::string& sql, std::vector<std::string>& outColumns,

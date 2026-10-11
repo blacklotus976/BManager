@@ -71,6 +71,9 @@ set(SOURCES
 )
 
 add_executable(PropertyManager WIN32 ${SOURCES})
+# demo photos / video / PDF the demo database attaches on first run (looked up next to the exe)
+add_custom_command(TARGET PropertyManager POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/demo_media $<TARGET_FILE_DIR:PropertyManager>/demo_media)
 
 target_link_libraries(PropertyManager PRIVATE
     sqlite3_vendored

@@ -41,4 +41,7 @@ struct Payment {
     int receipt_id = -1;
     // Payments created together in one action (a package charge) share a batch (-1 = created alone).
     int batch_id = -1;
+    // Read-only: the joint charge (κοινόχρηστο) this line is one resident's share of (-1 = not joint).
+    // Linked through batch_id: a joint charge owns its batch, and the share is the line's apartment + client.
+    int joint_op_id = -1;
 };

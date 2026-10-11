@@ -79,6 +79,7 @@ public:
     JointOp getJointOpById(int id) override;
     std::vector<JointShare> getJointShares(int opId) override;
     std::vector<int> getJointOpCharges(int opId) override;
+    std::vector<JointShare> getJointSharesFor(int userId, int apartmentId) override;
     // Once a day: copy the database to <db folder>/backups/ (keeps the newest `keep`).
     void autoBackup(int keep = 14);
     int addApartment(int buildingId, const std::string& label) override;

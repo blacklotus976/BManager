@@ -113,7 +113,7 @@ int main() {
     { std::ifstream probe(dbPath, std::ios::binary); dbExisted = probe.good(); }
     try {
         auto conn = std::make_unique<SqliteConn>(dbPath);
-        if (!dbExisted) seedDemoDataIfEmpty(conn.get());
+        if (!dbExisted) seedDemoDataIfEmpty(conn.get(), DirNextToExe() + "demo_media");
         conn->autoBackup();   // one copy per day in <db folder>/backups, newest 14 kept
         return RunApp(conn.get(), dbPath);
     } catch (const std::exception& e) {

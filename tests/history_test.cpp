@@ -76,6 +76,18 @@ int main() {
         // re-deriving u1's history leaves the receipted payment alone instead of failing
         CHECK(db.setResidencyHistory(u1, {{-1, u1, a2, "2026-01-01", ""}}));
         CHECK(db.getPaymentById(pOld).apartment_id == a1);
+
+        // dates outside every stay: before the first stay -> the first stay's apartment; in a gap or after the
+        // last stay ended -> no apartment (never the one the client lives in today)
+        User g; g.full_name = "ΚΕΝΟ ΔΙΑΣΤΗΜΑ"; g.apartment_id = a2; db.addUser(g);
+        int ug = -1; for (auto& x : db.searchUsers("ΚΕΝΟ", 0, 5)) ug = x.id;
+        CHECK(db.setResidencyHistory(ug, {{-1, ug, a1, "2026-03-01", "2026-04-30"}, {-1, ug, a2, "2026-07-01", ""}}));
+        CHECK(db.getApartmentOnDate(ug, 2026, 2, 1) == a1);
+        CHECK(db.getApartmentOnDate(ug, 2026, 4, 30) == a1);
+        CHECK(db.getApartmentOnDate(ug, 2026, 5, 15) == -1);
+        CHECK(db.getApartmentOnDate(ug, 2026, 7, 1) == a2);
+        CHECK(db.setResidencyHistory(ug, {{-1, ug, a1, "2026-03-01", "2026-04-30"}}));
+        CHECK(db.getApartmentOnDate(ug, 2026, 9, 1) == -1);   // moved out: not where users.apartment_id may point
     }
     std::filesystem::remove_all(dir);
     std::printf(fails ? "%d FAILED\n" : "all history tests passed\n", fails);

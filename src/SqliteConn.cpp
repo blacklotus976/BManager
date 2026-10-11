@@ -98,7 +98,9 @@ static const char* kPaymentCols =
     // the receipt covering the money paid on this charge (an issued one first), -1 = none
     "COALESCE((SELECT m.receipt_id FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN receipts r ON r.id = m.receipt_id "
     "          WHERE a.charge_id = p.id ORDER BY (r.status = 'issued') DESC, m.receipt_id DESC LIMIT 1), -1), "
-    "COALESCE(p.batch_id,-1)";
+    "COALESCE(p.batch_id,-1), "
+    // the joint charge (κοινόχρηστο) this line is a share of, -1 = none (joint_ops.batch_id is unique)
+    "COALESCE((SELECT o.id FROM joint_ops o WHERE o.batch_id = p.batch_id), -1)";
 
 static Payment ReadPayment(sqlite3_stmt* st) {
     auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
@@ -120,6 +122,7 @@ static Payment ReadPayment(sqlite3_stmt* st) {
     p.created_at = txt(13);
     p.receipt_id = sqlite3_column_int(st, 14);
     p.batch_id = sqlite3_column_int(st, 15);
+    p.joint_op_id = sqlite3_column_int(st, 16);
     return p;
 }
 
@@ -1203,6 +1206,8 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v11) απέτυχε: " + why; }
     }
 
+    executeQuery("CREATE INDEX IF NOT EXISTS idx_joint_shares_user ON joint_shares(user_id);");
+
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
     // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
     {
@@ -1585,7 +1590,15 @@ int SqliteConn::apartmentAt(int userId, int y, int m, int d) {
     if (sqlite3_step(st) == SQLITE_ROW) apt = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     if (apt > 0) return apt;
-    // before any recorded stay: fall back to where the client lives now
+    // No stay covers the date. Before the client's FIRST recorded stay (e.g. older payments of a client added today):
+    // the first stay's apartment. Between two stays or after the last one ended: no apartment (-1), so a charge is
+    // never put in an apartment the client did not live in at that date. No history at all: where they live now.
+    int first = -1; std::string firstFrom; bool any = false;
+    sqlite3_prepare_v2(db, "SELECT apartment_id, from_date FROM residencies WHERE user_id=? ORDER BY from_date, id LIMIT 1", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, userId);
+    if (sqlite3_step(st) == SQLITE_ROW) { any = true; first = sqlite3_column_int(st, 0); firstFrom = ColText(st, 1); }
+    sqlite3_finalize(st);
+    if (any) return std::string(date) < firstFrom ? first : -1;
     sqlite3_prepare_v2(db, "SELECT apartment_id FROM users WHERE id=?", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, userId);
     if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) apt = sqlite3_column_int(st, 0);
@@ -3181,10 +3194,12 @@ std::vector<DataConn::GroupedTotals> SqliteConn::paymentTotalsBy(PayGroup group,
                     : group == PayGroup::Service ? "p.service_id"
                     : group == PayGroup::Apartment ? "COALESCE(p.apartment_id,-1)"
                     : group == PayGroup::Day ? "p.pay_date"
+                    : group == PayGroup::ApartmentUser ? "COALESCE(p.apartment_id,-1) || '|' || COALESCE(p.user_id,-1)"
                     : "COALESCE(p.user_id,-1) || '|' || p.service_id";
     // group by the real columns (not the text key) so SQLite can stream an index instead of sorting
     std::string groupCols = group == PayGroup::User ? "p.user_id" : group == PayGroup::Service ? "p.service_id"
                           : group == PayGroup::Apartment ? "p.apartment_id" : group == PayGroup::Day ? "p.pay_date"
+                          : group == PayGroup::ApartmentUser ? "p.apartment_id, p.user_id"
                           : "p.user_id, p.service_id";
     std::string sql = "SELECT " + key + ", " + kTotalsCols + " FROM charges p" + w.joins + w.where + " GROUP BY " + groupCols;
     std::vector<GroupedTotals> out;
@@ -4086,28 +4101,47 @@ JointOp SqliteConn::getJointOpById(int id) {
     return o;
 }
 
-std::vector<JointShare> SqliteConn::getJointShares(int opId) {
+static const char* kJointShareSql =
+    "SELECT s.id, s.op_id, s.apartment_id, COALESCE(s.user_id, -1), s.amount, s.included, COALESCE(s.exclude_reason,''), "
+    "       COALESCE(a.label,''), COALESCE(u.full_name,''), "
+    "       (SELECT COALESCE(SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)), 0) FROM charges c "
+    "        WHERE c.batch_id = o.batch_id AND c.apartment_id = s.apartment_id AND c.user_id IS s.user_id), "
+    "       o.label, o.op_date, COALESCE(b.address,''), o.total "
+    "FROM joint_shares s JOIN joint_ops o ON o.id = s.op_id "
+    "LEFT JOIN apartments a ON a.id = s.apartment_id LEFT JOIN users u ON u.id = s.user_id "
+    "LEFT JOIN buildings b ON b.id = o.building_id ";
+
+static std::vector<JointShare> ReadJointShares(sqlite3_stmt* st) {
     std::vector<JointShare> out;
-    sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db,
-        "SELECT s.id, s.op_id, s.apartment_id, COALESCE(s.user_id, -1), s.amount, s.included, COALESCE(s.exclude_reason,''), "
-        "       COALESCE(a.label,''), COALESCE(u.full_name,''), "
-        "       (SELECT COALESCE(SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)), 0) FROM charges c "
-        "        WHERE c.batch_id = o.batch_id AND c.apartment_id = s.apartment_id AND c.user_id IS s.user_id) "
-        "FROM joint_shares s JOIN joint_ops o ON o.id = s.op_id "
-        "LEFT JOIN apartments a ON a.id = s.apartment_id LEFT JOIN users u ON u.id = s.user_id "
-        "WHERE s.op_id = ? ORDER BY s.included DESC, a.label, s.id", -1, &st, nullptr);
-    sqlite3_bind_int(st, 1, opId);
     while (sqlite3_step(st) == SQLITE_ROW) {
         JointShare s;
         s.id = sqlite3_column_int(st, 0); s.op_id = sqlite3_column_int(st, 1); s.apartment_id = sqlite3_column_int(st, 2);
         s.user_id = sqlite3_column_int(st, 3); s.amount = RoundMoney(sqlite3_column_double(st, 4));
         s.included = sqlite3_column_int(st, 5) != 0; s.exclude_reason = ColText(st, 6);
         s.apartment_label = ColText(st, 7); s.user_name = ColText(st, 8); s.paid = FromCents(sqlite3_column_int64(st, 9));
+        s.op_label = ColText(st, 10); s.op_date = ColText(st, 11); s.building_address = ColText(st, 12);
+        s.op_total = RoundMoney(sqlite3_column_double(st, 13));
         out.push_back(s);
     }
     sqlite3_finalize(st);
     return out;
+}
+
+std::vector<JointShare> SqliteConn::getJointShares(int opId) {
+    sqlite3_stmt* st = nullptr;
+    std::string sql = std::string(kJointShareSql) + "WHERE s.op_id = ? ORDER BY s.included DESC, a.label, s.id";
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, opId);
+    return ReadJointShares(st);
+}
+
+std::vector<JointShare> SqliteConn::getJointSharesFor(int userId, int apartmentId) {
+    sqlite3_stmt* st = nullptr;
+    std::string sql = std::string(kJointShareSql) + "WHERE (?1 < 0 OR s.user_id = ?1) AND (?2 < 0 OR s.apartment_id = ?2) "
+                      "ORDER BY o.op_date DESC, o.id DESC, s.id";
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, userId); sqlite3_bind_int(st, 2, apartmentId);
+    return ReadJointShares(st);
 }
 
 std::vector<int> SqliteConn::getJointOpCharges(int opId) {

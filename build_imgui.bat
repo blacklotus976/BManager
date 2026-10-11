@@ -81,6 +81,7 @@ echo.
 echo --- 6. dist\ ---
 if not exist "dist" mkdir dist
 copy /Y "%BUILD_DIR%\Release\PropertyManager.exe" "dist\" >nul
+xcopy /E /I /Y /Q "demo_media" "dist\demo_media" >nul
 echo dist\PropertyManager.exe  (copy the database folder together with its attachments\ folder and -wal/-shm files)
 
 echo.

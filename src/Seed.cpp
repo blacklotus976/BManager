@@ -3,6 +3,8 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <cstdlib>
+#include <cstdio>
 
 // Demo data set. Rules followed:
 //  - Uses only DataConn methods (addBuilding/addApartment/addUser/addServiceGetId/
@@ -98,7 +100,7 @@ static void SeedAddPayment(DataConn* db, Payment p) {
     db->addPayment(p);
 }
 
-void seedDemoDataIfEmpty(DataConn* db) {
+void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
     if (db->getRowCount("users") > 0) return; // already has data
 
     // ---- Buildings and their apartments -------------------------------------------
@@ -112,12 +114,14 @@ void seedDemoDataIfEmpty(DataConn* db) {
     };
     // apartmentId[b][label] -> real DB id, so each client can be pointed at their unit.
     std::vector<std::map<std::string,int>> apartmentId(seedBuildings.size());
+    std::vector<int> buildingIds;
     for (size_t b = 0; b < seedBuildings.size(); ++b) {
         Building bld;
         bld.address = seedBuildings[b].address; bld.area = seedBuildings[b].area;
         bld.postal_code = seedBuildings[b].postal; bld.afm = seedBuildings[b].afm;
         int bid = db->addBuilding(bld);
         if (bid < 0) return; // sanity guard, shouldn't happen
+        buildingIds.push_back(bid);
         for (auto& label : seedBuildings[b].apartments)
             apartmentId[b][label] = db->addApartment(bid, label);
     }
@@ -145,12 +149,14 @@ void seedDemoDataIfEmpty(DataConn* db) {
         {"ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ",        "6933221144", "Π-402",  3, "Α2"},
         {"ΑΝΤΩΝΙΟΥ ΧΡΗΣΤΟΣ",          "6948899001", "ΚΩΔ-95", 3, "Β1"},
         {"ΠΕΤΡΟΥ ΔΗΜΗΤΡΑ",            "6922334455", "Π-377",  3, "Β2"},
+        // Moved out (no apartment now): lived at ΠΑΤΗΣΙΩΝ 205 Β2 until June; ΜΑΚΡΗΣ moved in there in July.
+        {"ΣΑΡΡΗΣ ΑΝΤΩΝΙΟΣ",           "6987001122", "Π-099", -1, ""},
     };
 
     for (auto& su : seedUsers) {
         User u;
         u.full_name = su.name; u.phone = su.phone; u.special_code = su.special;
-        u.apartment_id = apartmentId[su.bldg][su.apt];
+        u.apartment_id = su.bldg >= 0 ? apartmentId[su.bldg][su.apt] : -1;
         db->addUser(u);
     }
 
@@ -164,6 +170,39 @@ void seedDemoDataIfEmpty(DataConn* db) {
         }
     }
     if ((int)uid.size() < 16 || uid[0] < 0) return; // sanity guard, shouldn't happen
+
+    // Apartment history BEFORE any payment: each payment stores the apartment its client lived in on its date,
+    // so old payments stay with the old apartment and a new resident starts with a clean history.
+    // -----------------------------------------------------------------
+    // Apartment history. Everybody has lived in their apartment since January; four clients
+    // moved during the year, so some apartments have had SEVERAL tenants and a few are empty
+    // now. The payments' apartment snapshots are re-derived from these dates.
+    // -----------------------------------------------------------------
+    {
+        auto aptOf = [&](int b, const char* label) { return apartmentId[b][label]; };
+        auto stay = [&](int user, int apt, const char* from, const char* to) {
+            Residency r; r.user_id = user; r.apartment_id = apt; r.from_date = from; r.to_date = to; return r; };
+        for (size_t i = 0; i < seedUsers.size(); ++i) {
+            std::vector<Residency> h;
+            const std::string name = seedUsers[i].name;
+            if (name == "ΣΑΡΡΗΣ ΑΝΤΩΝΙΟΣ") {           // moved out of the area: history only, no current apartment
+                db->setResidencyHistory(uid[i], {stay(uid[i], aptOf(0, "Β2"), "2026-01-01", "2026-06-30")});
+                continue;
+            }
+            const int nowApt = aptOf(seedUsers[i].bldg, seedUsers[i].apt);
+            const char* from = "2026-01-01";
+            if (name == "ΒΛΑΧΟΥ ΣΟΦΙΑ")            { h.push_back(stay(uid[i], aptOf(2, "4ος"), "2026-01-01", "2026-02-28")); from = "2026-03-01"; }
+            if (name == "ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ ΜΑΡΙΑ")    { h.push_back(stay(uid[i], aptOf(2, "Ισόγειο"), "2026-01-01", "2026-02-28"));   // upstairs while
+                                                     h.push_back(stay(uid[i], aptOf(2, "4ος"), "2026-03-01", "2026-05-31")); from = "2026-06-01"; }   // the ground floor was renovated
+            if (name == "ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ")         { h.push_back(stay(uid[i], aptOf(1, "Β2"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
+            // ΚΗΦΙΣΙΑΣ Β1 until June (then ΜΙΧΑΗΛΙΔΟΥ moved in there), ΠΑΤΗΣΙΩΝ Β2 from July (after ΣΑΡΡΗΣ left)
+            if (name == "ΜΑΚΡΗΣ ΕΛΕΥΘΕΡΙΟΣ")        { h.push_back(stay(uid[i], aptOf(1, "Β1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
+            if (name == "ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ")     { h.push_back(stay(uid[i], aptOf(3, "Γ1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
+            h.push_back(stay(uid[i], nowApt, from, ""));
+            db->setResidencyHistory(uid[i], h);
+        }
+    }
+
 
     // "Current" reference date for spreading past/future payments: 2026-09-06.
     std::vector<YM> pastMonths  = {{2026,2},{2026,3},{2026,4},{2026,5},{2026,6},{2026,7},{2026,8}};
@@ -189,35 +228,6 @@ void seedDemoDataIfEmpty(DataConn* db) {
     }
 
     // -----------------------------------------------------------------
-    // Joint/shared services -- at least 2, different (not identical) subsets.
-    // -----------------------------------------------------------------
-    struct JointSvc { std::vector<int> ownerIdxs; int id; std::string label; double shareBase; };
-    std::vector<JointSvc> joints;
-    {
-        // ΠΑΤΗΣΙΩΝ 205: all five residents share the building's heating oil.
-        Service heating; heating.label = "ΘΕΡΜΑΝΣΗ – ΠΡΟΜΗΘΕΙΑ ΠΕΤΡΕΛΑΙΟΥ - ΠΑΤΗΣΙΩΝ 205";
-        heating.suggested_price = 300.0;
-        heating.extra_notes = "Κοινή παραγγελία πετρελαίου θέρμανσης, μοιρασμένη ανά χιλιοστά.";
-        std::vector<int> ownersA = {0, 1, 2, 3, 4};
-        int hid = db->addServiceGetId(uid[ownersA[0]], heating);
-        if (hid >= 0) {
-            for (size_t i = 1; i < ownersA.size(); ++i) db->addServiceUser(hid, uid[ownersA[i]]);
-            joints.push_back({ownersA, hid, heating.label, 300.0});
-        }
-
-        // ΤΣΙΜΙΣΚΗ 81: its four residents share the building insurance.
-        Service insurance; insurance.label = "ΑΣΦΑΛΕΙΑ ΑΣΤΙΚΗΣ ΕΥΘΥΝΗΣ ΚΤΙΡΙΟΥ - ΤΣΙΜΙΣΚΗ 81";
-        insurance.suggested_price = 180.0;
-        insurance.extra_notes = "Ετήσιο ασφαλιστήριο συμβόλαιο κτιρίου, μοιρασμένο ανά διαμέρισμα.";
-        std::vector<int> ownersB = {8, 9, 10, 11};
-        int iid = db->addServiceGetId(uid[ownersB[0]], insurance);
-        if (iid >= 0) {
-            for (size_t i = 1; i < ownersB.size(); ++i) db->addServiceUser(iid, uid[ownersB[i]]);
-            joints.push_back({ownersB, iid, insurance.label, 180.0});
-        }
-    }
-
-    // -----------------------------------------------------------------
     // Packages: one per category (its unique services as components), plus the
     // site's BASIC / ALL IN ONE / FULL PACK bundles.
     // -----------------------------------------------------------------
@@ -228,7 +238,6 @@ void seedDemoDataIfEmpty(DataConn* db) {
             auto it = idByLabel.find(c.label);
             if (it != idByLabel.end() && pkgId[c.pkg] >= 0) db->addMasterServiceComponent(pkgId[c.pkg], it->second);
         }
-        if (!joints.empty() && pkgId[2] >= 0) db->addMasterServiceComponent(pkgId[2], joints[0].id); // heating oil
         for (auto& b : kBundles) {
             int mid = db->addMasterService(b.name);
             if (mid < 0) continue;
@@ -277,64 +286,6 @@ void seedDemoDataIfEmpty(DataConn* db) {
     }
 
     // -----------------------------------------------------------------
-    // Payments: joint services -- each owner pays their own share, mix of
-    // paid/future and in/out, uneven amounts.
-    // -----------------------------------------------------------------
-    for (size_t ji = 0; ji < joints.size(); ++ji) {
-        auto& j = joints[ji];
-        double shares[] = {320.0, 275.5, 410.0, 190.25, 260.75};
-        for (size_t oi = 0; oi < j.ownerIdxs.size(); ++oi) {
-            int owner = uid[j.ownerIdxs[oi]];
-            double share = shares[(oi + ji) % 5];
-
-            // Past paid installment
-            YM ym = pastMonths[(oi + ji * 2) % pastMonths.size()];
-            Payment paid;
-            paid.service_id = j.id; paid.user_id = owner;
-            paid.year = ym.y; paid.month = ym.m; paid.day = 8 + (int)oi * 3;
-            paid.amount_due = share;
-            paid.amount_paid = share;
-            paid.balance = 0.0;
-            paid.status = "paid";
-            paid.direction = (ji == 0) ? "out" : "in"; // heating oil: manager fronts it; insurance: collected directly
-            paid.notes = "Μερίδιο " + j.label;
-            SeedAddPayment(db, paid); payTotal++;
-
-            // For the heating-oil (direction=out) service, add a matching "in" collection
-            // row for about half the owners so the net trends toward zero for some.
-            if (ji == 0 && (oi % 2 == 0)) {
-                Payment collect;
-                collect.service_id = j.id; collect.user_id = owner;
-                YM ym2 = pastMonths[(oi + ji * 2 + 1) % pastMonths.size()];
-                collect.year = ym2.y; collect.month = ym2.m; collect.day = 15 + (int)oi;
-                collect.amount_due = share;
-                collect.amount_paid = share * 0.7;
-                collect.balance = share * 0.3;
-                collect.status = "paid";
-                collect.direction = "in";
-                collect.notes = "Είσπραξη μεριδίου πετρελαίου";
-                SeedAddPayment(db, collect); payTotal++;
-            }
-
-            // One future installment per owner for the first joint service
-            if (ji == 0) {
-                YM ymF = futureMonths[oi % futureMonths.size()];
-                Payment fut;
-                fut.service_id = j.id; fut.user_id = owner;
-                fut.year = ymF.y; fut.month = ymF.m; fut.day = 10 + (int)oi * 2;
-                fut.amount_due = 150.0 + (double)oi * 10.0;
-                fut.amount_paid = 0.0;
-                fut.balance = fut.amount_due;
-                fut.status = "future";
-                fut.direction = "out";
-                fut.resolution_date = "2026-12-2" + std::to_string(1 + (oi % 8));
-                fut.notes = "Επιπλέον δόση πετρελαίου";
-                SeedAddPayment(db, fut); payTotal++;
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------
     // Payments: package-component services -- add a few extra rows directly
     // on components already used above, tagged so it's clear packages don't
     // introduce a new payment dimension (still attach to the real service+user).
@@ -348,18 +299,6 @@ void seedDemoDataIfEmpty(DataConn* db) {
         p.notes = "Εξόφληση μέσω πακέτου συντήρησης";
         SeedAddPayment(db, p); payTotal++;
     }
-    if (joints.size() > 1) {
-        Payment p;
-        p.service_id = joints[1].id; p.user_id = uid[joints[1].ownerIdxs[0]];
-        YM ym = futureMonths[2 % futureMonths.size()];
-        p.year = ym.y; p.month = ym.m; p.day = 18;
-        p.amount_due = 200.0; p.amount_paid = 0.0; p.balance = 200.0;
-        p.status = "future"; p.direction = "in";
-        p.resolution_date = "2027-01-05";
-        p.notes = "Ανανέωση ασφαλιστηρίου";
-        SeedAddPayment(db, p); payTotal++;
-    }
-
     // Extra scattered payments so we comfortably clear 40-60 total and vary
     // amounts/dates further, split across a handful of users/services not yet
     // touched by an extra row.
@@ -431,93 +370,276 @@ void seedDemoDataIfEmpty(DataConn* db) {
         }
     }
 
-    // Whole BASIC / FULL PACK bundles bought by a few clients (the category packages
-    // above already give partial buyers of the bundles through their overlap).
+    // Whole BASIC / FULL PACK bundles bought by a few clients, each purchase made at once: its lines form one
+    // batch and (mostly) share ONE receipt. One purchase is left without a receipt on purpose
+    // (Πληρωμές → «Μόνο χωρίς απόδειξη»).
     {
-        struct BundleBuy { size_t bundle; int client; };
-        const std::vector<BundleBuy> bplan = { {0, 4}, {0, 13}, {2, 2}, {2, 9} };
+        struct BundleBuy { size_t bundle; int client; const char* method; const char* paper; };
+        const std::vector<BundleBuy> bplan = { {0, 4, "cash", "1187"}, {0, 13, "bank", ""}, {2, 2, "", ""}, {2, 9, "card", ""} };
         int bseq = 0;
         for (auto& bb : bplan) {
+            YM ym = pastMonths[(bseq + bb.client) % pastMonths.size()];
+            int day = 4 + (bseq * 2 + bb.client) % 24;
+            std::vector<Payment> lines;
             for (auto part : kBundles[bb.bundle].parts) {
                 auto it = idByLabel.find(part);
                 if (it == idByLabel.end()) continue;
                 double amount = 0.0;
                 for (auto& c : kCatalog) if (std::string(c.label) == part) amount = c.amount;
-                YM ym = pastMonths[(bseq + bb.client) % pastMonths.size()];
                 Payment p;
                 p.service_id = it->second; p.user_id = uid[bb.client];
-                p.year = ym.y; p.month = ym.m; p.day = 4 + (bseq * 2 + bb.client) % 24;
+                p.year = ym.y; p.month = ym.m; p.day = day;
                 p.amount_due = amount; p.amount_paid = amount; p.balance = 0.0;
                 p.status = "paid"; p.direction = "in";
                 p.notes = std::string("Πακέτο: ") + kBundles[bb.bundle].name;
-                SeedAddPayment(db, p); payTotal++;
-                bseq++;
+                char ts[32]; std::snprintf(ts, sizeof(ts), "%04d-%02d-%02d 11:%02d:00", ym.y, ym.m, day, 10 + bseq);
+                p.created_at = ts;
+                lines.push_back(p); payTotal++;
             }
+            char d[16]; std::snprintf(d, sizeof(d), "%04d-%02d-%02d", ym.y, ym.m, day);
+            Receipt r; r.user_id = uid[bb.client]; r.issue_date = d; r.method = bb.method; r.paper_ref = bb.paper;
+            if (std::string(bb.method) == "bank") r.bank_ref = "ALPHA-TRX-55120931";
+            db->addPaymentsWithReceipt(lines, kBundles[bb.bundle].name, *bb.method ? &r : nullptr);
+            bseq++;
         }
     }
 
-    // -----------------------------------------------------------------
-    // Apartment history. Everybody has lived in their apartment since January; four clients
-    // moved during the year, so some apartments have had SEVERAL tenants and a few are empty
-    // now. The payments' apartment snapshots are re-derived from these dates.
-    // -----------------------------------------------------------------
+    // =================================================================================================
+    // Κοινόχρηστα. Each joint charge splits ONE cost over the apartments of ONE building, among the residents
+    // living there ON THE CHARGE'S DATE (from the residency history), so a resident who left keeps their old
+    // shares and the new resident only gets the later ones. Shares are then paid (or not) like any charge,
+    // each resident with their own payment and receipt.
+    // =================================================================================================
+    std::map<std::string, int> receiptIdOf;      // tag -> receipt id, for the attachments below
+    std::map<std::string, int> chargeIdOf;       // tag -> charge id
     {
-        auto aptOf = [&](int b, const char* label) { return apartmentId[b][label]; };
-        auto stay = [&](int user, int apt, const char* from, const char* to) {
-            Residency r; r.user_id = user; r.apartment_id = apt; r.from_date = from; r.to_date = to; return r; };
-        for (size_t i = 0; i < seedUsers.size(); ++i) {
-            std::vector<Residency> h;
-            const std::string name = seedUsers[i].name;
-            const int nowApt = aptOf(seedUsers[i].bldg, seedUsers[i].apt);
-            const char* from = "2026-01-01";
-            if (name == "ΒΛΑΧΟΥ ΣΟΦΙΑ")            { h.push_back(stay(uid[i], aptOf(2, "4ος"), "2026-01-01", "2026-02-28")); from = "2026-03-01"; }
-            if (name == "ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ ΜΑΡΙΑ")    { h.push_back(stay(uid[i], aptOf(2, "4ος"), "2026-03-01", "2026-05-31")); from = "2026-06-01"; }
-            if (name == "ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ")         { h.push_back(stay(uid[i], aptOf(1, "Β2"),  "2026-01-01", "2026-04-30")); from = "2026-05-01"; }
-            if (name == "ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ")     { h.push_back(stay(uid[i], aptOf(3, "Γ1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
-            h.push_back(stay(uid[i], nowApt, from, ""));
-            db->setResidencyHistory(uid[i], h);
-        }
-    }
+        auto cat = [&](const char* label, const char* notes, const char* kind) {
+            Service sv; sv.label = label; sv.extra_notes = notes;
+            int jid = db->addJointService(sv, kind);
+            int svcId = -1;
+            for (auto& j : db->getJointCatalog(true)) if (j.id == jid) svcId = j.service.id;
+            return std::make_pair(jid, svcId);
+        };
+        auto oil   = cat("ΘΕΡΜΑΝΣΗ – ΠΕΤΡΕΛΑΙΟ ΚΟΙΝΟΧΡΗΣΤΟ", "Προμήθεια πετρελαίου για την κεντρική θέρμανση, κατανομή με χιλιοστά θέρμανσης.", "heating_oil");
+        auto clean = cat("ΚΑΘΑΡΙΟΤΗΤΑ ΚΛΙΜΑΚΟΣ", "Μηνιαίος καθαρισμός κλιμακοστασίου, ισόποσα σε όλα τα διαμερίσματα.", "equal");
+        auto power = cat("ΡΕΥΜΑ ΚΟΙΝΟΧΡΗΣΤΩΝ ΧΩΡΩΝ", "Λογαριασμός ΔΕΗ για φωτισμό κλιμακοστασίου και ανελκυστήρα.", "equal");
+        auto lift  = cat("ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ", "Μηνιαία συντήρηση ανελκυστήρα, κατανομή με χιλιοστά.", "millesimal");
+        auto insur = cat("ΑΣΦΑΛΕΙΑ ΚΤΙΡΙΟΥ", "Ετήσιο ασφαλιστήριο κτιρίου (πυρός & αστικής ευθύνης), με χιλιοστά.", "millesimal");
+        (void)power;
 
-    // Κοινόχρηστα: a small catalog and one heating-oil charge split over the first building's residents
-    // (one apartment excluded, as happens when a flat has its own boiler).
-    {
-        Service oil; oil.label = "ΘΕΡΜΑΝΣΗ – ΠΕΤΡΕΛΑΙΟ ΚΟΙΝΟΧΡΗΣΤΟ";
-        oil.extra_notes = "Προμήθεια πετρελαίου για την κεντρική θέρμανση, κατανομή με χιλιοστά θέρμανσης.";
-        int oilId = db->addJointService(oil, "heating_oil");
-        Service clean; clean.label = "ΚΑΘΑΡΙΟΤΗΤΑ ΚΛΙΜΑΚΟΣ";
-        db->addJointService(clean, "equal");
-        Service lift; lift.label = "ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ";
-        db->addJointService(lift, "millesimal");
-        auto blds = db->getBuildings();
-        auto cat = db->getJointCatalog();
-        if (oilId > 0 && !blds.empty()) {
-            auto users = db->searchUsers("", 0, 1 << 30);
-            JointOp op; op.building_id = blds[0].id; op.source_type = "joint"; op.source_id = oilId; op.kind = "heating_oil";
-            op.label = "ΠΕΤΡΕΛΑΙΟ ΘΕΡΜΑΝΣΗΣ ΟΚΤ. 2026"; op.op_date = "2026-10-05";
-            std::vector<JointShare> shares; std::string weights; bool firstW = true, excludedOne = false;
-            const double w[] = {120, 95, 110, 80, 130, 100, 90, 105};
-            int k = 0;
-            for (auto& a : db->getApartmentsForBuilding(blds[0].id)) {
-                for (auto& u : users) {
-                    if (u.apartment_id != a.id) continue;
-                    JointShare sh; sh.apartment_id = a.id; sh.user_id = u.id;
-                    if (!excludedOne && k == 1) { sh.included = false; sh.exclude_reason = "Αυτόνομη θέρμανση"; excludedOne = true; }
-                    else { sh.amount = w[k % 8]; weights += std::string(firstW ? "" : ",") + "\"" + std::to_string(a.id) + "\":" + std::to_string((int)w[k % 8]); firstW = false; }
-                    shares.push_back(sh); k++;
-                    break;
+        // (apartment, resident) pairs of a building on a date; apartments with nobody then get an excluded row
+        struct Row { int apt; int user; std::string label; };
+        auto residentsOn = [&](int b, const std::string& date) {
+            int y = std::atoi(date.substr(0, 4).c_str()), m = std::atoi(date.substr(5, 2).c_str()), d = std::atoi(date.substr(8, 2).c_str());
+            std::vector<Row> rows;
+            for (auto& [label, apt] : apartmentId[b]) {
+                bool any = false;
+                for (size_t i = 0; i < uid.size(); i++)
+                    if (db->getApartmentOnDate(uid[i], y, m, d) == apt) { rows.push_back({apt, uid[i], label}); any = true; }
+                if (!any) rows.push_back({apt, -1, label});
+            }
+            return rows;
+        };
+        // weights: thousandths per apartment label (only for the kinds that use them)
+        struct OpSpec {
+            int b; std::pair<int,int> svc; const char* source; int sourceId; const char* kind; const char* label;
+            const char* date; double total; std::map<std::string, double> weights; std::map<std::string, std::string> exclude;
+            std::string params;
+        };
+        auto split = [](long long total, const std::vector<double>& w) {
+            std::vector<long long> out(w.size(), 0); double sum = 0; for (double x : w) sum += x;
+            long long given = 0;
+            for (size_t i = 0; i < w.size(); i++) { out[i] = (long long)((double)total * w[i] / sum); given += out[i]; }
+            for (size_t i = 0; given < total; i = (i + 1) % w.size()) if (w[i] > 0) { out[i]++; given++; }
+            return out;
+        };
+        auto charge = [&](const OpSpec& o, const std::vector<JointLine>& lines) {
+            auto rows = residentsOn(o.b, o.date);
+            std::vector<JointShare> shares; std::vector<double> w; std::vector<size_t> inc;
+            std::string wjson;
+            for (auto& r : rows) {
+                JointShare sh; sh.apartment_id = r.apt; sh.user_id = r.user;
+                auto ex = o.exclude.find(r.label);
+                if (r.user <= 0) { sh.included = false; sh.exclude_reason = "Κενό διαμέρισμα"; }
+                else if (ex != o.exclude.end()) { sh.included = false; sh.exclude_reason = ex->second; }
+                else {
+                    double wt = 1.0;
+                    if (auto it = o.weights.find(r.label); it != o.weights.end()) {
+                        wt = it->second;
+                        wjson += (wjson.empty() ? "" : ",") + std::string("\"") + std::to_string(r.apt) + "\":" + std::to_string((int)wt);
+                    }
+                    inc.push_back(shares.size()); w.push_back(wt);
                 }
+                shares.push_back(sh);
             }
-            // 1000 litres x 1.25 = 1250.00, split by the thousandths above
-            double sumW = 0; for (auto& sh : shares) if (sh.included) sumW += sh.amount;
-            long long total = 125000, given = 0; JointShare* last = nullptr;
-            for (auto& sh : shares) if (sh.included) { long long c = (long long)(total * sh.amount / sumW); sh.amount = c / 100.0; given += c; last = &sh; }
-            if (last) last->amount = (ToCents(last->amount) + total - given) / 100.0;
-            op.total = 1250.00;
-            op.params_json = "{\"extra\":0,\"litres\":1000,\"price_per_litre\":1.25,\"weights\":{" + weights + "}}";
-            int svc = -1; for (auto& j : cat) if (j.id == oilId) svc = j.service.id;
-            if (svc > 0 && last) db->chargeJoint(op, {{svc, 1250.00}}, shares);
+            auto parts = split(ToCents(o.total), w);
+            for (size_t i = 0; i < inc.size(); i++) shares[inc[i]].amount = FromCents(parts[i]);
+            JointOp op; op.building_id = buildingIds[o.b]; op.source_type = o.source; op.source_id = o.sourceId; op.kind = o.kind;
+            op.label = o.label; op.total = o.total; op.op_date = o.date;
+            op.params_json = "{" + o.params + (o.weights.empty() ? "" : std::string(o.params.empty() ? "" : ",") + "\"weights\":{" + wjson + "}") + "}";
+            return db->chargeJoint(op, lines, shares);
+        };
+        auto one = [](int svc, double total) { return std::vector<JointLine>{{svc, total}}; };
+
+        std::map<std::string, double> patWeights  = {{"Ισόγειο", 150}, {"Α1", 210}, {"Α2", 190}, {"Β1", 220}, {"Β2", 230}};
+        std::map<std::string, double> aigWeights  = {{"Α1", 120}, {"Α2", 95}, {"Β1", 110}, {"Β2", 80}, {"Γ1", 100}};
+        std::map<std::string, double> tsimWeights = {{"Ισόγειο", 160}, {"1ος", 200}, {"2ος", 200}, {"3ος", 210}, {"4ος", 230}};
+        std::map<std::string, double> kifWeights  = {{"Α1", 240}, {"Α2", 260}, {"Β1", 250}, {"Β2", 250}};
+
+        std::vector<std::pair<std::string, int>> ops;   // tag -> op id
+        auto add = [&](const std::string& tag, int id) { if (id > 0) ops.push_back({tag, id}); };
+        // ΠΑΤΗΣΙΩΝ 205: heating oil in January (ΣΑΡΡΗΣ lives in Β2) and October (ΜΑΚΡΗΣ lives in Β2);
+        // the ground floor has its own boiler.
+        add("pat_oil_jan", charge({0, oil, "joint", oil.first, "heating_oil", "ΠΕΤΡΕΛΑΙΟ ΘΕΡΜΑΝΣΗΣ ΙΑΝ. 2026", "2026-01-15", 1500.00,
+                                   patWeights, {{"Ισόγειο", "Αυτόνομη θέρμανση"}}, "\"litres\":1200,\"price_per_litre\":1.25,\"extra\":0"},
+                                  one(oil.second, 1500.00)));
+        add("pat_oil_oct", charge({0, oil, "joint", oil.first, "heating_oil", "ΠΕΤΡΕΛΑΙΟ ΘΕΡΜΑΝΣΗΣ ΟΚΤ. 2026", "2026-10-05", 1031.20,
+                                   patWeights, {{"Ισόγειο", "Αυτόνομη θέρμανση"}}, "\"litres\":800,\"price_per_litre\":1.289,\"extra\":0"},
+                                  one(oil.second, 1031.20)));
+        // ΑΙΓΑΙΟΥ 9: heating oil in October (Γ1 empty since ΔΗΜΗΤΡΙΟΥ moved to Α2; Α2 has its own heating)
+        add("aig_oil_oct", charge({3, oil, "joint", oil.first, "heating_oil", "ΠΕΤΡΕΛΑΙΟ ΘΕΡΜΑΝΣΗΣ ΟΚΤ. 2026", "2026-10-05", 1250.00,
+                                   aigWeights, {{"Α2", "Αυτόνομη θέρμανση"}}, "\"litres\":1000,\"price_per_litre\":1.25,\"extra\":0"},
+                                  one(oil.second, 1250.00)));
+        // monthly stair cleaning in every building (equal split) -- March, June, September
+        const char* months[][2] = {{"2026-03-01", "ΜΑΡ."}, {"2026-06-01", "ΙΟΥΝ."}, {"2026-09-01", "ΣΕΠΤ."}};
+        const double cleanTotal[] = {80.00, 60.00, 75.00, 70.00};
+        const char* bTag[] = {"pat", "kif", "tsim", "aig"};
+        for (int b = 0; b < 4; b++)
+            for (auto& mo : months)
+                add(std::string(bTag[b]) + "_clean_" + mo[0], charge({b, clean, "joint", clean.first, "equal",
+                        (std::string("ΚΑΘΑΡΙΟΤΗΤΑ ΚΛΙΜΑΚΟΣ ") + mo[1] + " 2026").c_str(), mo[0], cleanTotal[b], {}, {}, ""},
+                        one(clean.second, cleanTotal[b])));
+        // ΚΗΦΙΣΙΑΣ 118: elevator maintenance by thousandths
+        add("kif_lift", charge({1, lift, "joint", lift.first, "millesimal", "ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ Β' ΤΡΙΜ. 2026", "2026-04-10", 240.00,
+                                kifWeights, {}, ""}, one(lift.second, 240.00)));
+        // ΤΣΙΜΙΣΚΗ 81: yearly insurance in February (ΒΛΑΧΟΥ then lived in 4ος)
+        add("tsim_ins", charge({2, insur, "joint", insur.first, "millesimal", "ΑΣΦΑΛΕΙΑ ΚΤΙΡΙΟΥ 2026", "2026-02-10", 720.00,
+                                tsimWeights, {}, ""}, one(insur.second, 720.00)));
+        // a PACKAGE charged as joint: ΠΥΡΟΣΒΕΣΤΗΡΑΣ (its services) on ΚΗΦΙΣΙΑΣ 118, one apartment excluded
+        {
+            int pkg = -1;
+            for (auto& m : db->getMasterServices()) if (m.label == "ΠΥΡΟΣΒΕΣΤΗΡΑΣ") pkg = m.id;
+            if (pkg > 0) {
+                auto comps = db->getMasterServiceComponents(pkg);
+                std::vector<double> w; for (auto& c : comps) w.push_back(c.suggested_price);
+                auto parts = split(10500, w);                     // 105.00 € over the components by catalog price
+                std::vector<JointLine> lines;
+                for (size_t i = 0; i < comps.size(); i++) lines.push_back({comps[i].id, FromCents(parts[i])});
+                add("kif_fire", charge({1, {-1, -1}, "package", pkg, "equal", "ΠΥΡΟΣΒΕΣΤΗΡΕΣ ΚΤΙΡΙΟΥ 2026", "2026-05-20", 105.00,
+                                        {}, {{"Α2", "Έχει δικό του πυροσβεστήρα"}}, ""}, lines));
+            }
         }
+        // a plain SERVICE charged as joint: emergency drain unblocking on ΤΣΙΜΙΣΚΗ 81
+        {
+            auto it = idByLabel.find("ΑΠΟΦΡΑΞΗ – ΕΚΤΑΚΤΗ");
+            if (it != idByLabel.end())
+                add("tsim_drain", charge({2, {-1, -1}, "service", it->second, "equal", "ΕΚΤΑΚΤΗ ΑΠΟΦΡΑΞΗ ΚΕΝΤΡΙΚΗΣ ΑΠΟΧΕΤΕΥΣΗΣ", "2026-08-14", 140.00,
+                                          {}, {}, ""}, one(it->second, 140.00)));
+        }
+
+        // ---- paying the shares: every case once -----------------------------------------------------
+        // charges of an op for one client
+        auto chargesOf = [&](const std::string& tag, int user) {
+            std::vector<Payment> out;
+            for (auto& [t, id] : ops) if (t == tag) for (int cid : db->getJointOpCharges(id)) {
+                Payment p = db->getPaymentById(cid);
+                if (p.user_id == user) out.push_back(p);
+            }
+            return out;
+        };
+        auto addDays = [](const std::string& date, int days) {   // good enough for the demo (stays inside the month)
+            int d = std::atoi(date.substr(8, 2).c_str()) + days; if (d > 28) d = 28;
+            char b[16]; std::snprintf(b, sizeof(b), "%s-%02d", date.substr(0, 7).c_str(), d); return std::string(b);
+        };
+        // pay `fraction` of a client's share(s) of the given ops with ONE payment; receipt if method given
+        auto pay = [&](int user, std::vector<std::string> tags, double fraction, const char* method, const char* paper,
+                       const std::string& receiptTag = "") {
+            std::vector<Allocation> al; long long total = 0; std::string date;
+            for (auto& tag : tags) for (auto& c : chargesOf(tag, user)) {
+                long long amt = (long long)(ToCents(c.balance) * fraction);
+                if (amt <= 0) continue;
+                al.push_back({-1, c.id, FromCents(amt)}); total += amt;
+                char d[16]; std::snprintf(d, sizeof(d), "%04d-%02d-%02d", c.year, c.month, c.day);
+                if (std::string(d) > date) date = d;
+            }
+            if (total <= 0) return -1;
+            MoneyPayment m; m.user_id = user; m.amount = FromCents(total); m.direction = "in";
+            m.pay_date = addDays(date, 6); m.method = *method ? method : "cash";
+            Receipt r; r.user_id = user; r.issue_date = m.pay_date; r.method = m.method; r.paper_ref = paper;
+            if (m.method == "bank" || m.method == "ebanking") { r.bank_ref = "PIRAEUS-" + std::to_string(700000 + total % 99991); m.reference = r.bank_ref; }
+            int mid = db->recordPayment(m, al, *method ? &r : nullptr);
+            if (mid > 0 && !receiptTag.empty()) {
+                for (auto& mm : db->getMoneyForUser(user)) if (mm.id == mid && mm.receipt_id > 0) receiptIdOf[receiptTag] = mm.receipt_id;
+            }
+            return mid;
+        };
+        auto U = [&](const char* name) { for (size_t i = 0; i < seedUsers.size(); i++) if (name == std::string(seedUsers[i].name)) return uid[i]; return -1; };
+
+        // ΠΑΤΗΣΙΩΝ 205 January oil: most paid in full with a receipt each; ΣΑΡΡΗΣ (moved out in June) paid only
+        // part and still owes the rest -- it stays HIS debt from apartment Β2, not the new resident's.
+        pay(U("ΑΝΑΣΤΑΣΙΟΥ ΔΗΜΗΤΡΙΟΣ"), {"pat_oil_jan"}, 1.0, "cash", "1201", "pat_oil_cash");
+        pay(U("ΣΤΑΥΡΟΥ ΑΙΚΑΤΕΡΙΝΗ"),   {"pat_oil_jan"}, 1.0, "bank", "");
+        pay(U("ΓΕΩΡΓΙΟΥ ΙΩΑΝΝΗΣ"),     {"pat_oil_jan"}, 1.0, "ebanking", "");
+        pay(U("ΣΑΡΡΗΣ ΑΝΤΩΝΙΟΣ"),      {"pat_oil_jan"}, 0.5, "", "");
+        // ONE payment + ONE receipt covering two joint shares (March cleaning + January oil already paid -> cleaning
+        // of March and June together)
+        pay(U("ΑΝΑΣΤΑΣΙΟΥ ΔΗΜΗΤΡΙΟΣ"), {"pat_clean_2026-03-01", "pat_clean_2026-06-01"}, 1.0, "cash", "1305", "pat_two_shares");
+        pay(U("ΠΑΠΑΔΟΠΟΥΛΟΣ ΓΕΩΡΓΙΟΣ"), {"pat_clean_2026-03-01"}, 1.0, "cash", "1306");
+        // the receipt that gets voided and reissued (wrong method written)
+        int wrong = pay(U("ΣΤΑΥΡΟΥ ΑΙΚΑΤΕΡΙΝΗ"), {"pat_clean_2026-03-01"}, 1.0, "cash", "1307");
+        if (wrong > 0) {
+            for (auto& mm : db->getMoneyForUser(U("ΣΤΑΥΡΟΥ ΑΙΚΑΤΕΡΙΝΗ"))) if (mm.id == wrong && mm.receipt_id > 0) {
+                db->voidReceipt(mm.receipt_id, "Λάθος τρόπος πληρωμής: πληρώθηκε με κάρτα, όχι μετρητά");
+                Receipt r; r.user_id = mm.user_id; r.issue_date = mm.pay_date; r.method = "card"; r.notes = "Αντικαθιστά την ακυρωμένη απόδειξη";
+                db->issueReceiptForMoney(r, {mm.id});
+            }
+        }
+        // ΚΗΦΙΣΙΑΣ 118: elevator + fire extinguishers. ΜΑΚΡΗΣ paid the elevator share of Β1 before moving away;
+        // ΜΙΧΑΗΛΙΔΟΥ (then in Β2) paid hers without asking for a receipt.
+        pay(U("ΝΙΚΟΛΑΟΥ ΕΛΕΝΗ"),   {"kif_lift", "kif_fire"}, 1.0, "bank", "", "kif_fire_bank");
+        pay(U("ΜΑΚΡΗΣ ΕΛΕΥΘΕΡΙΟΣ"), {"kif_lift"}, 1.0, "cash", "1410");
+        pay(U("ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ"),  {"kif_lift", "kif_fire"}, 1.0, "", "");
+        // ΤΣΙΜΙΣΚΗ 81: insurance (ΒΛΑΧΟΥ was in 4ος then) and the emergency drain job
+        pay(U("ΒΛΑΧΟΥ ΣΟΦΙΑ"),             {"tsim_ins"}, 1.0, "iris", "");
+        pay(U("ΧΡΙΣΤΟΔΟΥΛΟΥ ΠΑΝΑΓΙΩΤΗΣ"),  {"tsim_ins", "tsim_drain"}, 1.0, "cash", "1502");
+        pay(U("ΟΙΚΟΝΟΜΟΥ ΒΑΣΙΛΕΙΟΣ"),      {"tsim_ins"}, 0.4, "", "");
+        pay(U("ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ ΜΑΡΙΑ"),     {"tsim_drain"}, 1.0, "collector", "1503", "tsim_drain_collector");
+        // ΑΙΓΑΙΟΥ 9: September cleaning by everyone, October oil by one resident so far
+        for (const char* n : {"ΚΑΡΑΓΙΑΝΝΗΣ ΝΙΚΟΛΑΟΣ", "ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ", "ΑΝΤΩΝΙΟΥ ΧΡΗΣΤΟΣ", "ΠΕΤΡΟΥ ΔΗΜΗΤΡΑ"})
+            pay(U(n), {"aig_clean_2026-09-01"}, 1.0, "cash", "");
+        pay(U("ΚΑΡΑΓΙΑΝΝΗΣ ΝΙΚΟΛΑΟΣ"), {"aig_oil_oct"}, 1.0, "ebanking", "");
+
+        // a normal service bill with an attached video (boiler fault) -- for the attachments
+        auto it = idByLabel.find("ΚΑΥΣΤΗΡΑΣ – ΒΛΑΒΗ");
+        if (it != idByLabel.end()) {
+            Payment p; p.service_id = it->second; p.user_id = U("ΟΙΚΟΝΟΜΟΥ ΒΑΣΙΛΕΙΟΣ");
+            p.year = 2026; p.month = 8; p.day = 14; p.amount_due = 85.00; p.amount_paid = 0.0; p.status = "paid"; p.direction = "in";
+            p.notes = "Βλάβη καυστήρα διαμερίσματος – βίντεο και φωτογραφία στα συνημμένα";
+            int cid = db->addPaymentsWithReceipt({p}, "", nullptr);
+            if (cid > 0) chargeIdOf["boiler"] = cid;
+        }
+    }
+
+    // ---- attachments: real files copied next to the database (see docs/JOINT_CHARGES.md → «Συνημμένα») ----
+    if (!mediaDir.empty()) {
+        auto f = [&](const char* name) { return mediaDir + "/" + name; };
+        auto userNamed = [&](const char* name) { for (size_t i = 0; i < seedUsers.size(); i++) if (name == std::string(seedUsers[i].name)) return uid[i]; return -1; };
+        if (receiptIdOf.count("pat_two_shares"))
+            db->addAttachment("receipt", receiptIdOf["pat_two_shares"], f("receipt_scan_A000001.jpg"), "Σκαναρισμένη χειρόγραφη απόδειξη");
+        if (receiptIdOf.count("kif_fire_bank"))
+            db->addAttachment("receipt", receiptIdOf["kif_fire_bank"], f("receipt_scan_A000002.jpg"), "Αποδεικτικό κατάθεσης");
+        if (receiptIdOf.count("pat_oil_cash"))
+            db->addAttachment("receipt", receiptIdOf["pat_oil_cash"], f("oil_delivery_note.jpg"), "Δελτίο παράδοσης πετρελαίου");
+        if (chargeIdOf.count("boiler")) {
+            db->addAttachment("charge", chargeIdOf["boiler"], f("boiler_inspection.mp4"), "Βίντεο από τον τεχνικό");
+            db->addAttachment("charge", chargeIdOf["boiler"], f("boiler_damage.jpg"), "Φωτογραφία βλάβης");
+        }
+        int pap = userNamed("ΠΑΠΑΔΟΠΟΥΛΟΣ ΓΕΩΡΓΙΟΣ");
+        if (pap > 0) {
+            db->addAttachment("client", pap, f("management_contract.pdf"), "Σύμβαση διαχείρισης");
+            db->addAttachment("client", pap, f("client_id_card.jpg"), "Αντίγραφο ταυτότητας");
+        }
+        db->takeLastError();   // a missing demo file is not an error worth showing
     }
 
     // Notes: deliberately NOT seeded -- the client wants the Notes tab to start

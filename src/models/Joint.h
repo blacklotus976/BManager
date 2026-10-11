@@ -50,6 +50,9 @@ struct JointShare {
     // read-only
     std::string apartment_label, user_name;
     double paid = 0.0;
+    // read-only, filled by getJointSharesFor: the charge this share belongs to
+    std::string op_label, op_date, building_address;
+    double op_total = 0.0;
 };
 
 // A line of what is being split (a package splits each component; a service or joint service is one line).
