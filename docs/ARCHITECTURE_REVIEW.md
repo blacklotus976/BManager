@@ -183,26 +183,42 @@ Windows build (`build_imgui.bat` + vcpkg) is unchanged.
 - `tests/money_test.cpp` (run by `build_linux.sh` via ctest).
 - Columns stay `REAL` euros so the raw view, CSV and SQL console read naturally; on PostgreSQL use `NUMERIC(12,2)`.
 
-## 11. The client's business (expresshomeservice.gr)
+## 11. The client's business (expresshomeservice.gr, crawled 2026-10-11)
 
-EXPRESS HOME SERVICE Ε.Π.Ε., Νέα Ερυθραία. Offering (from the site/catalog seeded in `Seed.cpp`): building
-management & κοινόχρηστα, heating oil, burner/boiler service, disinfection/pest control, drain unblocking,
-fire extinguishers (buy / lend / service / refill), cleaning crews. **Introductory packages (πακέτα γνωριμίας):**
-- **BASIC — from €15/month**: κοινόχρηστα issuing, 2 disinfection/pest-control visits, burner service, free public-liability insurance.
-- **ALL IN ONE — from €40/month**: full management, expense transparency, fuel cost allocation, multiple payment methods, legal receipts.
+**EXPRESS HOME SERVICE Ε.Π.Ε.**, Νέα Ερυθραία (north Attica), founded 1997; the site claims an active
+portfolio of **70,000 buildings** in greater Athens. Phones 210 625 1962-6, 210 625 0548, 210 807 6087,
+210 620 7058 · info@expresshomeservice.gr. Pest-control licence no. 1281142/14.
 
-What that implies for the admin panel:
-1. **Packages are subscriptions with entitlements**, not just groupings: "€15/month includes 2 pest-control
-   visits/year + 1 burner service". Needed: `contracts` (customer/building ↔ package, start/end, monthly price)
-   and an **entitlement counter** (used 1 of 2 visits) so extra visits are billed and included ones are €0.
-2. **"From €X"** = price depends on building size → per-contract price override, frozen on each charge.
-3. **Promotions** like "free extinguisher lending inside a package", "1 in 4 fuel additive orders free",
-   introductory price for N months → promotion rules applied at charge time and stored on the charge line.
-4. **Customer is often the building (πολυκατοικία, own ΑΦΜ)**, not a person: the building pays the management
-   fee, apartments owe κοινόχρηστα shares. Model "who is billed" as either a building or a resident.
-5. **Expense transparency & legal receipts** are part of what he sells: every expense (`direction='out'`)
-   should carry the supplier, document number and an attachment (scan/PDF), visible to residents later on the portal.
-6. **Fuel allocation** (κατανομή πετρελαίου by χιλιοστά/hours) is a calculation the ALL IN ONE package promises —
-   a future module: apartment `millesimal shares` per expense category.
-7. **Scheduled service work** (annual extinguisher check, burner service, pest control twice a year) →
-   a service-visit calendar with reminders; this is the "controller" side of the admin panel.
+### Price list ("από" = starting price, varies per building)
+| Service | Price | Notes |
+|---|---|---|
+| Κοινόχρηστα (issuing) | free with a package | delivered within 24–48h; per-building history of oil level, heating meters, boiler, sub-meters, ΔΕΗ, septic |
+| Διαχείριση πολυκατοικίας | from €40/month | pays ΔΕΗ/water/gas, crews (cleaning, lift, gardener), heating oil; collects κοινόχρηστα |
+| Απολύμανση/απεντόμωση/μυοκτονία | from €30 per application | **offer: 3 applications (Mar, Jun, Sep) for the price of 2** |
+| Αποφράξεις (preventive pressure-jet) | from €55 | emergencies priced per case/time (holidays) |
+| Συντήρηση καυστήρα | oil from €50, gas from €60 | yearly maintenance sheet (φύλλο συντήρησης) for the administrator's file |
+| Πυροσβεστήρες | buy / lend free (παραχώρηση) / service / refill | keeps the record and reminds of the yearly check |
+| Συνεργεία καθαριότητας | from €50 | priced per building after an inspection; signed agreement incl. yearly extra jobs |
+| Θέρμανση (heating oil) | below wholesale | same-day delivery, orders <1000 L, free tank cleaning, **1 in 4 fuel additives free**, "save up to €200", order code archive |
+
+### Packages (πακέτα γνωριμίας)
+- **BASIC, from €15/month**: κοινόχρηστα · 2 pest-control applications · burner/boiler service **or** a drain unblocking · flue-gas measurements · burner faults · tank cleaning (oil) · free civil-liability insurance.
+- **ALL IN ONE, from €40/month**: full management + transparency of expenses and allocation · exact fuel calculation · payment by collector, bank deposit, e-banking or card · email to non-resident owners · automatic balance updates · legal receipts posted for every tenant · owners notified when tenants owe > 2 months · legal/advisory cover. *Price conditional: bimonthly issuing, agreed payment method, adequate reserve, number of apartments, monthly expenses.*
+- **FULL PACK, from €120/month**: management + cleaning crew + 3 pest-control applications + burner service, measurements, faults, tank cleaning + **2 drain unblockings/year** + roof extinguisher refill + insurance.
+
+("Προσφορά του μήνα" page sits behind a bot check; ask the client what is on it — it's a monthly promo slot.)
+
+### What the admin panel must model (derived from the above)
+1. **Contracts per building**: package + negotiated monthly price ("από") + billing period (monthly / **bimonthly**) + conditions. Price frozen per charge.
+2. **Entitlements with counters**: "2 pest-control/yr", "2 drain jobs/yr", "burner service OR drain" (choice), "3 for 2" scheduled Mar/Jun/Sep. Included visits charge €0; extra ones bill at list price.
+3. **Promotion rules**: N-for-M (3 for 2), every-Nth-free (1 in 4 additives), free-with-package (κοινόχρηστα, extinguisher lending, insurance), monthly offer. Stored on the charge line with the promotion id.
+4. **Two kinds of money**: (a) *his revenue* — fees and service invoices to the building; (b) *the building's fund (ταμείο)* that he manages — expenses paid on its behalf (`direction='out'`) and κοινόχρηστα collected from apartments. These must be separate ledgers per building; mixing them is the classic dispute.
+5. **Κοινόχρηστα allocation**: per-apartment **millesimal shares (‰) per category** (general, heating, lift, …), owner-only vs tenant expenses, closed-apartment rules, heating formula (pre-1985 fixed % + hours×‰; post-1985 Πi=[fi·εi + Mi/ΣMi·(1−Σfi·εi)]·100).
+6. **Owner vs tenant**: an apartment has an owner and maybe a tenant; owner gets notified when the tenant owes > 2 months.
+7. **Heating oil stock in FIFO lots**: each purchase (litres × price), tank readings, consumption charged at the lot's purchase price (their own 460 L × 0.90 + 380 L × 0.89 example).
+8. **Meter readings** per apartment per period (hours / heat units / gas), dated to the gas company's reading day.
+9. **Compliance calendar** per building: burner service yearly (twice for large), gas tightness every 4 years, extinguisher check/refill yearly, pest control 2–3×/season, drain cleaning 1–2×/yr — with reminders and the issued certificate attached.
+10. **Expense documents**: only expenses with legal receipts (παραστατικά) can be charged; store supplier, number, scan; εργόσημο for workers without receipts.
+11. **Approvals**: extraordinary expenses need the building administrator's approval (record who/when); big works need a general-assembly decision.
+12. **Collection channels**: collector visits on scheduled dates (cash, receipt book), bank deposit, e-banking (→ RF codes), card.
+13. **Scale**: 70k buildings × apartments is far beyond a single-user desktop SQLite — confirms the server/PostgreSQL target; the desktop should be designed as a client of that from now on.
