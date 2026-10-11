@@ -1,11 +1,17 @@
 #pragma once
 #include "models/User.h"
+#include "models/Building.h"
 #include "models/Service.h"
 #include "models/MasterService.h"
 #include "models/Payment.h"
 #include "models/Note.h"
 #include <vector>
 #include <string>
+#include <utility>
+
+// Column-header sort for the paged lists: (column number, ascending) pairs, most important first.
+// Column numbers are each table's own; unknown ones are ignored; empty = the default order.
+using SortSpec = std::vector<std::pair<int, bool>>;
 
 class DataConn {
 public:
@@ -22,6 +28,39 @@ public:
     virtual bool editUser(int id, const User& user) = 0;
     virtual bool removeUser(int id) = 0;
     virtual User getUserById(int id) = 0;
+
+    // --- Buildings & apartments ---
+    // A building exists on its own, regardless of who lives in it: address, area,
+    // ΤΚ and the building's own ΑΦΜ, plus a list of apartments (real rows, so
+    // vacant ones are visible). A client points at ONE apartment via
+    // User::apartment_id -- that is the only place "where they live" is stored.
+    // User::address/area/postal_code/apartment/building_id are derived by JOIN.
+    //
+    // Removal semantics (FK cascades are NOT enforced in this app, so these do the
+    // cleanup by hand): removing an apartment leaves its residents unassigned
+    // (apartment_id = NULL, nobody is deleted); removing a building removes its
+    // apartments and unassigns their residents.
+    virtual std::vector<Building> getBuildings() = 0;
+    virtual Building getBuildingById(int id) = 0;
+    virtual int addBuilding(const Building& building) = 0;          // new id, or -1
+    virtual bool editBuilding(int id, const Building& building) = 0;
+    virtual bool removeBuilding(int id) = 0;
+    virtual std::vector<Apartment> getApartmentsForBuilding(int buildingId) = 0;
+    virtual int addApartment(int buildingId, const std::string& label) = 0;  // new id, or -1
+    virtual bool editApartment(int id, const std::string& label) = 0;
+    virtual bool removeApartment(int id) = 0;
+
+    // --- Apartment history ---
+    // Residencies record who lived in which apartment and when (oldest first). Moving a client
+    // (editUser with a different apartment) closes the old stay and opens the new one by itself.
+    virtual std::vector<Residency> getResidencies(int apartmentId) = 0;
+    virtual std::vector<Residency> getUserResidencies(int userId) = 0;
+    // Replaces a client's whole history (used by the demo data / imports); also re-derives the
+    // apartment snapshot of that client's payments from the new dates.
+    virtual bool setResidencyHistory(int userId, const std::vector<Residency>& history) = 0;
+    virtual std::vector<Payment> getPaymentsForApartment(int apartmentId) = 0;
+    // The last database error nobody has looked at yet ("" = none); the UI shows it as a banner.
+    virtual std::string takeLastError() = 0;
 
     // --- Services ---
     // A `services` row is a generic, reusable catalog entry (e.g. "Πετρέλαιο",
@@ -160,5 +199,39 @@ public:
     // --- Raw SQL console (Settings screen power-user feature) ---
     virtual bool executeRawQuery(const std::string& sql, std::vector<std::string>& outColumns,
                                   std::vector<std::vector<std::string>>& outRows, std::string& outError) = 0;
+
+    // --- Paged list queries (list-view pagers; SQL-level offset/limit) ---
+    // sort = the list's column-header sort (several keys allowed). It is applied in SQL so it
+    // spans every page.
+    // These back the Clients / Services / Payments list tabs so the UI only
+    // ever holds ONE page in RAM, regardless of table size. Each pageX takes
+    // an offset + limit and returns exactly that slice; each countX returns
+    // the total for the same filter set so the pager can display "X-Y of Z".
+    //
+    // pageUsers scope: 0 = all fields, 1 = full_name only, 2 = special_code only,
+    //                  3 = phone only, 4 = building address only. `letters` is
+    //                  the multi-select Greek-letter name filter (empty = none).
+    virtual std::vector<User> pageUsers(const std::string& query, int scope,
+                                         const std::vector<std::string>& letters,
+                                         int offset, int limit, const SortSpec& sort = {}) = 0;
+    virtual int countUsers(const std::string& query, int scope,
+                            const std::vector<std::string>& letters) = 0;
+
+    // Services: only single-owner services (joint ones live on their own tab).
+    // query does a label/notes substring match.
+    virtual std::vector<Service> pageServices(const std::string& query, int offset, int limit,
+                                               const SortSpec& sort = {}) = 0;
+    virtual int countServices(const std::string& query) = 0;
+
+    // Payments: full filter set at SQL level (dates as YYYY-MM-DD strings,
+    // userId/serviceId -1 = no filter, status "" | "future" | "resolved",
+    // direction "" | "in" | "out").
+    virtual std::vector<Payment> pagePayments(const std::string& startDate, const std::string& endDate,
+                                               int userId, int serviceId,
+                                               const std::string& status, const std::string& direction,
+                                               int offset, int limit, const SortSpec& sort = {}) = 0;
+    virtual int countPayments(const std::string& startDate, const std::string& endDate,
+                               int userId, int serviceId,
+                               const std::string& status, const std::string& direction) = 0;
 
 };

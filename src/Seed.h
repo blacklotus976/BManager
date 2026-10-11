@@ -1,5 +1,7 @@
 #pragma once
 #include "DataConn.h"
 
-// Seeds realistic Greek property-management demo data if the users table is empty.
+// Seeds the realistic Greek property-management demo data set (4 buildings with
+// apartments, 16 clients living in them, services, packages, payments) if the
+// users table is empty. main.cpp only calls this for a brand-new database file.
 void seedDemoDataIfEmpty(DataConn* db);

@@ -38,12 +38,33 @@ cmake --build . --config Release --target PropertyManager -- /m
 IF %ERRORLEVEL% NEQ 0 ( echo [ERROR] Build failed. & goto :eof )
 cd ..
 
+
+
+
+
+
+@REM  echo.
+@REM  echo --- 4. Deploying standalone EXE ---
+@REM  if not exist "dist" mkdir dist
+@REM  copy /Y "build\Release\PropertyManager.exe" "dist\"
+@REM  if exist "data.db" copy /Y "data.db" "dist\"
+@REM  if exist "create_tables.sql" copy /Y "create_tables.sql" "dist\"
+
+
+
 echo.
-echo --- 4. Deploying standalone EXE ---
+echo --- 4. Deploying standalone EXE + DB snapshots ---
 if not exist "dist" mkdir dist
 copy /Y "build\Release\PropertyManager.exe" "dist\"
-if exist "data.db" copy /Y "data.db" "dist\"
-if exist "create_tables.sql" copy /Y "create_tables.sql" "dist\"
+
+REM Ship every DB that exists in the project root -- the populated one, its
+REM clone (both names land so the client can pick whichever they recognize),
+REM and the empty starter. Missing files are skipped silently, so a fresh
+REM checkout without any .db still builds clean.
+if exist "data.db"        copy /Y "data.db"        "dist\data.db"
+if exist "data_clone.db"  copy /Y "data_clone.db"  "dist\data_clone.db"
+if exist "empty_data.db"  copy /Y "empty_data.db"  "dist\empty_data.db"
+
 
 echo.
 echo ========================================================

@@ -87,8 +87,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 int main() {
     std::string dbPath = "data.db";
 #endif
+    // Demo data only for a database file that did not exist yet; an existing
+    // (even empty) file is the user's own and must stay as it is.
+    bool dbExisted = false;
+    { std::ifstream probe(dbPath, std::ios::binary); dbExisted = probe.good(); }
     auto conn = std::make_unique<SqliteConn>(dbPath);
-    seedDemoDataIfEmpty(conn.get());
+    if (!dbExisted) seedDemoDataIfEmpty(conn.get());
+    conn->autoBackup();   // one copy per day in <db folder>/backups, newest 14 kept
 
     return RunApp(conn.get(), dbPath);
 }

@@ -29,4 +29,9 @@ struct Payment {
     // nullable/empty until set.
     std::string resolution_date;
     std::string resolved_at;
+    // Where it happened: the apartment the client lived in AT THE PAYMENT'S DATE (a snapshot taken
+    // from the residency history when the payment is saved, so moving a client later does not
+    // re-attribute old payments). -1 = unknown. created_at = when the row was entered (minute precision).
+    int apartment_id = -1;
+    std::string created_at;
 };

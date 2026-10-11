@@ -10,6 +10,10 @@ private:
     std::map<std::string, std::vector<std::string>> greekHeaders;
 
     bool executeQuery(const std::string& sql);
+    std::string lastError_;
+    std::string dbPath_;
+    int apartmentAt(int userId, int y, int m, int d);
+    double priceOf(int serviceId);
     std::string toJson(const std::vector<std::string>& cols, const std::vector<std::string>& vals);
     std::vector<std::string> getColumnNames(const std::string& table);
 
@@ -24,6 +28,23 @@ public:
     bool editUser(int id, const User& user) override;
     bool removeUser(int id) override;
     User getUserById(int id) override;
+
+    std::vector<Building> getBuildings() override;
+    Building getBuildingById(int id) override;
+    int addBuilding(const Building& building) override;
+    bool editBuilding(int id, const Building& building) override;
+    bool removeBuilding(int id) override;
+    std::vector<Apartment> getApartmentsForBuilding(int buildingId) override;
+    std::vector<Residency> getResidencies(int apartmentId) override;
+    std::vector<Residency> getUserResidencies(int userId) override;
+    bool setResidencyHistory(int userId, const std::vector<Residency>& history) override;
+    std::vector<Payment> getPaymentsForApartment(int apartmentId) override;
+    std::string takeLastError() override;
+    // Once a day: copy the database to <db folder>/backups/ (keeps the newest `keep`).
+    void autoBackup(int keep = 14);
+    int addApartment(int buildingId, const std::string& label) override;
+    bool editApartment(int id, const std::string& label) override;
+    bool removeApartment(int id) override;
 
     std::vector<Service> searchServices(const std::string& query, int offset, int limit) override;
     std::vector<Service> advancedSearchServices(const std::string& label, const std::string& extra_notes,
@@ -86,6 +107,22 @@ public:
 
     bool executeRawQuery(const std::string& sql, std::vector<std::string>& outColumns,
                           std::vector<std::vector<std::string>>& outRows, std::string& outError) override;
+
+    std::vector<User> pageUsers(const std::string& query, int scope,
+                                 const std::vector<std::string>& letters,
+                                 int offset, int limit, const SortSpec& sort = {}) override;
+    int countUsers(const std::string& query, int scope,
+                    const std::vector<std::string>& letters) override;
+    std::vector<Service> pageServices(const std::string& query, int offset, int limit,
+                                       const SortSpec& sort = {}) override;
+    int countServices(const std::string& query) override;
+    std::vector<Payment> pagePayments(const std::string& startDate, const std::string& endDate,
+                                       int userId, int serviceId,
+                                       const std::string& status, const std::string& direction,
+                                       int offset, int limit, const SortSpec& sort = {}) override;
+    int countPayments(const std::string& startDate, const std::string& endDate,
+                       int userId, int serviceId,
+                       const std::string& status, const std::string& direction) override;
 
     // Paged phone-book pickers (dashboard filters) -- see DataConn.h for contract.
     std::vector<User> pickerUsers(const std::vector<std::string>& letters,

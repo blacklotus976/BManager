@@ -1,5 +1,7 @@
 ﻿#include "SqliteConn.h"
 #include <iostream>
+#include <filesystem>
+#include <algorithm>
 #include <sstream>
 #include <fstream>
 #include <chrono>
@@ -8,11 +10,59 @@
 
 // Helper to convert struct to JSON string manually for audit
 static std::string userToJson(const User& u) {
-    return "{ \"id\": " + std::to_string(u.id) + ", \"full_name\": \"" + u.full_name + "\", \"phone\": \"" + u.phone + "\", \"address\": \"" + u.address + "\" }";
+    return "{ \"id\": " + std::to_string(u.id) + ", \"full_name\": \"" + u.full_name + "\", \"phone\": \"" + u.phone +
+           "\", \"special_code\": \"" + u.special_code + "\", \"apartment_id\": " + std::to_string(u.apartment_id) + " }";
+}
+
+static std::string ColText(sqlite3_stmt* s, int i) {
+    const unsigned char* t = sqlite3_column_text(s, i);
+    return t ? (const char*)t : "";
+}
+
+static bool ColumnExists(sqlite3* db, const std::string& table, const std::string& col) {
+    bool found = false;
+    sqlite3_stmt* stmt = nullptr;
+    std::string sql = "PRAGMA table_info(" + table + ")";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            if (ColText(stmt, 1) == col) { found = true; break; }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+// ONE select + ONE row-mapper for every query that returns Users. The users table
+// no longer stores address/area/ΤΚ/apartment -- they are derived here from
+// users -> apartments -> buildings, so "where does this client live" is always
+// read through the same join and can't drift between code paths (the old
+// per-query positional column mapping is exactly what made earlier schema
+// additions so error-prone). Append a WHERE/ORDER clause to use it.
+static const char* kUserSelect =
+    "SELECT u.id, u.full_name, u.phone, u.special_code, u.created_at, u.apartment_id, "
+    "       a.label, b.id, b.address, b.area, b.postal_code "
+    "FROM users u "
+    "LEFT JOIN apartments a ON a.id = u.apartment_id "
+    "LEFT JOIN buildings  b ON b.id = a.building_id ";
+
+static User MapUserRow(sqlite3_stmt* s) {
+    User u;
+    u.id           = sqlite3_column_int(s, 0);
+    u.full_name    = ColText(s, 1);
+    u.phone        = ColText(s, 2);
+    u.special_code = ColText(s, 3);
+    u.created_at   = ColText(s, 4);
+    u.apartment_id = sqlite3_column_type(s, 5) == SQLITE_NULL ? -1 : sqlite3_column_int(s, 5);
+    u.apartment    = ColText(s, 6);
+    u.building_id  = sqlite3_column_type(s, 7) == SQLITE_NULL ? -1 : sqlite3_column_int(s, 7);
+    u.address      = ColText(s, 8);
+    u.area         = ColText(s, 9);
+    u.postal_code  = ColText(s, 10);
+    return u;
 }
 
 static std::string serviceToJson(const Service& s) {
-    return "{ \"id\": " + std::to_string(s.id) + ", \"label\": \"" + s.label + "\" }";
+    return "{ \"id\": " + std::to_string(s.id) + ", \"label\": \"" + s.label + "\", \"suggested_price\": " + std::to_string(s.suggested_price) + " }";
 }
 
 // Direction is a 2-value attribute (in/out) after the client's revert away from
@@ -31,6 +81,7 @@ static std::string paymentToJson(const Payment& p) {
 }
 
 SqliteConn::SqliteConn(const std::string& dbPath) {
+    dbPath_ = dbPath;
     int rc = sqlite3_open(dbPath.c_str(), &db);
     if (rc) {
         std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
@@ -39,21 +90,38 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
 
     // Create tables if not exist
     std::string schema = R"(
+        CREATE TABLE IF NOT EXISTS buildings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT NOT NULL,
+            area TEXT,
+            postal_code TEXT,
+            afm TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS apartments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            building_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            FOREIGN KEY (building_id) REFERENCES buildings(id) ON DELETE CASCADE
+        );
+        -- Column order is deliberate: id, full_name, phone, created_at, special_code,
+        -- apartment_id is exactly what a LEGACY users table ends up as after the
+        -- restructure migration below drops its old columns, so fresh and migrated
+        -- databases are identical (raw view / CSV headers match by position).
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             full_name TEXT NOT NULL,
             phone TEXT,
-            address TEXT NOT NULL,
-            area TEXT,
-            postal_code TEXT,
-            contract_code TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            special_code TEXT,
+            apartment_id INTEGER REFERENCES apartments(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             label TEXT NOT NULL,
             extra_notes TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            suggested_price REAL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS service_users (
             service_id INTEGER NOT NULL,
@@ -112,6 +180,9 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
     )";
     executeQuery(schema);
+
+    if (!ColumnExists(db, "services", "suggested_price"))
+        executeQuery("ALTER TABLE services ADD COLUMN suggested_price REAL DEFAULT 0;");
 
     // --- Migration for DBs created before service_users / payments.user_id existed ---
     // (services used to carry a single "user_id" FK; payments had no user_id at all)
@@ -225,6 +296,77 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         }
     }
 
+
+    // --- Migration: buildings + apartments become real tables; users stop carrying
+    // an address and just point at an apartment (users.apartment_id) ---
+    //
+    // A LEGACY users table is recognised by still having its own `address` column.
+    // For those, in order:
+    //   1. snapshot the whole DB first (VACUUM INTO -- a consistent copy), because
+    //      the last step irreversibly drops columns,
+    //   2. build one `buildings` row per distinct (address, area, ΤΚ) found among
+    //      the users, one `apartments` row per distinct (building, apartment label),
+    //      and point each user at theirs -- NOTHING about where people live is lost,
+    //   3. drop the old per-user columns. address/area/postal_code/apartment now
+    //      live in buildings/apartments; `afm` and `contract_code` (ΣΥΜΒΟΛΑΙΟ) are
+    //      dropped on purpose -- the client confirmed they are not needed.
+    // Users with no address stay unassigned (apartment_id NULL) rather than being
+    // parked in a fake "no address" building. Runs inside one transaction: if any
+    // step fails it rolls back and the legacy table is left exactly as it was.
+    // A fresh/already-migrated DB has no `address` column, so this is skipped.
+    if (!ColumnExists(db, "users", "apartment_id")) {
+        executeQuery("ALTER TABLE users ADD COLUMN apartment_id INTEGER REFERENCES apartments(id) ON DELETE SET NULL;");
+    }
+    if (ColumnExists(db, "users", "address")) {
+        // Very old DBs predate the free-text apartment column; the SQL below reads it.
+        if (!ColumnExists(db, "users", "apartment")) {
+            executeQuery("ALTER TABLE users ADD COLUMN apartment TEXT;");
+        }
+
+        std::string bak = dbPath + ".pre-buildings.bak";
+        {
+            std::ifstream exists(bak, std::ios::binary);
+            if (!exists.good()) {
+                std::string q;
+                for (char c : bak) { q += c; if (c == '\'') q += '\''; }
+                executeQuery("VACUUM INTO '" + q + "';");
+            }
+        }
+
+        std::string mig =
+            "BEGIN;"
+            "INSERT INTO buildings (address, area, postal_code, afm) "
+            "  SELECT DISTINCT TRIM(address), COALESCE(TRIM(area),''), COALESCE(TRIM(postal_code),''), '' "
+            "  FROM users WHERE address IS NOT NULL AND TRIM(address) <> '';"
+            "INSERT INTO apartments (building_id, label) "
+            "  SELECT DISTINCT b.id, COALESCE(NULLIF(TRIM(u.apartment),''),'—') "
+            "  FROM users u JOIN buildings b ON b.address = TRIM(u.address) "
+            "       AND b.area = COALESCE(TRIM(u.area),'') AND b.postal_code = COALESCE(TRIM(u.postal_code),'') "
+            "  WHERE u.address IS NOT NULL AND TRIM(u.address) <> '';"
+            "UPDATE users SET apartment_id = ("
+            "  SELECT a.id FROM apartments a JOIN buildings b ON b.id = a.building_id "
+            "  WHERE b.address = TRIM(users.address) AND b.area = COALESCE(TRIM(users.area),'') "
+            "    AND b.postal_code = COALESCE(TRIM(users.postal_code),'') "
+            "    AND a.label = COALESCE(NULLIF(TRIM(users.apartment),''),'—') LIMIT 1) "
+            "  WHERE address IS NOT NULL AND TRIM(address) <> '';"
+            "ALTER TABLE users DROP COLUMN address;"
+            "ALTER TABLE users DROP COLUMN area;"
+            "ALTER TABLE users DROP COLUMN postal_code;"
+            "ALTER TABLE users DROP COLUMN apartment;";
+        if (ColumnExists(db, "users", "contract_code")) mig += "ALTER TABLE users DROP COLUMN contract_code;";
+        if (ColumnExists(db, "users", "afm"))           mig += "ALTER TABLE users DROP COLUMN afm;";
+        mig += "COMMIT;";
+
+        char* err = nullptr;
+        if (sqlite3_exec(db, mig.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+            std::cerr << "Buildings migration failed, rolling back: " << (err ? err : "?") << std::endl;
+            sqlite3_free(err);
+            sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+    }
+    executeQuery("CREATE INDEX IF NOT EXISTS idx_users_apartment ON users(apartment_id);");
+    executeQuery("CREATE INDEX IF NOT EXISTS idx_apartments_building ON apartments(building_id);");
+
     // --- Migration: audit_log.category (business vs db) added after initial ship ---
     {
         bool auditHasCategory = false;
@@ -262,7 +404,11 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (hasServiceType) executeQuery("ALTER TABLE services DROP COLUMN service_type;");
         if (hasPeriodDays) executeQuery("ALTER TABLE services DROP COLUMN period_days;");
         if (hasLastRunDate) executeQuery("ALTER TABLE services DROP COLUMN last_run_date;");
-        if (hasNextDueDate) executeQuery("ALTER TABLE services DROP COLUMN next_due_date;");
+        if (hasNextDueDate) {
+            // Old DBs carry an index on this column; SQLite refuses to drop an indexed column.
+            executeQuery("DROP INDEX IF EXISTS idx_services_due;");
+            executeQuery("ALTER TABLE services DROP COLUMN next_due_date;");
+        }
     }
 
     // --- Undo: the "service sub-items" feature (service_items table +
@@ -285,7 +431,43 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
     }
 
     // Greek Headers Map
-    greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΔΙΕΥΘΥΝΣΗ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΣΥΜΒ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ."};
+    // users: id, full_name, phone, created_at, special_code, apartment_id (see schema note)
+    // --- Migration: apartment history. residencies = who lived where and when; payments get the
+    // apartment they were made from (snapshot at the payment's date) and the minute they were
+    // entered. Done once; old data is back-filled from the current assignments. ---
+    {
+        executeQuery("CREATE TABLE IF NOT EXISTS residencies ("
+                     "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, apartment_id INTEGER NOT NULL, "
+                     "from_date TEXT NOT NULL, to_date TEXT);"
+                     "CREATE INDEX IF NOT EXISTS idx_res_apartment ON residencies(apartment_id);"
+                     "CREATE INDEX IF NOT EXISTS idx_res_user ON residencies(user_id);");
+        if (!ColumnExists(db, "payments", "apartment_id")) executeQuery("ALTER TABLE payments ADD COLUMN apartment_id INTEGER;");
+        if (!ColumnExists(db, "payments", "created_at"))   executeQuery("ALTER TABLE payments ADD COLUMN created_at TEXT;");
+        int nRes = 0;
+        { sqlite3_stmt* st; sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM residencies", -1, &st, nullptr);
+          if (sqlite3_step(st) == SQLITE_ROW) nRes = sqlite3_column_int(st, 0); sqlite3_finalize(st); }
+        if (nRes == 0) {
+            // one open stay per client who currently has an apartment, starting no later than their first payment
+            executeQuery("INSERT INTO residencies (user_id, apartment_id, from_date) "
+                         "SELECT u.id, u.apartment_id, "
+                         "  MIN(COALESCE(date(u.created_at), date('now','localtime')), "
+                         "      COALESCE((SELECT MIN(printf('%04d-%02d-%02d', year, month, day)) FROM payments WHERE user_id = u.id), '9999-12-31')) "
+                         "FROM users u WHERE u.apartment_id IS NOT NULL;");
+        }
+        executeQuery("UPDATE payments SET apartment_id = ("
+                     "  SELECT r.apartment_id FROM residencies r WHERE r.user_id = payments.user_id "
+                     "  AND r.from_date <= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day) "
+                     "  AND (r.to_date IS NULL OR r.to_date >= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day)) "
+                     "  ORDER BY r.from_date DESC, r.id DESC LIMIT 1) WHERE apartment_id IS NULL;"
+                     "UPDATE payments SET apartment_id = (SELECT apartment_id FROM users WHERE users.id = payments.user_id) WHERE apartment_id IS NULL;"
+                     "UPDATE payments SET created_at = printf('%04d-%02d-%02d 00:00:00', year, month, day) WHERE created_at IS NULL;"
+                     "CREATE INDEX IF NOT EXISTS idx_payments_apartment ON payments(apartment_id);");
+        executeQuery("PRAGMA user_version = 2;");
+    }
+
+    greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
+    greekHeaders["buildings"] = {"ΚΩΔ", "ΔΙΕΥΘΥΝΣΗ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΑΦΜ", "ΗΜ/ΝΙΑ ΔΗΜ."};
+    greekHeaders["apartments"] = {"ΚΩΔ", "ΚΩΔ ΚΤΙΡΙΟΥ", "ΔΙΑΜΕΡΙΣΜΑ"};
     greekHeaders["services"] = {"ΚΩΔ ΥΠΗΡ.", "ΠΕΡΙΓΡΑΦΗ", "ΣΗΜΕΙΩΣΕΙΣ", "ΗΜ/ΝΙΑ ΔΗΜ."};
     greekHeaders["service_users"] = {"ΚΩΔ ΥΠΗΡ.", "ΚΩΔ ΧΡΗΣΤΗ"};
     greekHeaders["payments"] = {"ΚΩΔ ΠΛΗΡ.", "ΚΩΔ ΥΠΗΡ.", "ΕΤΟΣ", "ΜΗΝΑΣ", "ΗΜΕΡΑ", "ΠΟΣΟ ΟΦΕΙΛ.", "ΠΟΣΟ ΠΛΗΡ.", "ΥΠΟΛΟΙΠΟ", "ΚΑΤΑΣΤΑΣΗ", "ΣΧΟΛΙΑ", "ΚΩΔ ΧΡΗΣΤΗ", "ΤΥΠΟΣ", "ΗΜ/ΝΙΑ ΕΠΙΛΥΣΗΣ", "ΕΠΙΛΥΘΗΚΕ ΣΤΙΣ"};
@@ -296,10 +478,19 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
 
 SqliteConn::~SqliteConn() { if(db) sqlite3_close(db); }
 
+double SqliteConn::priceOf(int serviceId) {
+    sqlite3_stmt* st = nullptr; double v = 0.0;
+    sqlite3_prepare_v2(db, "SELECT COALESCE(suggested_price,0) FROM services WHERE id=?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, serviceId);
+    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_double(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
 bool SqliteConn::executeQuery(const std::string& sql) {
     char* errMsg = nullptr;
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
-    if(rc != SQLITE_OK) { std::cerr << "SQL Error: " << errMsg << std::endl; sqlite3_free(errMsg); return false; }
+    if(rc != SQLITE_OK) { std::cerr << "SQL Error: " << errMsg << std::endl; lastError_ = errMsg ? errMsg : "SQL error"; sqlite3_free(errMsg); return false; }
     return true;
 }
 
@@ -318,83 +509,82 @@ void SqliteConn::logAction(const std::string& table, int recordId, const std::st
 }
 
 // --- USERS ---
+// Every read goes through kUserSelect / MapUserRow (top of file), so a client's
+// address / area / ΤΚ / apartment are always the ones DERIVED from their apartment
+// (users -> apartments -> buildings). Writes only touch what is actually stored on
+// the users table: name, phone, special code, and the apartment they point to.
+
 std::vector<User> SqliteConn::searchUsers(const std::string& query, int offset, int limit) {
     std::vector<User> results;
-    std::string sql = "SELECT id, full_name, phone, address, area, postal_code, contract_code, created_at, special_code FROM users WHERE full_name LIKE '%' || ? || '%' OR address LIKE '%' || ? || '%' OR phone LIKE '%' || ? || '%' OR area LIKE '%' || ? || '%' OR postal_code LIKE '%' || ? || '%' OR special_code LIKE '%' || ? || '%' LIMIT ? OFFSET ?";
+    // Free-text: what identifies a client AND where they live (location columns
+    // belong to the building/apartment now, reached through the join).
+    std::string sql = std::string(kUserSelect) +
+        "WHERE u.full_name LIKE '%' || ?1 || '%' OR u.phone LIKE '%' || ?1 || '%' "
+        "   OR u.special_code LIKE '%' || ?1 || '%' OR a.label LIKE '%' || ?1 || '%' "
+        "   OR b.address LIKE '%' || ?1 || '%' OR b.area LIKE '%' || ?1 || '%' "
+        "   OR b.postal_code LIKE '%' || ?1 || '%' "
+        "ORDER BY u.id LIMIT ?2 OFFSET ?3";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, query.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, query.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, query.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, query.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 6, query.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 7, limit);
-    sqlite3_bind_int(stmt, 8, offset);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        User u; u.id = sqlite3_column_int(stmt,0); u.full_name = (const char*)sqlite3_column_text(stmt,1); u.phone = (const char*)sqlite3_column_text(stmt,2); u.address = (const char*)sqlite3_column_text(stmt,3); u.area = (const char*)sqlite3_column_text(stmt,4); u.postal_code = (const char*)sqlite3_column_text(stmt,5) ? (const char*)sqlite3_column_text(stmt,5) : ""; u.contract_code = (const char*)sqlite3_column_text(stmt,6) ? (const char*)sqlite3_column_text(stmt,6) : ""; u.created_at = (const char*)sqlite3_column_text(stmt,7) ? (const char*)sqlite3_column_text(stmt,7) : ""; u.special_code = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : ""; results.push_back(u);
-    }
+    sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, limit);
+    sqlite3_bind_int(stmt, 3, offset);
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(MapUserRow(stmt));
     sqlite3_finalize(stmt);
     return results;
 }
 
-// Advanced multi-field search: only non-empty criteria fields are AND-ed in, each as a
-// case-insensitive LIKE (LOWER() on both sides, matching how the rest of the app treats
-// Greek text -- SQLite's built-in LIKE case-folding is ASCII-only). Parameterized: every
-// user-supplied value is bound via '?', never concatenated into the SQL text.
+// Multi-field AND search for the Αναζήτηση tab: each NON-EMPTY field of `criteria`
+// becomes one AND-ed case-insensitive LIKE clause (LOWER() on both sides, matching
+// how the rest of the app treats Greek text -- SQLite's built-in LIKE case-folding
+// is ASCII-only). address/area/postal_code/apartment are matched against the
+// client's building/apartment through the join. Parameterized: every user-supplied
+// value is bound via '?', never concatenated into the SQL text.
 std::vector<User> SqliteConn::advancedSearchUsers(const User& criteria, const std::string& idQuery) {
     std::vector<User> results;
-    std::string sql = "SELECT id, full_name, phone, address, area, postal_code, contract_code, created_at, special_code FROM users WHERE 1=1";
+    std::string sql = std::string(kUserSelect) + "WHERE 1=1";
     std::vector<std::string> binds;
     auto addClause = [&](const char* col, const std::string& val) {
         if (val.empty()) return;
         sql += std::string(" AND LOWER(") + col + ") LIKE '%' || LOWER(?) || '%'";
         binds.push_back(val);
     };
-    addClause("CAST(id AS TEXT)", idQuery);
-    addClause("full_name", criteria.full_name);
-    addClause("phone", criteria.phone);
-    addClause("address", criteria.address);
-    addClause("area", criteria.area);
-    addClause("postal_code", criteria.postal_code);
-    addClause("contract_code", criteria.contract_code);
-    addClause("special_code", criteria.special_code);
-    sql += " ORDER BY full_name LIMIT 2000";
+    addClause("CAST(u.id AS TEXT)", idQuery);
+    addClause("u.full_name", criteria.full_name);
+    addClause("u.phone", criteria.phone);
+    addClause("b.address", criteria.address);
+    addClause("b.area", criteria.area);
+    addClause("b.postal_code", criteria.postal_code);
+    addClause("a.label", criteria.apartment);
+    addClause("u.special_code", criteria.special_code);
+    sql += " ORDER BY u.full_name LIMIT 2000";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     for (size_t i = 0; i < binds.size(); i++) sqlite3_bind_text(stmt, (int)i + 1, binds[i].c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        User u;
-        u.id = sqlite3_column_int(stmt,0);
-        u.full_name = (const char*)sqlite3_column_text(stmt,1);
-        u.phone = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
-        u.address = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
-        u.area = sqlite3_column_text(stmt,4) ? (const char*)sqlite3_column_text(stmt,4) : "";
-        u.postal_code = sqlite3_column_text(stmt,5) ? (const char*)sqlite3_column_text(stmt,5) : "";
-        u.contract_code = sqlite3_column_text(stmt,6) ? (const char*)sqlite3_column_text(stmt,6) : "";
-        u.created_at = sqlite3_column_text(stmt,7) ? (const char*)sqlite3_column_text(stmt,7) : "";
-        u.special_code = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        results.push_back(u);
-    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(MapUserRow(stmt));
     sqlite3_finalize(stmt);
     return results;
 }
 
+static void BindApartment(sqlite3_stmt* stmt, int idx, int apartmentId) {
+    if (apartmentId < 0) sqlite3_bind_null(stmt, idx);
+    else sqlite3_bind_int(stmt, idx, apartmentId);
+}
+
 bool SqliteConn::addUser(const User& u) {
-    std::string sql = "INSERT INTO users (full_name, phone, address, area, postal_code, contract_code, special_code) VALUES (?,?,?,?,?,?,?)";
+    std::string sql = "INSERT INTO users (full_name, phone, special_code, apartment_id) VALUES (?,?,?,?)";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt,1,u.full_name.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,2,u.phone.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,3,u.address.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,4,u.area.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,5,u.postal_code.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,6,u.contract_code.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,7,u.special_code.c_str(),-1,SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, u.full_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, u.phone.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, u.special_code.c_str(), -1, SQLITE_TRANSIENT);
+    BindApartment(stmt, 4, u.apartment_id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) {
-        int newId = sqlite3_last_insert_rowid(db);
+    if (rc == SQLITE_DONE) {
+        int newId = (int)sqlite3_last_insert_rowid(db);
+        if (u.apartment_id > 0)
+            executeQuery("INSERT INTO residencies (user_id, apartment_id, from_date) VALUES (" + std::to_string(newId) + "," + std::to_string(u.apartment_id) + ", date('now','localtime'));");
         logAction("users", newId, "INSERT", "", userToJson(u), "business");
         return true;
     }
@@ -403,20 +593,24 @@ bool SqliteConn::addUser(const User& u) {
 
 bool SqliteConn::editUser(int id, const User& u) {
     User old = getUserById(id);
-    std::string sql = "UPDATE users SET full_name=?, phone=?, address=?, area=?, postal_code=?, contract_code=?, special_code=? WHERE id=?";
+    std::string sql = "UPDATE users SET full_name=?, phone=?, special_code=?, apartment_id=? WHERE id=?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt,1,u.full_name.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,2,u.phone.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,3,u.address.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,4,u.area.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,5,u.postal_code.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,6,u.contract_code.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_text(stmt,7,u.special_code.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_int(stmt,8,id);
+    sqlite3_bind_text(stmt, 1, u.full_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, u.phone.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, u.special_code.c_str(), -1, SQLITE_TRANSIENT);
+    BindApartment(stmt, 4, u.apartment_id);
+    sqlite3_bind_int(stmt, 5, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("users", id, "UPDATE", userToJson(old), userToJson(u), "business"); return true; }
+    if (rc == SQLITE_DONE) {
+        if (old.apartment_id != u.apartment_id) {          // moved: close the old stay, open the new one
+            executeQuery("UPDATE residencies SET to_date = date('now','localtime') WHERE user_id = " + std::to_string(id) + " AND to_date IS NULL;");
+            if (u.apartment_id > 0)
+                executeQuery("INSERT INTO residencies (user_id, apartment_id, from_date) VALUES (" + std::to_string(id) + "," + std::to_string(u.apartment_id) + ", date('now','localtime'));");
+        }
+        logAction("users", id, "UPDATE", userToJson(old), userToJson(u), "business"); return true;
+    }
     return false;
 }
 
@@ -425,18 +619,294 @@ bool SqliteConn::removeUser(int id) {
     std::string sql = "DELETE FROM users WHERE id=?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,id);
+    sqlite3_bind_int(stmt, 1, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("users", id, "DELETE", "", "", "business"); return true; }
+    if (rc == SQLITE_DONE) { executeQuery("DELETE FROM residencies WHERE user_id = " + std::to_string(id) + ";"); logAction("users", id, "DELETE", "", "", "business"); return true; }
     return false;
 }
 
 User SqliteConn::getUserById(int id) {
-    User u; std::string sql = "SELECT * FROM users WHERE id=?";
-    sqlite3_stmt* stmt; sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr); sqlite3_bind_int(stmt,1,id);
-    if(sqlite3_step(stmt) == SQLITE_ROW) { u.id=sqlite3_column_int(stmt,0); u.full_name=(const char*)sqlite3_column_text(stmt,1); u.phone=(const char*)sqlite3_column_text(stmt,2); u.address=(const char*)sqlite3_column_text(stmt,3); u.area=(const char*)sqlite3_column_text(stmt,4); u.postal_code=(const char*)sqlite3_column_text(stmt,5)?(const char*)sqlite3_column_text(stmt,5):""; u.contract_code=(const char*)sqlite3_column_text(stmt,6)?(const char*)sqlite3_column_text(stmt,6):""; u.created_at=(const char*)sqlite3_column_text(stmt,7)?(const char*)sqlite3_column_text(stmt,7):""; u.special_code=sqlite3_column_text(stmt,8)?(const char*)sqlite3_column_text(stmt,8):""; }
-    sqlite3_finalize(stmt); return u;
+    User u;
+    std::string sql = std::string(kUserSelect) + "WHERE u.id=?";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) u = MapUserRow(stmt);
+    sqlite3_finalize(stmt);
+    return u;
+}
+
+// --- BUILDINGS & APARTMENTS ---
+std::vector<Building> SqliteConn::getBuildings() {
+    std::vector<Building> out;
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT id, address, area, postal_code, afm, created_at FROM buildings ORDER BY address, area, id", -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Building b;
+        b.id = sqlite3_column_int(stmt, 0);
+        b.address = ColText(stmt, 1);
+        b.area = ColText(stmt, 2);
+        b.postal_code = ColText(stmt, 3);
+        b.afm = ColText(stmt, 4);
+        b.created_at = ColText(stmt, 5);
+        out.push_back(b);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+Building SqliteConn::getBuildingById(int id) {
+    Building b;
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT id, address, area, postal_code, afm, created_at FROM buildings WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        b.id = sqlite3_column_int(stmt, 0);
+        b.address = ColText(stmt, 1);
+        b.area = ColText(stmt, 2);
+        b.postal_code = ColText(stmt, 3);
+        b.afm = ColText(stmt, 4);
+        b.created_at = ColText(stmt, 5);
+    }
+    sqlite3_finalize(stmt);
+    return b;
+}
+
+static std::string BuildingToJson(const Building& b) {
+    return "{ \"id\": " + std::to_string(b.id) + ", \"address\": \"" + b.address + "\", \"area\": \"" + b.area +
+           "\", \"postal_code\": \"" + b.postal_code + "\", \"afm\": \"" + b.afm + "\" }";
+}
+
+int SqliteConn::addBuilding(const Building& b) {
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "INSERT INTO buildings (address, area, postal_code, afm) VALUES (?,?,?,?)", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, b.address.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, b.area.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, b.postal_code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, b.afm.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+    int id = (int)sqlite3_last_insert_rowid(db);
+    logAction("buildings", id, "INSERT", "", BuildingToJson(b), "business");
+    return id;
+}
+
+bool SqliteConn::editBuilding(int id, const Building& b) {
+    Building old = getBuildingById(id);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "UPDATE buildings SET address=?, area=?, postal_code=?, afm=? WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, b.address.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, b.area.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, b.postal_code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, b.afm.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return false;
+    logAction("buildings", id, "UPDATE", BuildingToJson(old), BuildingToJson(b), "business");
+    return true;
+}
+
+// FK cascades are not enforced in this app, so the cleanup is explicit and runs in
+// one transaction: residents of this building's apartments are UNASSIGNED (never
+// deleted), then its apartments, then the building itself.
+bool SqliteConn::removeBuilding(int id) {
+    Building old = getBuildingById(id);
+    char* err = nullptr;
+    std::string sid = std::to_string(id);
+    std::string sql =
+        "BEGIN;"
+        "UPDATE users SET apartment_id = NULL WHERE apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ");"
+        "DELETE FROM residencies WHERE apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ");"
+        "UPDATE payments SET apartment_id = NULL WHERE apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ");"
+        "DELETE FROM apartments WHERE building_id = " + sid + ";"
+        "DELETE FROM buildings WHERE id = " + sid + ";"
+        "COMMIT;";
+    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "removeBuilding failed: " << (err ? err : "?") << std::endl;
+        sqlite3_free(err);
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
+    }
+    logAction("buildings", id, "DELETE", BuildingToJson(old), "", "business");
+    return true;
+}
+
+std::vector<Apartment> SqliteConn::getApartmentsForBuilding(int buildingId) {
+    std::vector<Apartment> out;
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT id, building_id, label FROM apartments WHERE building_id=? ORDER BY id", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, buildingId);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Apartment a;
+        a.id = sqlite3_column_int(stmt, 0);
+        a.building_id = sqlite3_column_int(stmt, 1);
+        a.label = ColText(stmt, 2);
+        out.push_back(a);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+int SqliteConn::addApartment(int buildingId, const std::string& label) {
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "INSERT INTO apartments (building_id, label) VALUES (?,?)", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, buildingId);
+    sqlite3_bind_text(stmt, 2, label.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+    int id = (int)sqlite3_last_insert_rowid(db);
+    logAction("apartments", id, "INSERT", "",
+              "{ \"id\": " + std::to_string(id) + ", \"building_id\": " + std::to_string(buildingId) + ", \"label\": \"" + label + "\" }", "business");
+    return id;
+}
+
+bool SqliteConn::editApartment(int id, const std::string& label) {
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "UPDATE apartments SET label=? WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, label.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return false;
+    logAction("apartments", id, "UPDATE", "", "{ \"id\": " + std::to_string(id) + ", \"label\": \"" + label + "\" }", "business");
+    return true;
+}
+
+// Residents are unassigned, not deleted (see removeBuilding).
+bool SqliteConn::removeApartment(int id) {
+    char* err = nullptr;
+    std::string sid = std::to_string(id);
+    std::string sql =
+        "BEGIN;"
+        "UPDATE users SET apartment_id = NULL WHERE apartment_id = " + sid + ";"
+        "DELETE FROM residencies WHERE apartment_id = " + sid + ";"
+        "UPDATE payments SET apartment_id = NULL WHERE apartment_id = " + sid + ";"
+        "DELETE FROM apartments WHERE id = " + sid + ";"
+        "COMMIT;";
+    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "removeApartment failed: " << (err ? err : "?") << std::endl;
+        sqlite3_free(err);
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
+    }
+    logAction("apartments", id, "DELETE", "", "", "business");
+    return true;
+}
+
+// --- APARTMENT HISTORY ---
+int SqliteConn::apartmentAt(int userId, int y, int m, int d) {
+    if (userId <= 0) return -1;
+    char date[16]; std::snprintf(date, sizeof(date), "%04d-%02d-%02d", y, m, d);
+    int apt = -1;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT apartment_id FROM residencies WHERE user_id=?1 AND from_date<=?2 AND (to_date IS NULL OR to_date>=?2) "
+                           "ORDER BY from_date DESC, id DESC LIMIT 1", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, userId); sqlite3_bind_text(st, 2, date, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) apt = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (apt > 0) return apt;
+    // before any recorded stay: fall back to where the client lives now
+    sqlite3_prepare_v2(db, "SELECT apartment_id FROM users WHERE id=?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, userId);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) apt = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return apt;
+}
+
+static std::vector<Residency> ReadResidencies(sqlite3* db, const std::string& where, int arg) {
+    std::vector<Residency> out;
+    sqlite3_stmt* st = nullptr;
+    std::string sql = "SELECT id, user_id, apartment_id, from_date, COALESCE(to_date,'') FROM residencies WHERE " + where + " ORDER BY from_date, id";
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, arg);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        Residency r;
+        r.id = sqlite3_column_int(st, 0); r.user_id = sqlite3_column_int(st, 1); r.apartment_id = sqlite3_column_int(st, 2);
+        r.from_date = ColText(st, 3); r.to_date = ColText(st, 4);
+        out.push_back(r);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+std::vector<Residency> SqliteConn::getResidencies(int apartmentId) { return ReadResidencies(db, "apartment_id=?", apartmentId); }
+std::vector<Residency> SqliteConn::getUserResidencies(int userId)  { return ReadResidencies(db, "user_id=?", userId); }
+
+bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& history) {
+    char* err = nullptr;
+    std::string uid = std::to_string(userId);
+    std::string sql = "BEGIN; DELETE FROM residencies WHERE user_id = " + uid + ";";
+    int currentApt = -1;
+    for (auto& r : history) {
+        std::string from = r.from_date.empty() ? "1970-01-01" : r.from_date;
+        sql += "INSERT INTO residencies (user_id, apartment_id, from_date, to_date) VALUES (" + uid + "," + std::to_string(r.apartment_id) + ",'" + from + "',"
+             + (r.to_date.empty() ? std::string("NULL") : "'" + r.to_date + "'") + ");";
+        if (r.to_date.empty()) currentApt = r.apartment_id;
+    }
+    sql += "UPDATE users SET apartment_id = " + (currentApt > 0 ? std::to_string(currentApt) : std::string("NULL")) + " WHERE id = " + uid + ";";
+    sql += "UPDATE payments SET apartment_id = COALESCE(("
+           "SELECT r.apartment_id FROM residencies r WHERE r.user_id = payments.user_id "
+           "AND r.from_date <= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day) "
+           "AND (r.to_date IS NULL OR r.to_date >= printf('%04d-%02d-%02d', payments.year, payments.month, payments.day)) "
+           "ORDER BY r.from_date DESC, r.id DESC LIMIT 1), apartment_id) WHERE user_id = " + uid + ";COMMIT;";
+    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+        lastError_ = err ? err : "setResidencyHistory failed";
+        sqlite3_free(err);
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
+    }
+    logAction("residencies", userId, "UPDATE", "", "history replaced", "business");
+    return true;
+}
+
+std::vector<Payment> SqliteConn::getPaymentsForApartment(int apartmentId) {
+    std::vector<Payment> out;
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db, "SELECT id, service_id, year, month, day, amount_due, amount_paid, balance, status, notes, user_id, direction, "
+                           "resolution_date, resolved_at, apartment_id, created_at FROM payments WHERE apartment_id=? ORDER BY year, month, day, id", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, apartmentId);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Payment p;
+        p.id = sqlite3_column_int(stmt, 0); p.service_id = sqlite3_column_int(stmt, 1);
+        p.year = sqlite3_column_int(stmt, 2); p.month = sqlite3_column_int(stmt, 3); p.day = sqlite3_column_int(stmt, 4);
+        p.amount_due = sqlite3_column_double(stmt, 5); p.amount_paid = sqlite3_column_double(stmt, 6); p.balance = sqlite3_column_double(stmt, 7);
+        p.status = ColText(stmt, 8); p.notes = ColText(stmt, 9);
+        p.user_id = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt, 10);
+        p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt, 11));
+        p.resolution_date = ColText(stmt, 12); p.resolved_at = ColText(stmt, 13);
+        p.apartment_id = apartmentId; p.created_at = ColText(stmt, 15);
+        out.push_back(p);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+std::string SqliteConn::takeLastError() { std::string e; e.swap(lastError_); return e; }
+
+void SqliteConn::autoBackup(int keep) {
+    namespace fs = std::filesystem;
+    try {
+        fs::path dbp(dbPath_);
+        if (!fs::exists(dbp) || fs::file_size(dbp) == 0) return;
+        fs::path dir = dbp.parent_path() / "backups";
+        fs::create_directories(dir);
+        auto t = std::time(nullptr); std::tm tmv{}; localtime_s(&tmv, &t);
+        char name[48]; std::strftime(name, sizeof(name), "%Y%m%d", &tmv);
+        fs::path target = dir / (dbp.stem().string() + "_" + name + ".db");
+        if (!fs::exists(target)) {
+            std::string p = target.generic_string();
+            for (size_t i = 0; (i = p.find('\'', i)) != std::string::npos; i += 2) p.insert(i, "'");
+            executeQuery("VACUUM INTO '" + p + "';");
+        }
+        std::vector<fs::path> mine;
+        for (auto& e : fs::directory_iterator(dir))
+            if (e.path().extension() == ".db" && e.path().filename().string().rfind(dbp.stem().string() + "_", 0) == 0) mine.push_back(e.path());
+        std::sort(mine.begin(), mine.end());
+        while ((int)mine.size() > keep) { fs::remove(mine.front()); mine.erase(mine.begin()); }
+    } catch (const std::exception& e) { lastError_ = std::string("Αντίγραφο ασφαλείας: ") + e.what(); }
 }
 
 // --- SERVICES ---
@@ -460,6 +930,7 @@ std::vector<Service> SqliteConn::searchServices(const std::string& query, int of
         s.label = (const char*)sqlite3_column_text(stmt,1);
         s.extra_notes = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
         s.created_at = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
+        s.suggested_price = priceOf(s.id);
         results.push_back(s);
     }
     sqlite3_finalize(stmt);
@@ -489,6 +960,7 @@ std::vector<Service> SqliteConn::advancedSearchServices(const std::string& label
         s.label = (const char*)sqlite3_column_text(stmt,1);
         s.extra_notes = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
         s.created_at = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
+        s.suggested_price = priceOf(s.id);
         results.push_back(s);
     }
     sqlite3_finalize(stmt);
@@ -500,17 +972,19 @@ bool SqliteConn::addService(int userId, const Service& s) {
 }
 
 int SqliteConn::addServiceGetId(int userId, const Service& s) {
-    std::string sql = "INSERT INTO services (label, extra_notes) VALUES (?,?)";
+    if (s.suggested_price <= 0.0) return -1;   // every service must carry a price
+    std::string sql = "INSERT INTO services (label, extra_notes, suggested_price) VALUES (?,?,?)";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt,1,s.label.c_str(),-1,SQLITE_STATIC);
     sqlite3_bind_text(stmt,2,s.extra_notes.c_str(),-1,SQLITE_STATIC);
+    sqlite3_bind_double(stmt,3,s.suggested_price);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if(rc != SQLITE_DONE) return -1;
     int id = sqlite3_last_insert_rowid(db);
     logAction("services", id, "INSERT", "", serviceToJson(s), "business");
-    if (!addServiceUser(id, userId)) return -1;
+    if (userId >= 0 && !addServiceUser(id, userId)) return -1;   // userId < 0: independent service, no roster row
     return id;
 }
 
@@ -528,35 +1002,26 @@ bool SqliteConn::addServiceUser(int serviceId, int userId) {
 
 std::vector<User> SqliteConn::getUsersForService(int serviceId) {
     std::vector<User> results;
-    std::string sql = "SELECT u.* FROM users u JOIN service_users su ON su.user_id = u.id WHERE su.service_id=? ORDER BY u.full_name";
+    std::string sql = std::string(kUserSelect) +
+        "JOIN service_users su ON su.user_id = u.id WHERE su.service_id=? ORDER BY u.full_name";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_int(stmt,1,serviceId);
-    while(sqlite3_step(stmt) == SQLITE_ROW) {
-        User u;
-        u.id = sqlite3_column_int(stmt,0);
-        u.full_name = sqlite3_column_text(stmt,1) ? (const char*)sqlite3_column_text(stmt,1) : "";
-        u.phone = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
-        u.address = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
-        u.area = sqlite3_column_text(stmt,4) ? (const char*)sqlite3_column_text(stmt,4) : "";
-        u.postal_code = sqlite3_column_text(stmt,5) ? (const char*)sqlite3_column_text(stmt,5) : "";
-        u.contract_code = sqlite3_column_text(stmt,6) ? (const char*)sqlite3_column_text(stmt,6) : "";
-        u.created_at = sqlite3_column_text(stmt,7) ? (const char*)sqlite3_column_text(stmt,7) : "";
-        u.special_code = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        results.push_back(u);
-    }
+    sqlite3_bind_int(stmt, 1, serviceId);
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(MapUserRow(stmt));
     sqlite3_finalize(stmt);
     return results;
 }
 
 bool SqliteConn::editService(int id, const Service& s) {
+    if (s.suggested_price <= 0.0) return false;
     Service old = getServiceById(id);
-    std::string sql = "UPDATE services SET label=?, extra_notes=? WHERE id=?";
+    std::string sql = "UPDATE services SET label=?, extra_notes=?, suggested_price=? WHERE id=?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt,1,s.label.c_str(),-1,SQLITE_STATIC);
     sqlite3_bind_text(stmt,2,s.extra_notes.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_int(stmt,3,id);
+    sqlite3_bind_double(stmt,3,s.suggested_price);
+    sqlite3_bind_int(stmt,4,id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if(rc == SQLITE_DONE) { logAction("services", id, "UPDATE", serviceToJson(old), serviceToJson(s), "business"); return true; }
@@ -582,6 +1047,7 @@ Service SqliteConn::getServiceById(int id) {
         s.label = (const char*)sqlite3_column_text(stmt,1);
         s.extra_notes = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
         s.created_at = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
+        s.suggested_price = priceOf(s.id);
     }
     sqlite3_finalize(stmt);
     return s;
@@ -599,6 +1065,7 @@ std::vector<Service> SqliteConn::getServicesForUser(int userId) {
         s.label = (const char*)sqlite3_column_text(stmt,1);
         s.extra_notes = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
         s.created_at = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
+        s.suggested_price = priceOf(s.id);
         results.push_back(s);
     }
     sqlite3_finalize(stmt);
@@ -637,6 +1104,7 @@ std::vector<Service> SqliteConn::getMasterServiceComponents(int masterServiceId)
         s.label = sqlite3_column_text(stmt,1) ? (const char*)sqlite3_column_text(stmt,1) : "";
         s.extra_notes = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
         s.created_at = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
+        s.suggested_price = priceOf(s.id);
         results.push_back(s);
     }
     sqlite3_finalize(stmt);
@@ -713,7 +1181,8 @@ std::vector<DataConn::MasterServiceSummary> SqliteConn::getMasterServiceSummarie
 
 // --- PAYMENTS (Including Future) ---
 bool SqliteConn::addPayment(const Payment& p) {
-    std::string sql = "INSERT INTO payments (service_id, year, month, day, amount_due, amount_paid, balance, status, notes, user_id, direction, resolution_date, resolved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    int aptId = p.apartment_id >= 0 ? p.apartment_id : apartmentAt(p.user_id, p.year, p.month, p.day);
+    std::string sql = "INSERT INTO payments (service_id, year, month, day, amount_due, amount_paid, balance, status, notes, user_id, direction, resolution_date, resolved_at, apartment_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(?15, datetime('now','localtime')))";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,p.service_id); sqlite3_bind_int(stmt,2,p.year); sqlite3_bind_int(stmt,3,p.month); sqlite3_bind_int(stmt,4,p.day);
@@ -724,6 +1193,8 @@ bool SqliteConn::addPayment(const Payment& p) {
     sqlite3_bind_text(stmt,11,p.direction.empty() ? "in" : p.direction.c_str(),-1,SQLITE_STATIC);
     if (p.resolution_date.empty()) sqlite3_bind_null(stmt,12); else sqlite3_bind_text(stmt,12,p.resolution_date.c_str(),-1,SQLITE_STATIC);
     if (p.resolved_at.empty()) sqlite3_bind_null(stmt,13); else sqlite3_bind_text(stmt,13,p.resolved_at.c_str(),-1,SQLITE_STATIC);
+    if (aptId > 0) sqlite3_bind_int(stmt,14,aptId); else sqlite3_bind_null(stmt,14);
+    if (p.created_at.empty()) sqlite3_bind_null(stmt,15); else sqlite3_bind_text(stmt,15,p.created_at.c_str(),-1,SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if(rc == SQLITE_DONE) { int id = sqlite3_last_insert_rowid(db); logAction("payments", id, "INSERT", "", paymentToJson(p), "business"); return true; }
@@ -733,7 +1204,12 @@ bool SqliteConn::addPayment(const Payment& p) {
 // NOTE: STUB (not present in transcript) — added to satisfy DataConn interface.
 bool SqliteConn::editPayment(int id, const Payment& p) {
     Payment old = getPaymentById(id);
-    std::string sql = "UPDATE payments SET year=?, month=?, day=?, amount_due=?, amount_paid=?, balance=?, status=?, notes=?, user_id=?, direction=?, resolution_date=?, resolved_at=? WHERE id=?";
+    int aptId = p.apartment_id;
+    if (aptId < 0) {
+        bool moved = old.user_id != p.user_id || old.year != p.year || old.month != p.month || old.day != p.day;
+        aptId = moved ? apartmentAt(p.user_id, p.year, p.month, p.day) : old.apartment_id;
+    }
+    std::string sql = "UPDATE payments SET year=?, month=?, day=?, amount_due=?, amount_paid=?, balance=?, status=?, notes=?, user_id=?, direction=?, resolution_date=?, resolved_at=?, apartment_id=? WHERE id=?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,p.year); sqlite3_bind_int(stmt,2,p.month); sqlite3_bind_int(stmt,3,p.day);
@@ -744,7 +1220,8 @@ bool SqliteConn::editPayment(int id, const Payment& p) {
     sqlite3_bind_text(stmt,10,p.direction.empty() ? "in" : p.direction.c_str(),-1,SQLITE_STATIC);
     if (p.resolution_date.empty()) sqlite3_bind_null(stmt,11); else sqlite3_bind_text(stmt,11,p.resolution_date.c_str(),-1,SQLITE_STATIC);
     if (p.resolved_at.empty()) sqlite3_bind_null(stmt,12); else sqlite3_bind_text(stmt,12,p.resolved_at.c_str(),-1,SQLITE_STATIC);
-    sqlite3_bind_int(stmt,13,id);
+    if (aptId > 0) sqlite3_bind_int(stmt,13,aptId); else sqlite3_bind_null(stmt,13);
+    sqlite3_bind_int(stmt,14,id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if(rc == SQLITE_DONE) { logAction("payments", id, "UPDATE", paymentToJson(old), paymentToJson(p), "business"); return true; }
@@ -782,6 +1259,8 @@ Payment SqliteConn::getPaymentById(int id) {
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
     }
     sqlite3_finalize(stmt);
     return p;
@@ -810,6 +1289,8 @@ std::vector<Payment> SqliteConn::getPaymentsForService(int serviceId) {
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
         results.push_back(p);
     }
     sqlite3_finalize(stmt);
@@ -841,6 +1322,8 @@ std::vector<Payment> SqliteConn::getPaymentsForUser(int userId) {
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
         results.push_back(p);
     }
     sqlite3_finalize(stmt);
@@ -871,6 +1354,8 @@ std::vector<Payment> SqliteConn::getRecentPayments(int limit) {
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
         results.push_back(p);
     }
     sqlite3_finalize(stmt);
@@ -942,6 +1427,8 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
         results.push_back(p);
     }
     sqlite3_finalize(stmt);
@@ -969,6 +1456,8 @@ std::vector<Payment> SqliteConn::getAllPayments() {
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
         results.push_back(p);
     }
     sqlite3_finalize(stmt);
@@ -996,6 +1485,8 @@ std::vector<Payment> SqliteConn::getFuturePayments() {
         p.direction = NormalizeDirection((const char*)sqlite3_column_text(stmt,11));
         p.resolution_date = sqlite3_column_text(stmt,12) ? (const char*)sqlite3_column_text(stmt,12) : "";
         p.resolved_at = sqlite3_column_text(stmt,13) ? (const char*)sqlite3_column_text(stmt,13) : "";
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
         results.push_back(p);
     }
     sqlite3_finalize(stmt);
@@ -1131,7 +1622,7 @@ bool SqliteConn::removeNote(int id) {
 
 // --- BACKUP ---
 bool SqliteConn::exportAllTablesToCSV(const std::string& folder) {
-    std::vector<std::string> tables = {"users", "services", "service_users", "master_services", "master_service_components", "payments", "notes"};
+    std::vector<std::string> tables = {"buildings", "apartments", "users", "services", "service_users", "master_services", "master_service_components", "payments", "notes"};
     for(const auto& t : tables) {
         std::string path = folder + "/" + t + "_backup.csv";
         std::ofstream file(path);
@@ -1211,6 +1702,7 @@ std::vector<DataConn::JointServiceSummary> SqliteConn::getJointServices() {
         s.label = (const char*)sqlite3_column_text(stmt, 1);
         s.extra_notes = sqlite3_column_text(stmt, 2) ? (const char*)sqlite3_column_text(stmt, 2) : "";
         s.created_at = sqlite3_column_text(stmt, 3) ? (const char*)sqlite3_column_text(stmt, 3) : "";
+        s.suggested_price = priceOf(s.id);
 
         // Get users for this service
         jss.users = getUsersForService(s.id);
@@ -1303,23 +1795,22 @@ std::vector<User> SqliteConn::pickerUsers(const std::vector<std::string>& letter
                                            int offset, int limit,
                                            bool reverseSort) {
     std::vector<User> results;
-    std::string sql = "SELECT id, full_name, phone, address, area, postal_code, contract_code, created_at, special_code "
-                      "FROM users WHERE 1=1";
+    std::string sql = std::string(kUserSelect) + "WHERE 1=1";
     std::vector<std::string> binds;
     if (!letters.empty()) {
         sql += " AND (";
         for (size_t i = 0; i < letters.size(); i++) {
             if (i > 0) sql += " OR ";
-            sql += "full_name LIKE ? || '%'";
+            sql += "u.full_name LIKE ? || '%'";
             binds.push_back(letters[i]);
         }
         sql += ")";
     }
     if (!nameSearch.empty()) {
-        sql += " AND LOWER(full_name) LIKE '%' || LOWER(?) || '%'";
+        sql += " AND LOWER(u.full_name) LIKE '%' || LOWER(?) || '%'";
         binds.push_back(nameSearch);
     }
-    sql += reverseSort ? " ORDER BY full_name DESC" : " ORDER BY full_name ASC";
+    sql += reverseSort ? " ORDER BY u.full_name DESC" : " ORDER BY u.full_name ASC";
     sql += " LIMIT ? OFFSET ?";
 
     sqlite3_stmt* stmt;
@@ -1328,19 +1819,7 @@ std::vector<User> SqliteConn::pickerUsers(const std::vector<std::string>& letter
     for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, idx++, limit);
     sqlite3_bind_int(stmt, idx++, offset);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        User u;
-        u.id = sqlite3_column_int(stmt,0);
-        u.full_name = sqlite3_column_text(stmt,1) ? (const char*)sqlite3_column_text(stmt,1) : "";
-        u.phone = sqlite3_column_text(stmt,2) ? (const char*)sqlite3_column_text(stmt,2) : "";
-        u.address = sqlite3_column_text(stmt,3) ? (const char*)sqlite3_column_text(stmt,3) : "";
-        u.area = sqlite3_column_text(stmt,4) ? (const char*)sqlite3_column_text(stmt,4) : "";
-        u.postal_code = sqlite3_column_text(stmt,5) ? (const char*)sqlite3_column_text(stmt,5) : "";
-        u.contract_code = sqlite3_column_text(stmt,6) ? (const char*)sqlite3_column_text(stmt,6) : "";
-        u.created_at = sqlite3_column_text(stmt,7) ? (const char*)sqlite3_column_text(stmt,7) : "";
-        u.special_code = sqlite3_column_text(stmt,8) ? (const char*)sqlite3_column_text(stmt,8) : "";
-        results.push_back(u);
-    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(MapUserRow(stmt));
     sqlite3_finalize(stmt);
     return results;
 }
@@ -1398,6 +1877,7 @@ std::vector<Service> SqliteConn::pickerServices(const std::string& nameSearch,
         s.label = sqlite3_column_text(stmt, 1) ? (const char*)sqlite3_column_text(stmt, 1) : "";
         s.extra_notes = sqlite3_column_text(stmt, 2) ? (const char*)sqlite3_column_text(stmt, 2) : "";
         s.created_at = sqlite3_column_text(stmt, 3) ? (const char*)sqlite3_column_text(stmt, 3) : "";
+        s.suggested_price = priceOf(s.id);
         results.push_back(s);
     }
     sqlite3_finalize(stmt);
@@ -1415,6 +1895,284 @@ int SqliteConn::pickerServicesCount(const std::string& nameSearch) {
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     int idx = 1;
     for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+// --- PAGED LIST QUERIES (offset/limit) -------------------------------------
+// These build a WHERE clause from the caller's filter set and return only the
+// requested slice. The corresponding countX functions build the same WHERE
+// with SELECT COUNT(*) so the pager can show "X-Y of Z" without fetching
+// anything extra.
+
+// Shared builder for pageUsers / countUsers so both stay in lockstep.
+static std::string BuildUserPageWhere(const std::string& query, int scope,
+                                       const std::vector<std::string>& letters,
+                                       std::vector<std::string>& bindValues) {
+    std::string where = " WHERE 1=1";
+    if (!query.empty()) {
+        bindValues.push_back(query);
+        switch (scope) {
+            case 1:  where += " AND u.full_name    LIKE '%' || ? || '%'"; break;
+            case 2:  where += " AND u.special_code LIKE '%' || ? || '%'"; break;
+            case 3:  where += " AND u.phone        LIKE '%' || ? || '%'"; break;
+            case 4:  where += " AND b.address      LIKE '%' || ? || '%'"; break;
+            default:
+                where += " AND (u.full_name LIKE '%' || ? || '%'"
+                         " OR u.phone LIKE '%' || ? || '%'"
+                         " OR u.special_code LIKE '%' || ? || '%'"
+                         " OR a.label LIKE '%' || ? || '%'"
+                         " OR b.address LIKE '%' || ? || '%'"
+                         " OR b.area LIKE '%' || ? || '%'"
+                         " OR b.postal_code LIKE '%' || ? || '%')";
+                // Push the query six more times to fill the extra placeholders.
+                for (int k = 0; k < 6; k++) bindValues.push_back(query);
+                break;
+        }
+    }
+    if (!letters.empty()) {
+        where += " AND (";
+        for (size_t i = 0; i < letters.size(); i++) {
+            if (i > 0) where += " OR ";
+            where += "u.full_name LIKE ? || '%'";
+            bindValues.push_back(letters[i]);
+        }
+        where += ")";
+    }
+    return where;
+}
+
+// ORDER BY for the list-header sort. Column numbers are the Πελάτες table's own
+// (0 id, 1 address, 2 apartment, 3 name, 4 phone, 5 area, 6 ΤΚ, 7 special code); anything
+// else falls back to the name. Whitelisted, never built from user text.
+static std::string UserOrderBy(const SortSpec& spec) {
+    std::string out;
+    for (auto& k : spec) {
+        const char* key = nullptr;
+        switch (k.first) {
+            case 0: key = "u.id"; break;           case 1: key = "b.address"; break;
+            case 2: key = "a.label"; break;        case 3: key = "u.full_name"; break;
+            case 4: key = "u.phone"; break;        case 5: key = "b.area"; break;
+            case 6: key = "b.postal_code"; break;  case 7: key = "u.special_code"; break;
+            default: break;
+        }
+        if (key) out += std::string(out.empty() ? "" : ", ") + key + (k.second ? " ASC" : " DESC");
+    }
+    if (out.empty()) out = "u.full_name ASC";
+    return out + ", u.id ASC";
+}
+
+std::vector<User> SqliteConn::pageUsers(const std::string& query, int scope,
+                                         const std::vector<std::string>& letters,
+                                         int offset, int limit, const SortSpec& sort) {
+    std::vector<std::string> binds;
+    std::string where = BuildUserPageWhere(query, scope, letters, binds);
+    std::string sql = std::string(kUserSelect) + where + " ORDER BY " + UserOrderBy(sort) + " LIMIT ? OFFSET ?";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, idx++, limit);
+    sqlite3_bind_int(stmt, idx++, offset);
+    std::vector<User> results;
+    while (sqlite3_step(stmt) == SQLITE_ROW) results.push_back(MapUserRow(stmt));
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+int SqliteConn::countUsers(const std::string& query, int scope,
+                            const std::vector<std::string>& letters) {
+    std::vector<std::string> binds;
+    std::string where = BuildUserPageWhere(query, scope, letters, binds);
+    // kUserSelect's FROM/JOINs are reused so a.label/b.* exist for the WHERE
+    // clauses above; COUNT(*) is applied on top of that same join.
+    std::string sql =
+        "SELECT COUNT(*) FROM users u "
+        "LEFT JOIN apartments a ON a.id = u.apartment_id "
+        "LEFT JOIN buildings  b ON b.id = a.building_id " + where;
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+// Services table columns: 0 id, 1 label, 2 price, 3 notes.
+static std::string ServiceOrderBy(const SortSpec& spec) {
+    std::string out;
+    for (auto& k : spec) {
+        const char* key = nullptr;
+        switch (k.first) {
+            case 0: key = "s.id"; break;  case 1: key = "s.label"; break;
+            case 2: key = "s.suggested_price"; break;  case 3: key = "s.extra_notes"; break;
+            default: break;
+        }
+        if (key) out += std::string(out.empty() ? "" : ", ") + key + (k.second ? " ASC" : " DESC");
+    }
+    if (out.empty()) out = "s.label ASC";
+    return out + ", s.id ASC";
+}
+
+std::vector<Service> SqliteConn::pageServices(const std::string& query, int offset, int limit, const SortSpec& sort) {
+    // Joint services (>=2 owners) live on their own tab -- the subquery excludes
+    // them so the pager total reflects only what this tab actually shows.
+    std::string sql =
+        "SELECT s.id, s.label, s.extra_notes, s.created_at FROM services s "
+        "WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) <= 1";
+    std::vector<std::string> binds;
+    if (!query.empty()) {
+        sql += " AND (s.label LIKE '%' || ? || '%' OR s.extra_notes LIKE '%' || ? || '%')";
+        binds.push_back(query); binds.push_back(query);
+    }
+    sql += " ORDER BY " + ServiceOrderBy(sort) + " LIMIT ? OFFSET ?";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, idx++, limit);
+    sqlite3_bind_int(stmt, idx++, offset);
+    std::vector<Service> results;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Service s;
+        s.id = sqlite3_column_int(stmt, 0);
+        s.label = ColText(stmt, 1);
+        s.extra_notes = ColText(stmt, 2);
+        s.created_at = ColText(stmt, 3);
+        s.suggested_price = priceOf(s.id);
+        results.push_back(s);
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+int SqliteConn::countServices(const std::string& query) {
+    std::string sql =
+        "SELECT COUNT(*) FROM services s "
+        "WHERE (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s.id) <= 1";
+    std::vector<std::string> binds;
+    if (!query.empty()) {
+        sql += " AND (s.label LIKE '%' || ? || '%' OR s.extra_notes LIKE '%' || ? || '%')";
+        binds.push_back(query); binds.push_back(query);
+    }
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : binds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+// Shared builder for pagePayments / countPayments. Text binds are pushed first
+// (startDate/endDate/direction), then int binds (userId/serviceId), so the
+// placeholder order in the SQL matches the bind order below.
+static std::string BuildPaymentPageWhere(const std::string& startDate, const std::string& endDate,
+                                          int userId, int serviceId,
+                                          const std::string& status, const std::string& direction,
+                                          std::vector<std::string>& textBinds,
+                                          std::vector<int>& intBinds) {
+    std::string where = " WHERE 1=1";
+    if (!startDate.empty()) {
+        where += " AND printf('%04d-%02d-%02d', year, month, day) >= ?";
+        textBinds.push_back(startDate);
+    }
+    if (!endDate.empty()) {
+        where += " AND printf('%04d-%02d-%02d', year, month, day) <= ?";
+        textBinds.push_back(endDate);
+    }
+    if (userId >= 0)    { where += " AND user_id = ?";    intBinds.push_back(userId); }
+    if (serviceId >= 0) { where += " AND service_id = ?"; intBinds.push_back(serviceId); }
+    if (status == "future")        where += " AND status = 'future'";
+    else if (status == "resolved") where += " AND status != 'future'";
+    if (direction == "in" || direction == "out") {
+        where += " AND direction = ?";
+        textBinds.push_back(direction);
+    }
+    return where;
+}
+
+std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, const std::string& endDate,
+                                               int userId, int serviceId,
+                                               const std::string& status, const std::string& direction,
+                                               int offset, int limit, const SortSpec& sort) {
+    std::vector<std::string> textBinds;
+    std::vector<int> intBinds;
+    std::string where = BuildPaymentPageWhere(startDate, endDate, userId, serviceId, status, direction,
+                                               textBinds, intBinds);
+    // Payments table columns: 0 id, 1 date, 2 client, 3 service, 4 type, 5 status,
+    // 6 due, 7 paid, 8 notes. Client/service sort by NAME (sub-select), not by id.
+    std::string order;
+    for (auto& k : sort) {
+        std::string d = k.second ? " ASC" : " DESC";
+        std::string part;
+        switch (k.first) {
+            case 0: part = "id" + d; break;
+            case 1: part = "year" + d + ", month" + d + ", day" + d; break;
+            case 2: part = "(SELECT full_name FROM users WHERE users.id = payments.user_id)" + d; break;
+            case 3: part = "(SELECT label FROM services WHERE services.id = payments.service_id)" + d; break;
+            case 4: part = "direction" + d; break;
+            case 5: part = "status" + d; break;
+            case 6: part = "amount_due" + d; break;
+            case 7: part = "amount_paid" + d; break;
+            case 8: part = "notes" + d; break;
+            default: break;
+        }
+        if (!part.empty()) order += std::string(order.empty() ? "" : ", ") + part;
+    }
+    if (order.empty()) order = "year DESC, month DESC, day DESC";
+    order += ", id DESC";
+    std::string sql = "SELECT * FROM payments" + where + " ORDER BY " + order + " LIMIT ? OFFSET ?";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : textBinds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    for (auto i : intBinds)   sqlite3_bind_int (stmt, idx++, i);
+    sqlite3_bind_int(stmt, idx++, limit);
+    sqlite3_bind_int(stmt, idx++, offset);
+    std::vector<Payment> results;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Payment p;
+        p.id = sqlite3_column_int(stmt,0);
+        p.service_id = sqlite3_column_int(stmt,1);
+        p.year = sqlite3_column_int(stmt,2);
+        p.month = sqlite3_column_int(stmt,3);
+        p.day = sqlite3_column_int(stmt,4);
+        p.amount_due = sqlite3_column_double(stmt,5);
+        p.amount_paid = sqlite3_column_double(stmt,6);
+        p.balance = sqlite3_column_double(stmt,7);
+        p.status = ColText(stmt,8);
+        p.notes = ColText(stmt,9);
+        p.user_id = sqlite3_column_type(stmt,10) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,10);
+        p.direction = NormalizeDirection(sqlite3_column_text(stmt,11) ? (const char*)sqlite3_column_text(stmt,11) : "in");
+        p.resolution_date = ColText(stmt,12);
+        p.resolved_at = ColText(stmt,13);
+        p.apartment_id = sqlite3_column_type(stmt,14) == SQLITE_NULL ? -1 : sqlite3_column_int(stmt,14);
+        p.created_at = ColText(stmt,15);
+        results.push_back(p);
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+int SqliteConn::countPayments(const std::string& startDate, const std::string& endDate,
+                               int userId, int serviceId,
+                               const std::string& status, const std::string& direction) {
+    std::vector<std::string> textBinds;
+    std::vector<int> intBinds;
+    std::string where = BuildPaymentPageWhere(startDate, endDate, userId, serviceId, status, direction,
+                                               textBinds, intBinds);
+    std::string sql = "SELECT COUNT(*) FROM payments" + where;
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    int idx = 1;
+    for (auto& b : textBinds) sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
+    for (auto i : intBinds)   sqlite3_bind_int (stmt, idx++, i);
     int count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);

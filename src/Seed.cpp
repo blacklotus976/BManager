@@ -1,61 +1,168 @@
 #include "Seed.h"
 #include <vector>
 #include <string>
+#include <map>
 
-// Fresh seed data set (rewritten). Rules followed:
-//  - Uses only DataConn methods (addUser/addServiceGetId/addService/addServiceUser/
-//    addPayment/addNote/addMasterService/addMasterServiceComponent) so every insert
-//    goes through the same audit-logging code path as normal app usage.
+// Demo data set. Rules followed:
+//  - Uses only DataConn methods (addBuilding/addApartment/addUser/addServiceGetId/
+//    addServiceUser/addPayment/addMasterService/addMasterServiceComponent) so every
+//    insert goes through the same audit-logging code path as normal app usage.
+//  - Buildings exist on their own with a full list of apartments (one per building is
+//    deliberately left VACANT so empty units are visible). A client carries no address;
+//    they just point at the apartment they live in.
+//  - 16 clients across 4 buildings, distributed 5 / 3 / 4 / 4.
 //  - status is only ever "paid" or "future" for new rows (no legacy "pending"/"overdue").
 //  - resolved_at is never set here (only the app's Resolve action sets it).
 //  - resolution_date is only ever set on status=="future" rows.
 //  - direction covers both "in" (collect from client) and "out" (manager paid on
 //    client's behalf) across the data.
-struct SeedUser {
-    std::string name, phone, address, area, postal, contract, special;
+//  - No notes are seeded: the Notes tab starts empty on purpose.
+
+// ---------------------------------------------------------------------------
+// Service catalog modelled on the real offering of expresshomeservice.gr
+// (pages: διαχείριση, κοινόχρηστα, θέρμανση, συντήρηση καυστήρα, απολύμανση –
+// απεντόμωση, αποφράξεις, πυροσβεστήρες, συνεργεία καθαριότητας, πακέτα).
+// Each category is a PACKAGE (master service); each concrete thing you can buy
+// in it is a unique SERVICE. Amounts are the site's "από" prices where it gives
+// one, otherwise a plausible figure. Fire extinguishers follow the structure the
+// client asked for: Αγορά – Παραχώρηση – Συντήρηση – Αναγόμωση.
+// ---------------------------------------------------------------------------
+static const char* kPackages[] = {
+    "ΠΥΡΟΣΒΕΣΤΗΡΑΣ",                 // 0
+    "ΔΙΑΧΕΙΡΙΣΗ ΠΟΛΥΚΑΤΟΙΚΙΑΣ",       // 1
+    "ΘΕΡΜΑΝΣΗ",                      // 2
+    "ΚΑΥΣΤΗΡΑΣ – ΛΕΒΗΤΑΣ",            // 3
+    "ΑΠΟΛΥΜΑΝΣΗ – ΑΠΕΝΤΟΜΩΣΗ",        // 4
+    "ΑΠΟΦΡΑΞΕΙΣ",                    // 5
+    "ΣΥΝΕΡΓΕΙΑ ΚΑΘΑΡΙΟΤΗΤΑΣ",         // 6
+};
+struct CatSvc { int pkg; const char* label; const char* notes; double amount; };
+static const CatSvc kCatalog[] = {
+    {0, "ΠΥΡΟΣΒΕΣΤΗΡΑΣ – ΑΓΟΡΑ",        "Πιστοποιημένοι πυροσβεστήρες σε χαμηλές τιμές.", 35.0},
+    {0, "ΠΥΡΟΣΒΕΣΤΗΡΑΣ – ΠΑΡΑΧΩΡΗΣΗ",   "Παραχώρηση πυροσβεστήρα (δωρεάν ή με μειωμένο κόστος μέσα σε πακέτο).", 15.0},
+    {0, "ΠΥΡΟΣΒΕΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ",    "Υποχρεωτικός ετήσιος έλεγχος και τήρηση αρχείου για τον διαχειριστή.", 25.0},
+    {0, "ΠΥΡΟΣΒΕΣΤΗΡΑΣ – ΑΝΑΓΟΜΩΣΗ",    "Αναγόμωση πυροσβεστήρα (π.χ. οροφής).", 30.0},
+
+    {1, "ΔΙΑΧΕΙΡΙΣΗ – ΜΗΝΙΑΙΑ ΑΜΟΙΒΗ",  "Διαχείριση πολυκατοικίας και ταμείου. Από 40 €/μήνα.", 40.0},
+    {1, "ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ ΛΟΓΑΡΙΑΣΜΩΝ", "Πληρωμή κοινόχρηστων λογαριασμών: ΔΕΗ, νερό, φυσικό αέριο.", 120.0},
+    {1, "ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ ΣΥΝΕΡΓΕΙΩΝ", "Πληρωμή συνεργείων: καθαριότητα, ασανσέρ, κηπουρός.", 90.0},
+    {1, "ΚΟΙΝΟΧΡΗΣΤΑ – ΕΚΔΟΣΗ & ΔΙΑΝΟΜΗ", "Έκδοση κοινοχρήστων και διανομή ειδοποιητηρίων, με ανάρτηση παραστατικών.", 15.0},
+    {1, "ΚΟΙΝΟΧΡΗΣΤΑ – ΕΙΣΠΡΑΞΗ",       "Είσπραξη κοινοχρήστων με όλους τους τρόπους και ενημέρωση υπολοίπου.", 20.0},
+    {1, "ΔΙΑΧΕΙΡΙΣΗ – ΝΟΜΙΚΗ ΚΑΛΥΨΗ",   "Νομική κάλυψη και συμβουλευτική σε θέματα διαχείρισης.", 30.0},
+
+    {2, "ΘΕΡΜΑΝΣΗ – ΚΑΘΑΡΙΣΜΟΣ ΔΕΞΑΜΕΝΗΣ", "Καθαρισμός δεξαμενής πετρελαίου θέρμανσης (για καυστήρες πετρελαίου).", 45.0},
+    {2, "ΘΕΡΜΑΝΣΗ – ΠΡΟΣΘΕΤΟ ΠΕΤΡΕΛΑΙΟΥ", "Πρόσθετο καυσίμου θέρμανσης (προσφορά 1 στις 4 παραγγελίες).", 20.0},
+
+    {3, "ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΠΕΤΡΕΛΑΙΟΥ",  "Καθαρισμός λέβητα, έλεγχος και συντήρηση καυστήρα πετρελαίου. Από 50 €.", 50.0},
+    {3, "ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΦΥΣΙΚΟΥ ΑΕΡΙΟΥ", "Συντήρηση καυστήρα φυσικού αερίου από αδειούχους τεχνικούς. Από 60 €.", 60.0},
+    {3, "ΚΑΥΣΤΗΡΑΣ – ΜΕΤΡΗΣΕΙΣ ΚΑΥΣΑΕΡΙΩΝ", "Μετρήσεις καυσαερίων και βαθμού απόδοσης, ρύθμιση, φύλλο συντήρησης.", 25.0},
+    {3, "ΚΑΥΣΤΗΡΑΣ – ΒΛΑΒΗ",               "Αποκατάσταση βλάβης καυστήρα.", 40.0},
+
+    {4, "ΑΠΕΝΤΟΜΩΣΗ",                      "Κατσαρίδες, κουνούπια, μυρμήγκια, ψύλλοι, κοριοί. Από 30 € ανά εφαρμογή.", 30.0},
+    {4, "ΜΥΟΚΤΟΝΙΑ",                       "Καταπολέμηση ποντικιών στους κοινόχρηστους χώρους.", 35.0},
+    {4, "ΑΠΟΛΥΜΑΝΣΗ – ΕΤΗΣΙΟ ΠΡΟΓΡΑΜΜΑ",   "3 εφαρμογές (Μάρτιος, Ιούνιος, Σεπτέμβριος) στην τιμή των 2.", 60.0},
+
+    {5, "ΑΠΟΦΡΑΞΗ – ΠΡΟΛΗΠΤΙΚΟΣ ΚΑΘΑΡΙΣΜΟΣ", "Καθαρισμός οριζόντιου δικτύου με πιεστικό νερού. Από 55 €.", 55.0},
+    {5, "ΑΠΟΦΡΑΞΗ – ΕΚΤΑΚΤΗ",              "Άμεση εξυπηρέτηση σε έκτακτες αποφράξεις, ακόμα και αργίες.", 70.0},
+    {5, "ΑΠΟΦΡΑΞΗ – ΕΛΕΓΧΟΣ ΜΕ ΚΑΜΕΡΑ",     "Κάμερα για εντοπισμό βλαβών στο αποχετευτικό δίκτυο.", 60.0},
+
+    {6, "ΚΑΘΑΡΙΟΤΗΤΑ – ΤΑΚΤΙΚΗ",           "Τακτικός καθαρισμός κλιμακοστασίου και κοινόχρηστων. Από 50 €.", 50.0},
+    {6, "ΚΑΘΑΡΙΟΤΗΤΑ – ΕΙΔΙΚΕΣ ΕΡΓΑΣΙΕΣ",  "Τοίχοι, ταράτσα, γκαράζ, ακάλυπτοι, λεβητοστάσιο.", 80.0},
+    {6, "ΚΗΠΟΥΡΟΣ",                        "Φροντίδα κήπου και φύτευση/κλάδεμα.", 35.0},
+};
+// Express "bundle" packages: each lists catalog services by label.
+struct Bundle { const char* name; std::vector<const char*> parts; };
+static const std::vector<Bundle> kBundles = {
+    {"ΠΑΚΕΤΟ BASIC", {"ΚΟΙΝΟΧΡΗΣΤΑ – ΕΚΔΟΣΗ & ΔΙΑΝΟΜΗ", "ΑΠΕΝΤΟΜΩΣΗ", "ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΠΕΤΡΕΛΑΙΟΥ",
+        "ΚΑΥΣΤΗΡΑΣ – ΜΕΤΡΗΣΕΙΣ ΚΑΥΣΑΕΡΙΩΝ", "ΚΑΥΣΤΗΡΑΣ – ΒΛΑΒΗ", "ΘΕΡΜΑΝΣΗ – ΚΑΘΑΡΙΣΜΟΣ ΔΕΞΑΜΕΝΗΣ"}},
+    {"ΠΑΚΕΤΟ ALL IN ONE", {"ΔΙΑΧΕΙΡΙΣΗ – ΜΗΝΙΑΙΑ ΑΜΟΙΒΗ", "ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ ΛΟΓΑΡΙΑΣΜΩΝ", "ΚΟΙΝΟΧΡΗΣΤΑ – ΕΚΔΟΣΗ & ΔΙΑΝΟΜΗ",
+        "ΚΟΙΝΟΧΡΗΣΤΑ – ΕΙΣΠΡΑΞΗ", "ΔΙΑΧΕΙΡΙΣΗ – ΝΟΜΙΚΗ ΚΑΛΥΨΗ"}},
+    {"ΠΑΚΕΤΟ FULL PACK", {"ΔΙΑΧΕΙΡΙΣΗ – ΜΗΝΙΑΙΑ ΑΜΟΙΒΗ", "ΚΑΘΑΡΙΟΤΗΤΑ – ΤΑΚΤΙΚΗ", "ΑΠΟΛΥΜΑΝΣΗ – ΕΤΗΣΙΟ ΠΡΟΓΡΑΜΜΑ",
+        "ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΠΕΤΡΕΛΑΙΟΥ", "ΚΑΥΣΤΗΡΑΣ – ΜΕΤΡΗΣΕΙΣ ΚΑΥΣΑΕΡΙΩΝ", "ΚΑΥΣΤΗΡΑΣ – ΒΛΑΒΗ",
+        "ΘΕΡΜΑΝΣΗ – ΚΑΘΑΡΙΣΜΟΣ ΔΕΞΑΜΕΝΗΣ", "ΑΠΟΦΡΑΞΗ – ΠΡΟΛΗΠΤΙΚΟΣ ΚΑΘΑΡΙΣΜΟΣ", "ΠΥΡΟΣΒΕΣΤΗΡΑΣ – ΑΝΑΓΟΜΩΣΗ"}},
 };
 
 struct YM { int y, m; };
 
+// Every demo payment gets a believable "entered at" time (minute precision) so the apartment
+// history can be told per minute: on the payment's own date at a working-day hour; scheduled
+// (future) payments were entered in September.
+static int g_seedSeq = 0;
+static void SeedAddPayment(DataConn* db, Payment p) {
+    int s = g_seedSeq++;
+    char buf[32];
+    if (p.status == "future") std::snprintf(buf, sizeof(buf), "2026-09-%02d %02d:%02d:00", 1 + s % 28, 8 + (s * 7) % 10, (s * 13) % 60);
+    else std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:00", p.year, p.month, p.day, 8 + (s * 7) % 10, (s * 13) % 60);
+    p.created_at = buf;
+    db->addPayment(p);
+}
+
 void seedDemoDataIfEmpty(DataConn* db) {
     if (db->getRowCount("users") > 0) return; // already has data
 
-    // 12 users, realistic Greek names/addresses. 6 of them get a non-empty
-    // special_code (a plausible legacy external reference scheme); the rest blank.
+    // ---- Buildings and their apartments -------------------------------------------
+    struct SeedBuilding { const char* address; const char* area; const char* postal; const char* afm;
+                          std::vector<std::string> apartments; };
+    std::vector<SeedBuilding> seedBuildings = {
+        {"ΠΑΤΗΣΙΩΝ 205",  "ΑΘΗΝΑ",        "11253", "094018732", {"Ισόγειο","Α1","Α2","Β1","Β2"}},          // 5 residents = 5 apartments
+        {"ΚΗΦΙΣΙΑΣ 118",  "ΜΑΡΟΥΣΙ",      "15125", "998456321", {"Α1","Α2","Β1","Β2"}},                          // 3 residents = 3 apartments
+        {"ΤΣΙΜΙΣΚΗ 81",   "ΘΕΣΣΑΛΟΝΙΚΗ",  "54622", "800129457", {"Ισόγειο","1ος","2ος","3ος","4ος"}},             // 4 residents = 4 apartments
+        {"ΑΙΓΑΙΟΥ 9",     "ΝΕΟ ΨΥΧΙΚΟ",   "15451", "090276154", {"Α1","Α2","Β1","Β2","Γ1"}},                // 4 residents = 4 active apartments (Γ1 is empty now)
+    };
+    // apartmentId[b][label] -> real DB id, so each client can be pointed at their unit.
+    std::vector<std::map<std::string,int>> apartmentId(seedBuildings.size());
+    for (size_t b = 0; b < seedBuildings.size(); ++b) {
+        Building bld;
+        bld.address = seedBuildings[b].address; bld.area = seedBuildings[b].area;
+        bld.postal_code = seedBuildings[b].postal; bld.afm = seedBuildings[b].afm;
+        int bid = db->addBuilding(bld);
+        if (bid < 0) return; // sanity guard, shouldn't happen
+        for (auto& label : seedBuildings[b].apartments)
+            apartmentId[b][label] = db->addApartment(bid, label);
+    }
+
+    // ---- 16 clients. Every field filled in (name, phone, special code, residence) ---
+    struct SeedUser { const char* name; const char* phone; const char* special; int bldg; const char* apt; };
     std::vector<SeedUser> seedUsers = {
-        {"ΠΑΠΑΔΟΠΟΥΛΟΣ ΓΕΩΡΓΙΟΣ", "6944123456", "28 ΟΚΤΩΒΡΙΟΥ 49Β", "ΑΓ.ΠΑΡΑΣΚΕΥΗ", "15341", "ΣΥΜΒ-2021-014", "Π-104"},
-        {"ΝΙΚΟΛΑΟΥ ΕΛΕΝΗ", "6971234567", "ΚΗΦΙΣΙΑΣ 112", "ΜΑΡΟΥΣΙ", "15125", "ΣΥΜΒ-2019-087", ""},
-        {"ΑΝΑΣΤΑΣΙΟΥ ΔΗΜΗΤΡΙΟΣ", "2106547890", "ΠΑΤΗΣΙΩΝ 203", "ΑΘΗΝΑ", "11253", "ΣΥΜΒ-2022-041", "ΚΩΔ-77"},
-        {"ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ ΜΑΡΙΑ", "6932345678", "ΤΣΙΜΙΣΚΗ 77", "ΘΕΣΣΑΛΟΝΙΚΗ", "54622", "ΣΥΜΒ-2020-103", ""},
-        {"ΓΕΩΡΓΙΟΥ ΙΩΑΝΝΗΣ", "6981122334", "ΒΑΣ. ΣΟΦΙΑΣ 15", "ΓΛΥΦΑΔΑ", "16674", "ΣΥΜΒ-2023-009", "Π-211"},
-        {"ΣΤΑΥΡΟΥ ΑΙΚΑΤΕΡΙΝΗ", "2109988776", "ΕΡΜΟΥ 34", "ΠΕΡΙΣΤΕΡΙ", "12131", "ΣΥΜΒ-2018-055", ""},
-        {"ΧΡΙΣΤΟΔΟΥΛΟΥ ΠΑΝΑΓΙΩΤΗΣ", "6955667788", "ΜΕΣΟΓΕΙΩΝ 260", "ΧΟΛΑΡΓΟΣ", "15561", "ΣΥΜΒ-2021-072", "ΚΩΔ-88"},
-        {"ΒΛΑΧΟΥ ΣΟΦΙΑ", "6900112233", "ΑΓ.ΚΩΝΣΤΑΝΤΙΝΟΥ 8", "ΝΕΑ ΣΜΥΡΝΗ", "17121", "ΣΥΜΒ-2024-003", ""},
-        {"ΠΑΠΠΑΣ ΘΕΟΔΩΡΟΣ", "6912345098", "ΛΕΩΦ. ΣΥΓΓΡΟΥ 145", "ΚΑΛΛΙΘΕΑ", "17671", "ΣΥΜΒ-2022-118", "Π-305"},
-        {"ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ", "6977889900", "ΑΓΙΟΥ ΔΗΜΗΤΡΙΟΥ 22", "ΑΓ.ΔΗΜΗΤΡΙΟΣ", "17342", "ΣΥΜΒ-2020-066", ""},
-        {"ΚΑΡΑΓΙΑΝΝΗΣ ΝΙΚΟΛΑΟΣ", "6944556677", "ΑΙΓΑΙΟΥ ΠΕΛΑΓΟΥΣ 9", "ΝΕΟ ΨΥΧΙΚΟ", "15451", "ΣΥΜΒ-2023-051", "ΚΩΔ-19"},
-        {"ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ", "6933221144", "ΠΛΑΤΕΙΑΣ ΝΙΚΗΣ 5", "ΠΕΙΡΑΙΑΣ", "18531", "ΣΥΜΒ-2019-029", "Π-142"},
+        // Building 0 -- ΠΑΤΗΣΙΩΝ 205 (5)
+        {"ΠΑΠΑΔΟΠΟΥΛΟΣ ΓΕΩΡΓΙΟΣ",     "6944123456", "Π-104",  0, "Ισόγειο"},
+        {"ΑΝΑΣΤΑΣΙΟΥ ΔΗΜΗΤΡΙΟΣ",      "2106547890", "ΚΩΔ-77", 0, "Α1"},
+        {"ΣΤΑΥΡΟΥ ΑΙΚΑΤΕΡΙΝΗ",        "2109988776", "Π-118",  0, "Α2"},
+        {"ΓΕΩΡΓΙΟΥ ΙΩΑΝΝΗΣ",          "6981122334", "Π-211",  0, "Β1"},
+        {"ΜΑΚΡΗΣ ΕΛΕΥΘΕΡΙΟΣ",         "6970011223", "ΚΩΔ-31", 0, "Β2"},
+        // Building 1 -- ΚΗΦΙΣΙΑΣ 118 (3)
+        {"ΝΙΚΟΛΑΟΥ ΕΛΕΝΗ",            "6971234567", "Π-142",  1, "Α1"},
+        {"ΠΑΠΠΑΣ ΘΕΟΔΩΡΟΣ",           "6912345098", "Π-305",  1, "Α2"},
+        {"ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ",           "6977889900", "ΚΩΔ-52", 1, "Β1"},
+        // Building 2 -- ΤΣΙΜΙΣΚΗ 81 (4)
+        {"ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ ΜΑΡΙΑ",      "6932345678", "Π-167",  2, "Ισόγειο"},
+        {"ΧΡΙΣΤΟΔΟΥΛΟΥ ΠΑΝΑΓΙΩΤΗΣ",   "6955667788", "ΚΩΔ-88", 2, "1ος"},
+        {"ΒΛΑΧΟΥ ΣΟΦΙΑ",              "6900112233", "Π-290",  2, "2ος"},
+        {"ΟΙΚΟΝΟΜΟΥ ΒΑΣΙΛΕΙΟΣ",       "6936655443", "ΚΩΔ-64", 2, "3ος"},
+        // Building 3 -- ΑΙΓΑΙΟΥ 9 (4)
+        {"ΚΑΡΑΓΙΑΝΝΗΣ ΝΙΚΟΛΑΟΣ",       "6944556677", "ΚΩΔ-19", 3, "Α1"},
+        {"ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ",        "6933221144", "Π-402",  3, "Α2"},
+        {"ΑΝΤΩΝΙΟΥ ΧΡΗΣΤΟΣ",          "6948899001", "ΚΩΔ-95", 3, "Β1"},
+        {"ΠΕΤΡΟΥ ΔΗΜΗΤΡΑ",            "6922334455", "Π-377",  3, "Β2"},
     };
 
-    std::vector<int> uid; // parallel to seedUsers, filled in as we insert
     for (auto& su : seedUsers) {
         User u;
-        u.full_name = su.name; u.phone = su.phone; u.address = su.address;
-        u.area = su.area; u.postal_code = su.postal; u.contract_code = su.contract;
-        u.special_code = su.special;
+        u.full_name = su.name; u.phone = su.phone; u.special_code = su.special;
+        u.apartment_id = apartmentId[su.bldg][su.apt];
         db->addUser(u);
     }
+
+    std::vector<int> uid; // parallel to seedUsers, filled in by name lookup
     {
-        // Re-fetch everyone once, in insertion order (ids ascending since the table
-        // was empty), so we have real ids to work with for services/payments below.
-        auto all = db->searchUsers("", 0, 100);
+        auto all = db->searchUsers("", 0, 1000);
         for (auto& su : seedUsers) {
             int id = -1;
             for (auto& u : all) if (u.full_name == su.name) { id = u.id; break; }
             uid.push_back(id);
         }
     }
-    if ((int)uid.size() < 12 || uid[0] < 0) return; // sanity guard, shouldn't happen
+    if ((int)uid.size() < 16 || uid[0] < 0) return; // sanity guard, shouldn't happen
 
     // "Current" reference date for spreading past/future payments: 2026-09-06.
     std::vector<YM> pastMonths  = {{2026,2},{2026,3},{2026,4},{2026,5},{2026,6},{2026,7},{2026,8}};
@@ -68,22 +175,15 @@ void seedDemoDataIfEmpty(DataConn* db) {
     // -----------------------------------------------------------------
     struct SimpleSvc { int ownerIdx; int id; std::string label; double amount; };
     std::vector<SimpleSvc> simple;
+    std::map<std::string, int> idByLabel;
     {
-        struct Def { int ownerIdx; const char* label; const char* notes; double amount; };
-        std::vector<Def> defs = {
-            {0, "ΔΙΑΧΕΙΡΙΣΗ ΠΟΛΥΚΑΤΟΙΚΙΑΣ", "Μηνιαία αμοιβή διαχειριστή", 45.0},
-            {1, "ΚΑΘΑΡΙΟΤΗΤΑ ΚΟΙΝΟΧΡΗΣΤΩΝ", "Καθαρισμός κλιμακοστασίου", 60.0},
-            {3, "ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ", "Τακτικό service ανελκυστήρα", 75.0},
-            {6, "ΚΗΠΟΥΡΙΚΕΣ ΕΡΓΑΣΙΕΣ", "Φροντίδα κοινόχρηστου κήπου", 35.0},
-            {7, "ΑΠΕΝΤΟΜΩΣΗ", "Ετήσια απεντόμωση κτιρίου", 90.0},
-            {8, "ΕΛΕΓΧΟΣ ΠΥΡΟΣΒΕΣΤΗΡΩΝ", "Ετήσιος έλεγχος/αναγόμωση", 55.0},
-            {9, "ΚΑΘΑΡΙΣΜΟΣ ΤΖΑΜΙΩΝ", "Καθαρισμός εξωτερικών τζαμιών", 40.0},
-            {10, "ΣΥΝΤΗΡΗΣΗ ΚΗΠΟΥ ΠΡΟΣΟΨΗΣ", "Φύτευση/κλάδεμα", 50.0},
-        };
-        for (auto& d : defs) {
-            Service s; s.label = d.label; s.extra_notes = d.notes;
-            int sid = db->addServiceGetId(uid[d.ownerIdx], s);
-            if (sid >= 0) simple.push_back({d.ownerIdx, sid, d.label, d.amount});
+        int n = 0;
+        for (auto& c : kCatalog) {
+            int owner = (n * 5 + 2) % 16;   // spread over all 16 clients (5 is coprime with 16)
+            n++;
+            Service s; s.label = c.label; s.extra_notes = c.notes; s.suggested_price = c.amount;
+            int sid = db->addServiceGetId(-1, s);   // independent catalog service; clients are tied through payments
+            if (sid >= 0) { simple.push_back({owner, sid, c.label, c.amount}); idByLabel[c.label] = sid; }
         }
     }
 
@@ -93,21 +193,22 @@ void seedDemoDataIfEmpty(DataConn* db) {
     struct JointSvc { std::vector<int> ownerIdxs; int id; std::string label; double shareBase; };
     std::vector<JointSvc> joints;
     {
-        // Building A: owners 0,2,4,5 share heating oil.
-        Service heating; heating.label = "ΠΕΤΡΕΛΑΙΟ (ΚΟΙΝΟΧΡΗΣΤΟ) - ΚΤΙΡΙΟ Α";
+        // ΠΑΤΗΣΙΩΝ 205: all five residents share the building's heating oil.
+        Service heating; heating.label = "ΘΕΡΜΑΝΣΗ – ΠΡΟΜΗΘΕΙΑ ΠΕΤΡΕΛΑΙΟΥ - ΠΑΤΗΣΙΩΝ 205";
+        heating.suggested_price = 300.0;
         heating.extra_notes = "Κοινή παραγγελία πετρελαίου θέρμανσης, μοιρασμένη ανά χιλιοστά.";
-        std::vector<int> ownersA = {0, 2, 4, 5};
+        std::vector<int> ownersA = {0, 1, 2, 3, 4};
         int hid = db->addServiceGetId(uid[ownersA[0]], heating);
         if (hid >= 0) {
             for (size_t i = 1; i < ownersA.size(); ++i) db->addServiceUser(hid, uid[ownersA[i]]);
             joints.push_back({ownersA, hid, heating.label, 300.0});
         }
 
-        // Building B: owners 1,3,6,8,9 share building insurance (overlapping subset,
-        // not identical to the heating-oil group).
-        Service insurance; insurance.label = "ΑΣΦΑΛΙΣΗ ΚΤΙΡΙΟΥ - ΚΤΙΡΙΟ Β";
+        // ΤΣΙΜΙΣΚΗ 81: its four residents share the building insurance.
+        Service insurance; insurance.label = "ΑΣΦΑΛΕΙΑ ΑΣΤΙΚΗΣ ΕΥΘΥΝΗΣ ΚΤΙΡΙΟΥ - ΤΣΙΜΙΣΚΗ 81";
+        insurance.suggested_price = 180.0;
         insurance.extra_notes = "Ετήσιο ασφαλιστήριο συμβόλαιο κτιρίου, μοιρασμένο ανά διαμέρισμα.";
-        std::vector<int> ownersB = {1, 3, 6, 8, 9};
+        std::vector<int> ownersB = {8, 9, 10, 11};
         int iid = db->addServiceGetId(uid[ownersB[0]], insurance);
         if (iid >= 0) {
             for (size_t i = 1; i < ownersB.size(); ++i) db->addServiceUser(iid, uid[ownersB[i]]);
@@ -116,21 +217,24 @@ void seedDemoDataIfEmpty(DataConn* db) {
     }
 
     // -----------------------------------------------------------------
-    // Master/package services -- at least 2, grouping 2-3 real components each.
+    // Packages: one per category (its unique services as components), plus the
+    // site's BASIC / ALL IN ONE / FULL PACK bundles.
     // -----------------------------------------------------------------
     {
-        int pkg1 = db->addMasterService("Πακέτο Συντήρησης Πολυκατοικίας");
-        if (pkg1 >= 0) {
-            // ΔΙΑΧΕΙΡΙΣΗ (simple[0]), ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ (simple[2]), ΚΑΘΑΡΙΟΤΗΤΑ (simple[1])
-            if (simple.size() > 0) db->addMasterServiceComponent(pkg1, simple[0].id);
-            if (simple.size() > 2) db->addMasterServiceComponent(pkg1, simple[2].id);
-            if (simple.size() > 1) db->addMasterServiceComponent(pkg1, simple[1].id);
+        std::vector<int> pkgId;
+        for (auto name : kPackages) pkgId.push_back(db->addMasterService(name));
+        for (auto& c : kCatalog) {
+            auto it = idByLabel.find(c.label);
+            if (it != idByLabel.end() && pkgId[c.pkg] >= 0) db->addMasterServiceComponent(pkgId[c.pkg], it->second);
         }
-        int pkg2 = db->addMasterService("Πακέτο Ασφάλισης & Πυροπροστασίας");
-        if (pkg2 >= 0) {
-            // ΑΣΦΑΛΙΣΗ ΚΤΙΡΙΟΥ (joint[1]), ΕΛΕΓΧΟΣ ΠΥΡΟΣΒΕΣΤΗΡΩΝ (simple[5])
-            if (joints.size() > 1) db->addMasterServiceComponent(pkg2, joints[1].id);
-            if (simple.size() > 5) db->addMasterServiceComponent(pkg2, simple[5].id);
+        if (!joints.empty() && pkgId[2] >= 0) db->addMasterServiceComponent(pkgId[2], joints[0].id); // heating oil
+        for (auto& b : kBundles) {
+            int mid = db->addMasterService(b.name);
+            if (mid < 0) continue;
+            for (auto part : b.parts) {
+                auto it = idByLabel.find(part);
+                if (it != idByLabel.end()) db->addMasterServiceComponent(mid, it->second);
+            }
         }
     }
 
@@ -152,7 +256,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
             p.status = "paid";
             p.direction = (si % 5 == 0) ? "out" : "in"; // most are collections, a few manager-paid-forward
             p.notes = (i == 0) ? "Τακτική εξόφληση" : "";
-            db->addPayment(p); payTotal++;
+            SeedAddPayment(db, p); payTotal++;
         }
         // one future scheduled payment for most services
         if (si % 4 != 3) {
@@ -167,7 +271,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
             p.direction = (si % 5 == 0) ? "out" : "in";
             p.resolution_date = "2026-1" + std::to_string(1 + (int)(si % 2)) + "-1" + std::to_string(1 + (int)(si % 8));
             p.notes = "";
-            db->addPayment(p); payTotal++;
+            SeedAddPayment(db, p); payTotal++;
         }
     }
 
@@ -193,7 +297,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
             paid.status = "paid";
             paid.direction = (ji == 0) ? "out" : "in"; // heating oil: manager fronts it; insurance: collected directly
             paid.notes = "Μερίδιο " + j.label;
-            db->addPayment(paid); payTotal++;
+            SeedAddPayment(db, paid); payTotal++;
 
             // For the heating-oil (direction=out) service, add a matching "in" collection
             // row for about half the owners so the net trends toward zero for some.
@@ -208,7 +312,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
                 collect.status = "paid";
                 collect.direction = "in";
                 collect.notes = "Είσπραξη μεριδίου πετρελαίου";
-                db->addPayment(collect); payTotal++;
+                SeedAddPayment(db, collect); payTotal++;
             }
 
             // One future installment per owner for the first joint service
@@ -224,7 +328,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
                 fut.direction = "out";
                 fut.resolution_date = "2026-12-2" + std::to_string(1 + (oi % 8));
                 fut.notes = "Επιπλέον δόση πετρελαίου";
-                db->addPayment(fut); payTotal++;
+                SeedAddPayment(db, fut); payTotal++;
             }
         }
     }
@@ -241,7 +345,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
         p.amount_due = 45.0; p.amount_paid = 45.0; p.balance = 0.0;
         p.status = "paid"; p.direction = "in";
         p.notes = "Εξόφληση μέσω πακέτου συντήρησης";
-        db->addPayment(p); payTotal++;
+        SeedAddPayment(db, p); payTotal++;
     }
     if (joints.size() > 1) {
         Payment p;
@@ -252,7 +356,7 @@ void seedDemoDataIfEmpty(DataConn* db) {
         p.status = "future"; p.direction = "in";
         p.resolution_date = "2027-01-05";
         p.notes = "Ανανέωση ασφαλιστηρίου";
-        db->addPayment(p); payTotal++;
+        SeedAddPayment(db, p); payTotal++;
     }
 
     // Extra scattered payments so we comfortably clear 40-60 total and vary
@@ -270,7 +374,108 @@ void seedDemoDataIfEmpty(DataConn* db) {
         p.status = "paid";
         p.direction = (k % 3 == 0) ? "out" : "in";
         p.notes = "";
-        db->addPayment(p); payTotal++;
+        SeedAddPayment(db, p); payTotal++;
+    }
+
+    // -----------------------------------------------------------------
+    // Package purchases: some clients bought a WHOLE package, others only PARTS of
+    // it (2, 3, 4 ... services, not just one), so the Πακέτα screen has every case.
+    // Every purchase is a normal standalone payment (client + service); nothing links
+    // it to the package. {package, client, how many of its services}; a count equal to
+    // the package's size = whole package. Components are rotated per client so the same
+    // services are not always the ones chosen.
+    // -----------------------------------------------------------------
+    {
+        struct Buy { int pkg, client, count; };
+        const std::vector<Buy> plan = {
+            // ΠΥΡΟΣΒΕΣΤΗΡΑΣ (4)
+            {0, 3, 4}, {0, 7, 4}, {0, 5, 3}, {0, 11, 2}, {0, 14, 2},
+            // ΔΙΑΧΕΙΡΙΣΗ ΠΟΛΥΚΑΤΟΙΚΙΑΣ (6)
+            {1, 0, 6}, {1, 9, 6}, {1, 4, 5}, {1, 12, 4}, {1, 6, 3}, {1, 13, 3}, {1, 15, 2},
+            // ΘΕΡΜΑΝΣΗ (3, incl. the shared oil the ΠΑΤΗΣΙΩΝ 205 residents already pay)
+            {2, 0, 2}, {2, 1, 2}, {2, 2, 1},
+            // ΚΑΥΣΤΗΡΑΣ – ΛΕΒΗΤΑΣ (4)
+            {3, 5, 4}, {3, 8, 3}, {3, 10, 2}, {3, 2, 2},
+            // ΑΠΟΛΥΜΑΝΣΗ – ΑΠΕΝΤΟΜΩΣΗ (3)
+            {4, 6, 3}, {4, 12, 3}, {4, 1, 2}, {4, 9, 2},
+            // ΑΠΟΦΡΑΞΕΙΣ (3)
+            {5, 8, 3}, {5, 3, 2}, {5, 14, 2},
+            // ΣΥΝΕΡΓΕΙΑ ΚΑΘΑΡΙΟΤΗΤΑΣ (3)
+            {6, 1, 3}, {6, 10, 3}, {6, 7, 2},
+        };
+        int seq = 0;
+        for (auto& b : plan) {
+            std::vector<const CatSvc*> comps;
+            for (auto& c : kCatalog) if (c.pkg == b.pkg) comps.push_back(&c);
+            int M = (int)comps.size();
+            for (int k = 0; k < b.count && k < M; ++k) {
+                const CatSvc* c = comps[(k + b.client) % M];
+                auto it = idByLabel.find(c->label);
+                if (it == idByLabel.end()) continue;
+                bool fut = (seq % 5 == 4);
+                YM ym = fut ? futureMonths[seq % futureMonths.size()] : pastMonths[(seq + b.client) % pastMonths.size()];
+                Payment p;
+                p.service_id = it->second; p.user_id = uid[b.client];
+                p.year = ym.y; p.month = ym.m; p.day = 2 + (seq * 3 + b.client) % 26;
+                p.amount_due = c->amount;
+                p.amount_paid = fut ? 0.0 : c->amount;
+                p.balance = p.amount_due - p.amount_paid;
+                p.status = fut ? "future" : "paid";
+                p.direction = "in";
+                if (fut) p.resolution_date = "2026-12-1" + std::to_string(1 + seq % 8);
+                p.notes = std::string("Πακέτο: ") + kPackages[b.pkg];
+                SeedAddPayment(db, p); payTotal++;
+                seq++;
+            }
+        }
+    }
+
+    // Whole BASIC / FULL PACK bundles bought by a few clients (the category packages
+    // above already give partial buyers of the bundles through their overlap).
+    {
+        struct BundleBuy { size_t bundle; int client; };
+        const std::vector<BundleBuy> bplan = { {0, 4}, {0, 13}, {2, 2}, {2, 9} };
+        int bseq = 0;
+        for (auto& bb : bplan) {
+            for (auto part : kBundles[bb.bundle].parts) {
+                auto it = idByLabel.find(part);
+                if (it == idByLabel.end()) continue;
+                double amount = 0.0;
+                for (auto& c : kCatalog) if (std::string(c.label) == part) amount = c.amount;
+                YM ym = pastMonths[(bseq + bb.client) % pastMonths.size()];
+                Payment p;
+                p.service_id = it->second; p.user_id = uid[bb.client];
+                p.year = ym.y; p.month = ym.m; p.day = 4 + (bseq * 2 + bb.client) % 24;
+                p.amount_due = amount; p.amount_paid = amount; p.balance = 0.0;
+                p.status = "paid"; p.direction = "in";
+                p.notes = std::string("Πακέτο: ") + kBundles[bb.bundle].name;
+                SeedAddPayment(db, p); payTotal++;
+                bseq++;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Apartment history. Everybody has lived in their apartment since January; four clients
+    // moved during the year, so some apartments have had SEVERAL tenants and a few are empty
+    // now. The payments' apartment snapshots are re-derived from these dates.
+    // -----------------------------------------------------------------
+    {
+        auto aptOf = [&](int b, const char* label) { return apartmentId[b][label]; };
+        auto stay = [&](int user, int apt, const char* from, const char* to) {
+            Residency r; r.user_id = user; r.apartment_id = apt; r.from_date = from; r.to_date = to; return r; };
+        for (size_t i = 0; i < seedUsers.size(); ++i) {
+            std::vector<Residency> h;
+            const std::string name = seedUsers[i].name;
+            const int nowApt = aptOf(seedUsers[i].bldg, seedUsers[i].apt);
+            const char* from = "2026-01-01";
+            if (name == "ΒΛΑΧΟΥ ΣΟΦΙΑ")            { h.push_back(stay(uid[i], aptOf(2, "4ος"), "2026-01-01", "2026-02-28")); from = "2026-03-01"; }
+            if (name == "ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ ΜΑΡΙΑ")    { h.push_back(stay(uid[i], aptOf(2, "4ος"), "2026-03-01", "2026-05-31")); from = "2026-06-01"; }
+            if (name == "ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ")         { h.push_back(stay(uid[i], aptOf(1, "Β2"),  "2026-01-01", "2026-04-30")); from = "2026-05-01"; }
+            if (name == "ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ")     { h.push_back(stay(uid[i], aptOf(3, "Γ1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
+            h.push_back(stay(uid[i], nowApt, from, ""));
+            db->setResidencyHistory(uid[i], h);
+        }
     }
 
     // Notes: deliberately NOT seeded -- the client wants the Notes tab to start
