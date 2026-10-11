@@ -3,6 +3,9 @@
 #include <sqlite3.h>
 #include <string>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 class SqliteConn : public DataConn {
 private:
@@ -22,6 +25,11 @@ private:
     // missing or altered (tampering signal once they have been installed).
     int ensureAuditTriggers();
     void writeAuditAnchor();
+    // background full integrity check (own read-only connection), reported via takeLastError()
+    std::thread bgVerify_;
+    std::atomic<sqlite3*> bgDb_{nullptr};
+    std::mutex bgMutex_;
+    std::string bgMessage_;
 
 public:
     std::string auditActor_;     // read by the app_actor() SQL function
@@ -147,6 +155,12 @@ public:
     std::vector<Receipt> getReceiptsForUser(int userId) override;
     std::vector<int> getReceiptPaymentIds(int receiptId) override;
     int getReceiptIdForPayment(int paymentId) override;
+
+    std::vector<Payment> findPayments(const PaymentFilter& f, PayOrder order, int offset, int limit) override;
+    long long countPaymentsWhere(const PaymentFilter& f) override;
+    MoneyTotals paymentTotals(const PaymentFilter& f) override;
+    std::vector<GroupedTotals> paymentTotalsBy(PayGroup group, const PaymentFilter& f) override;
+    long long dataVersion() override { return (long long)sqlite3_total_changes64(db); }
 
     // Paged phone-book pickers (dashboard filters) -- see DataConn.h for contract.
     std::vector<User> pickerUsers(const std::vector<std::string>& letters,

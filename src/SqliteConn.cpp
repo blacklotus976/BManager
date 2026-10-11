@@ -3,6 +3,7 @@
 #include "Money.h"
 #include "Rf.h"
 #include "Sha256.h"
+#include "TextFold.h"
 #include <map>
 #include <set>
 #include <cstdlib>
@@ -149,6 +150,9 @@ static const char* kAuditedTables[] = {
     "master_service_components", "payment_batches", "payments", "receipts", "notes",
 };
 
+static DataConn::AuditCheck VerifyAudit(sqlite3* db, const std::string& dbPath);
+static std::string QuickAuditCheck(sqlite3* db, const std::string& dbPath);
+
 static int UserVersion(sqlite3* db) {
     int v = 0; sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &st, nullptr) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
@@ -163,7 +167,11 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
         return;
     }
-    registerSqlFunctions();   // audit_hash / app_actor / app_reason -- the audit triggers need them
+    registerSqlFunctions();   // audit_hash / app_actor / app_reason / fold -- the triggers and searches need them
+    // WAL: a reader (the background integrity check) never blocks the app's writes, and a crash mid-write
+    // can't corrupt the file. busy_timeout: wait briefly instead of failing if the file is momentarily locked.
+    executeQuery("PRAGMA journal_mode=WAL;");
+    sqlite3_busy_timeout(db, 5000);
     const int versionAtOpen = UserVersion(db);
 
     // Create tables if not exist
@@ -857,6 +865,17 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (!executeQuery("COMMIT;")) { executeQuery("ROLLBACK;"); std::cerr << "migration v7 failed\n"; }
     }
 
+
+    // --- Migration v8: the date index also carries the amounts, so per-day / per-period totals (dashboard,
+    // reports) read the index in date order instead of sorting the table: 2.2 s -> 0.46 s at 1M payments. ---
+    if (UserVersion(db) < 8) {
+        executeQuery("BEGIN;"
+                     "DROP INDEX IF EXISTS idx_payments_date;"
+                     "CREATE INDEX idx_payments_date ON payments(pay_date, status, direction, amount_due, amount_paid, balance);"
+                     "PRAGMA user_version = 8;"
+                     "COMMIT;");
+    }
+
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
     // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
     {
@@ -867,10 +886,27 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
             lastError_ = "Ο μηχανισμός καταγραφής ιστορικού είχε αφαιρεθεί ή αλλοιωθεί και αποκαταστάθηκε (" +
                          std::to_string(restored) + "). Ελέγξτε το ιστορικό αλλαγών.";
         }
-        AuditCheck chk = verifyAuditLog();
-        if (!chk.ok) lastError_ = "Έλεγχος ακεραιότητας ιστορικού: " + chk.problems.front() +
-                                  (chk.problems.size() > 1 ? " (+" + std::to_string(chk.problems.size() - 1) + " ακόμη)" : "");
+        // Startup stays fast at any size: the chain since the last daily checkpoint is verified now; the full
+        // check (every entry + every live row) runs on its own read-only connection in the background and
+        // reports through the same error banner when it finds something.
+        std::string quick = QuickAuditCheck(db, dbPath_);
+        if (!quick.empty()) lastError_ = "Έλεγχος ακεραιότητας ιστορικού: " + quick;
         writeAuditAnchor();
+        std::string pathCopy = dbPath_;
+        bgVerify_ = std::thread([this, pathCopy] {
+            sqlite3* ro = nullptr;
+            if (sqlite3_open_v2(pathCopy.c_str(), &ro, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) { sqlite3_close(ro); return; }
+            sqlite3_busy_timeout(ro, 5000);
+            bgDb_.store(ro);
+            AuditCheck chk = VerifyAudit(ro, pathCopy);
+            bgDb_.store(nullptr);
+            sqlite3_close(ro);
+            if (!chk.ok) {
+                std::lock_guard<std::mutex> lk(bgMutex_);
+                bgMessage_ = "Έλεγχος ακεραιότητας ιστορικού: " + chk.problems.front() +
+                             (chk.problems.size() > 1 ? " (+" + std::to_string(chk.problems.size() - 1) + " ακόμη)" : "");
+            }
+        });
     }
 
     greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
@@ -887,7 +923,11 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
     greekHeaders["notes"] = {"ΚΩΔ", "ΤΙΤΛΟΣ", "ΠΕΡΙΕΧΟΜΕΝΟ", "ΗΜ/ΝΙΑ ΔΗΜ."};
 }
 
-SqliteConn::~SqliteConn() { if(db) sqlite3_close(db); }
+SqliteConn::~SqliteConn() {
+    if (sqlite3* ro = bgDb_.load()) sqlite3_interrupt(ro);     // stop a background check still running
+    if (bgVerify_.joinable()) bgVerify_.join();
+    if (db) sqlite3_close(db);
+}
 
 double SqliteConn::priceOf(int serviceId) {
     sqlite3_stmt* st = nullptr; double v = 0.0;
@@ -1272,7 +1312,11 @@ std::vector<Payment> SqliteConn::getPaymentsForApartment(int apartmentId) {
     return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM payments p WHERE p.apartment_id = ? ORDER BY p.pay_date, p.id", {apartmentId});
 }
 
-std::string SqliteConn::takeLastError() { std::string e; e.swap(lastError_); return e; }
+std::string SqliteConn::takeLastError() {
+    std::string e; e.swap(lastError_);
+    if (e.empty()) { std::lock_guard<std::mutex> lk(bgMutex_); e.swap(bgMessage_); }
+    return e;
+}
 
 void SqliteConn::autoBackup(int keep) {
     namespace fs = std::filesystem;
@@ -2648,6 +2692,11 @@ static void SqlAuditHash(sqlite3_context* ctx, int, sqlite3_value** argv) {
     std::string h = Sha256Hex(t ? std::string((const char*)t, sqlite3_value_bytes(argv[0])) : std::string());
     sqlite3_result_text(ctx, h.c_str(), -1, SQLITE_TRANSIENT);
 }
+static void SqlFold(sqlite3_context* ctx, int, sqlite3_value** argv) {
+    const unsigned char* t = sqlite3_value_text(argv[0]);
+    std::string f = FoldGreek(t ? (const char*)t : "");
+    sqlite3_result_text(ctx, f.c_str(), (int)f.size(), SQLITE_TRANSIENT);
+}
 static void SqlAppActor(sqlite3_context* ctx, int, sqlite3_value**) {
     auto* self = static_cast<SqliteConn*>(sqlite3_user_data(ctx));
     sqlite3_result_text(ctx, self->auditActor_.c_str(), -1, SQLITE_TRANSIENT);
@@ -2670,6 +2719,7 @@ static std::string DefaultActor() {
 void SqliteConn::registerSqlFunctions() {
     if (auditActor_.empty()) auditActor_ = DefaultActor();
     sqlite3_create_function_v2(db, "audit_hash", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr, SqlAuditHash, nullptr, nullptr, nullptr);
+    sqlite3_create_function_v2(db, "fold", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr, SqlFold, nullptr, nullptr, nullptr);
     sqlite3_create_function_v2(db, "app_actor", 0, SQLITE_UTF8, this, SqlAppActor, nullptr, nullptr, nullptr);
     sqlite3_create_function_v2(db, "app_reason", 0, SQLITE_UTF8, this, SqlAppReason, nullptr, nullptr, nullptr);
 }
@@ -2765,8 +2815,11 @@ void SqliteConn::writeAuditAnchor() {
     } catch (const std::exception&) {}
 }
 
-DataConn::AuditCheck SqliteConn::verifyAuditLog() {
-    AuditCheck r;
+DataConn::AuditCheck SqliteConn::verifyAuditLog() { return VerifyAudit(db, dbPath_); }
+
+// Full integrity check on any connection (the app's own, or a read-only one in a background thread).
+static DataConn::AuditCheck VerifyAudit(sqlite3* db, const std::string& dbPath_) {
+    DataConn::AuditCheck r;
     auto problem = [&](const std::string& p) { r.ok = false; if (r.problems.size() < 50) r.problems.push_back(p); };
 
     // 1. triggers present and exactly as installed
@@ -2836,4 +2889,172 @@ DataConn::AuditCheck SqliteConn::verifyAuditLog() {
         if (have != hash) problem("Το σημείο ελέγχου της " + date + " (εγγραφή #" + std::to_string(id) + ") δεν ταιριάζει με το ιστορικό");
     }
     return r;
+}
+
+// --- PAYMENT QUERIES & TOTALS IN SQL -----------------------------------------------------------------
+namespace {
+struct Bind { bool text; std::string s; double d; };
+
+// WHERE clause for a PaymentFilter over "payments p" (+ the joins it needs). Binds are kept in one ordered
+// list next to their placeholders, so they can never get out of step.
+struct PayWhere {
+    std::string joins, where = " WHERE 1=1";
+    std::vector<Bind> binds;
+    void text(const std::string& clause, const std::string& v) { where += clause; binds.push_back({true, v, 0}); }
+    void num(const std::string& clause, double v) { where += clause; binds.push_back({false, "", v}); }
+};
+
+PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
+    PayWhere w;
+    if (!f.fromDate.empty()) w.text(" AND p.pay_date >= ?", f.fromDate);
+    if (!f.toDate.empty())   w.text(" AND p.pay_date <= ?", f.toDate);
+    if (f.userId >= 0)       w.num(" AND p.user_id = ?", f.userId);
+    if (f.serviceId >= 0)    w.num(" AND p.service_id = ?", f.serviceId);
+    if (f.apartmentId >= 0)  w.num(" AND p.apartment_id = ?", f.apartmentId);
+    if (f.direction == "in" || f.direction == "out") w.text(" AND p.direction = ?", f.direction);
+    if (f.status == 1) w.where += " AND p.status != 'future'";
+    if (f.status == 2) w.where += " AND p.status = 'future'";
+    if (f.owed == 1) w.where += " AND p.status != 'future' AND p.balance <= 0.005";
+    if (f.owed == 2) w.where += " AND p.status != 'future' AND p.balance > 0.005";
+    if (f.minDue > 0) w.num(" AND p.amount_due >= ?", f.minDue);
+    if (f.maxDue > 0) w.num(" AND p.amount_due <= ?", f.maxDue);
+    bool needNames = !f.text.empty() || !f.clientText.empty() || !f.serviceText.empty() || !f.buildingText.empty();
+    if (needNames)
+        w.joins = " LEFT JOIN users u ON u.id = p.user_id LEFT JOIN services s ON s.id = p.service_id"
+                  " LEFT JOIN apartments ua ON ua.id = u.apartment_id LEFT JOIN buildings ub ON ub.id = ua.building_id";
+    auto has = [&](const std::string& expr, const std::string& needle) {
+        if (!needle.empty()) w.text(" AND instr(fold(" + expr + "), fold(?)) > 0", needle);
+    };
+    has("COALESCE(u.full_name,'') || ' ' || COALESCE(s.label,'') || ' ' || COALESCE(p.notes,'') || ' ' || p.status || ' ' || p.pay_date || ' ' || COALESCE(ub.address,'')", f.text);
+    has("COALESCE(u.full_name,'')", f.clientText);
+    has("COALESCE(s.label,'')", f.serviceText);
+    has("COALESCE(p.notes,'')", f.notesText);
+    has("COALESCE(ub.address,'')", f.buildingText);
+    return w;
+}
+
+void BindAll(sqlite3_stmt* st, const std::vector<Bind>& binds, int first = 1) {
+    int i = first;
+    for (auto& b : binds) {
+        if (b.text) sqlite3_bind_text(st, i++, b.s.c_str(), -1, SQLITE_TRANSIENT);
+        else if (b.d == (double)(long long)b.d) sqlite3_bind_int64(st, i++, (long long)b.d);
+        else sqlite3_bind_double(st, i++, b.d);
+    }
+}
+
+// cents of an amount column
+std::string C(const std::string& col) { return "CAST(ROUND(" + col + " * 100) AS INTEGER)"; }
+
+const std::string kTotalsCols =
+    "COUNT(*), "
+    "TOTAL(CASE WHEN p.status != 'future' AND p.direction = 'in'  THEN " + C("p.amount_paid") + " END), "
+    "TOTAL(CASE WHEN p.status != 'future' AND p.direction = 'out' THEN " + C("p.amount_paid") + " END), "
+    "TOTAL(CASE WHEN p.status != 'future' AND p.direction = 'in'  AND p.balance > 0.005 THEN " + C("p.balance") + " END), "
+    "TOTAL(CASE WHEN p.status != 'future' AND p.direction = 'out' AND p.balance > 0.005 THEN " + C("p.balance") + " END), "
+    "TOTAL(CASE WHEN p.status  = 'future' AND p.direction = 'in'  THEN " + C("p.amount_due") + " END), "
+    "TOTAL(CASE WHEN p.status  = 'future' AND p.direction = 'out' THEN " + C("p.amount_due") + " END), "
+    "TOTAL(" + C("p.amount_due") + "), TOTAL(" + C("p.amount_paid") + ")";
+
+DataConn::MoneyTotals ReadTotals(sqlite3_stmt* st, int c0) {
+    DataConn::MoneyTotals t;
+    auto e = [&](int c) { return FromCents((long long)sqlite3_column_double(st, c)); };
+    t.count = sqlite3_column_int64(st, c0);
+    t.collected = e(c0 + 1); t.paidOut = e(c0 + 2); t.owedIn = e(c0 + 3); t.owedOut = e(c0 + 4);
+    t.futureIn = e(c0 + 5); t.futureOut = e(c0 + 6); t.dueAll = e(c0 + 7); t.paidAll = e(c0 + 8);
+    return t;
+}
+} // namespace
+
+std::vector<Payment> SqliteConn::findPayments(const PaymentFilter& f, PayOrder order, int offset, int limit) {
+    PayWhere w = BuildPayWhere(f);
+    const char* ord = order == PayOrder::DateAsc ? " ORDER BY p.pay_date, p.id"
+                    : order == PayOrder::ResolutionDesc ? " ORDER BY p.resolution_date DESC, p.id DESC"
+                    : " ORDER BY p.pay_date DESC, p.id DESC";
+    std::string sql = std::string("SELECT ") + kPaymentCols + " FROM payments p" + w.joins + w.where + ord + " LIMIT ? OFFSET ?";
+    std::vector<Payment> out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    BindAll(st, w.binds);
+    sqlite3_bind_int(st, (int)w.binds.size() + 1, limit);
+    sqlite3_bind_int(st, (int)w.binds.size() + 2, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadPayment(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
+long long SqliteConn::countPaymentsWhere(const PaymentFilter& f) {
+    return paymentTotals(f).count;
+}
+
+DataConn::MoneyTotals SqliteConn::paymentTotals(const PaymentFilter& f) {
+    PayWhere w = BuildPayWhere(f);
+    std::string sql = "SELECT " + kTotalsCols + " FROM payments p" + w.joins + w.where;
+    MoneyTotals t;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return t; }
+    BindAll(st, w.binds);
+    if (sqlite3_step(st) == SQLITE_ROW) t = ReadTotals(st, 0);
+    sqlite3_finalize(st);
+    return t;
+}
+
+std::vector<DataConn::GroupedTotals> SqliteConn::paymentTotalsBy(PayGroup group, const PaymentFilter& f) {
+    PayWhere w = BuildPayWhere(f);
+    std::string key = group == PayGroup::User ? "COALESCE(p.user_id,-1)"
+                    : group == PayGroup::Service ? "p.service_id"
+                    : group == PayGroup::Apartment ? "COALESCE(p.apartment_id,-1)"
+                    : group == PayGroup::Day ? "p.pay_date"
+                    : "COALESCE(p.user_id,-1) || '|' || p.service_id";
+    // group by the real columns (not the text key) so SQLite can stream an index instead of sorting
+    std::string groupCols = group == PayGroup::User ? "p.user_id" : group == PayGroup::Service ? "p.service_id"
+                          : group == PayGroup::Apartment ? "p.apartment_id" : group == PayGroup::Day ? "p.pay_date"
+                          : "p.user_id, p.service_id";
+    std::string sql = "SELECT " + key + ", " + kTotalsCols + " FROM payments p" + w.joins + w.where + " GROUP BY " + groupCols;
+    std::vector<GroupedTotals> out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    BindAll(st, w.binds);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char* k = sqlite3_column_text(st, 0);
+        out.push_back({k ? (const char*)k : "", ReadTotals(st, 1)});
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+// Fast startup check: the newest daily checkpoint still matches, and every entry after it chains correctly.
+// O(entries since the last checkpoint). Returns "" when fine, else the problem.
+static std::string QuickAuditCheck(sqlite3* db, const std::string& dbPath) {
+    namespace fs = std::filesystem;
+    long long fromId = 0; std::string fromHash, lastLine;
+    {
+        std::ifstream in(fs::path(dbPath).parent_path() / "backups" / (fs::path(dbPath).stem().string() + "_audit_anchor.txt"));
+        std::string date, hash; long long id = 0;
+        while (in >> date >> id >> hash) { fromId = id; fromHash = hash; }
+    }
+    sqlite3_stmt* st = nullptr;
+    if (fromId > 0) {
+        sqlite3_prepare_v2(db, "SELECT hash FROM audit_log WHERE id = ?", -1, &st, nullptr);
+        sqlite3_bind_int64(st, 1, fromId);
+        std::string have;
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) have = (const char*)sqlite3_column_text(st, 0);
+        sqlite3_finalize(st);
+        if (have != fromHash) return "το τελευταίο σημείο ελέγχου (εγγραφή #" + std::to_string(fromId) + ") δεν ταιριάζει";
+    }
+    sqlite3_prepare_v2(db, "SELECT id, changed_at, actor, table_name, record_id, action_type, old_data, new_data, reason, category, "
+                           "prev_hash, hash FROM audit_log WHERE id > ? ORDER BY id", -1, &st, nullptr);
+    sqlite3_bind_int64(st, 1, fromId);
+    auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
+    std::string prev = fromHash, problem;
+    bool first = true;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        std::string id = txt(0);
+        if (first && fromId == 0) prev = txt(10);           // no checkpoint yet: start from the first row's own prev
+        first = false;
+        std::string expect = Sha256Hex(AuditCanonical(prev, id, txt(1), txt(2), txt(3), txt(4), txt(5), txt(6), txt(7), txt(8), txt(9)));
+        if (txt(10) != prev || txt(11) != expect) { problem = "η αλυσίδα του ιστορικού σπάει στην εγγραφή #" + id; break; }
+        prev = txt(11);
+    }
+    sqlite3_finalize(st);
+    return problem;
 }

@@ -115,3 +115,5 @@ Desktop.ini
 .DS_Store
 build-linux/
 third_party/imgui/
+build-dbg/
+build-asan/

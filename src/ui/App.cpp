@@ -14,6 +14,7 @@
 #include "models/Note.h"
 #include "Config.h"
 #include "Money.h"
+#include "TextFold.h"
 #include "Seed.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -33,6 +34,7 @@
 #include <string>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -304,30 +306,50 @@ struct AppState {
     DataConn* conn = nullptr;
     std::string dbPath;
 
-    // cached lists (reloaded on demand)
+    // cached lists (reloaded on demand). Payments are NOT held in memory: screens ask the database
+    // for exactly the rows/totals they show (findPayments / paymentTotals / paymentTotalsBy).
     std::vector<User> users;
     std::vector<Service> services;
-    std::vector<Payment> payments;
     std::vector<DataConn::JointServiceSummary> jointServices;
     std::vector<Note> notes;
+    std::unordered_map<int, size_t> userIdx, serviceIdx;   // id -> position, for O(1) name lookups
+    long long reloadGen = 0;                               // bumped by reloadAll(): forces cached views to recompute
 
-    void reloadUsers() { users = conn->searchUsers("", 0, 5000); }
-    void reloadServices() { services = conn->searchServices("", 0, 5000); }
-    void reloadPayments() { payments = conn->getAllPayments(); }
+    void reloadUsers() {
+        users = conn->searchUsers("", 0, 1 << 30);          // all clients (was capped at 5000)
+        userIdx.clear(); for (size_t i = 0; i < users.size(); i++) userIdx[users[i].id] = i;
+    }
+    void reloadServices() {
+        services = conn->searchServices("", 0, 1 << 30);
+        serviceIdx.clear(); for (size_t i = 0; i < services.size(); i++) serviceIdx[services[i].id] = i;
+    }
     void reloadJoint() { jointServices = conn->getJointServices(); }
     void reloadNotes() { notes = conn->getAllNotes(); }
-    void reloadAll() { reloadUsers(); reloadServices(); reloadPayments(); reloadJoint(); reloadNotes(); }
+    void reloadAll() { reloadUsers(); reloadServices(); reloadJoint(); reloadNotes(); reloadGen++; }
 
+    const User* user(int id) const { auto it = userIdx.find(id); return it == userIdx.end() ? nullptr : &users[it->second]; }
     std::string userName(int id) const {
-        for (auto& u : users) if (u.id == id) return u.full_name;
-        return "#" + std::to_string(id);
+        const User* u = user(id);
+        return u ? u->full_name : "#" + std::to_string(id);
     }
     std::string serviceLabel(int id) const {
-        for (auto& s : services) if (s.id == id) return s.label;
-        return "#" + std::to_string(id);
+        auto it = serviceIdx.find(id);
+        return it == serviceIdx.end() ? "#" + std::to_string(id) : services[it->second].label;
     }
 };
 static AppState g_app;
+
+// A value computed from the database that is recomputed only when the data changed (any write on the
+// connection), the caller's key changed (filters, selection), or the user pressed a refresh button.
+// Wrap every screen's heavy computation in one of these: an unchanged screen then costs nothing per frame.
+template <class T> struct Cached {
+    long long ver = -1; std::string key; T val{};
+    template <class F> const T& get(const std::string& k, F&& compute) {
+        long long v = g_app.conn->dataVersion() * 1000003 + g_app.reloadGen;
+        if (v != ver || k != key) { val = compute(); ver = v; key = k; }
+        return val;
+    }
+};
 
 // Forward declaration -- StatTile is defined further down but DrawBuildingsScreen
 // (defined above it) needs it.
@@ -597,7 +619,30 @@ struct BuildingAgg {
 
 static bool g_showVacantApts = false;   // default: only apartments with active clients
 
-static std::vector<BuildingAgg> BuildBuildings() {
+// Resolved money per client (one GROUP BY), cached until the data changes.
+static const std::unordered_map<int, DataConn::MoneyTotals>& TotalsByUser() {
+    static Cached<std::unordered_map<int, DataConn::MoneyTotals>> cache;
+    return cache.get("", [] {
+        std::unordered_map<int, DataConn::MoneyTotals> m;
+        DataConn::PaymentFilter f; f.status = 1;
+        for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::User, f)) m[std::atoi(g.key.c_str())] = g.t;
+        return m;
+    });
+}
+
+static std::vector<BuildingAgg> ComputeBuildings();
+// Recomputed only when the data or the vacant-apartments toggle changes (was: every frame, with a DB
+// query per building and a scan of every client and every payment per apartment).
+static const std::vector<BuildingAgg>& BuildBuildings() {
+    static Cached<std::vector<BuildingAgg>> cache;
+    return cache.get(g_showVacantApts ? "v" : "", ComputeBuildings);
+}
+
+static std::vector<BuildingAgg> ComputeBuildings() {
+    std::unordered_map<int, std::vector<int>> residentsOf;              // apartment -> indices into g_app.users
+    for (size_t i = 0; i < g_app.users.size(); i++)
+        if (g_app.users[i].apartment_id > 0) residentsOf[g_app.users[i].apartment_id].push_back((int)i);
+    const auto& byUser = TotalsByUser();
     std::vector<BuildingAgg> out;
     for (auto& b : g_app.conn->getBuildings()) {
         BuildingAgg agg;
@@ -608,17 +653,15 @@ static std::vector<BuildingAgg> BuildBuildings() {
         for (auto& a : g_app.conn->getApartmentsForBuilding(b.id)) {
             agg.totalApts++;   // count EVERY apartment -- vacant AND hidden ones too
             AptAgg aa; aa.apt = a;
-            for (size_t i = 0; i < g_app.users.size(); i++)
-                if (g_app.users[i].apartment_id == a.id) aa.userIndices.push_back((int)i);
+            if (auto it = residentsOf.find(a.id); it != residentsOf.end()) aa.userIndices = it->second;
             if (aa.userIndices.empty() && !g_showVacantApts) continue;   // not "active" -> not listed
             if (!aa.userIndices.empty()) agg.active++;
             agg.residents += (int)aa.userIndices.size();
-            std::set<int> ids;
-            for (int idx : aa.userIndices) ids.insert(g_app.users[idx].id);
-            for (auto& p : g_app.payments) {
-                if (p.status == "future" || !ids.count(p.user_id)) continue;
-                if (p.direction == "out") { aa.paidOut += p.amount_paid; if (p.balance > 0.005) aa.owedOut += p.balance; }
-                else                      { aa.collected += p.amount_paid; if (p.balance > 0.005) aa.owedIn += p.balance; }
+            for (int idx : aa.userIndices) {           // same rule as before: the current residents' resolved payments
+                auto t = byUser.find(g_app.users[idx].id);
+                if (t == byUser.end()) continue;
+                aa.collected += t->second.collected; aa.paidOut += t->second.paidOut;
+                aa.owedIn += t->second.owedIn;       aa.owedOut += t->second.owedOut;
             }
             agg.collected += aa.collected; agg.paidOut += aa.paidOut;
             agg.owedIn += aa.owedIn;       agg.owedOut += aa.owedOut;
@@ -744,7 +787,7 @@ static void DrawBuildingsScreen() {
     ImGui::TextDisabled("Οι πολυκατοικίες και τα διαμερίσματά τους αποθηκεύονται ανεξάρτητα από τους πελάτες.");
     ImGui::Separator();
 
-    auto buildings = BuildBuildings();
+    const auto& buildings = BuildBuildings();
     DrawBuildingDialogs();
     if (buildings.empty()) {
         ImGui::TextDisabled("Καμία πολυκατοικία ακόμα — πατήστε «Νέα πολυκατοικία».");
@@ -796,7 +839,7 @@ static void DrawBuildingsScreen() {
 
     // ---- RIGHT: selected building detail ----
     ImGui::BeginChild("bldgdetail", ImVec2(rightW, -1), false);
-    BuildingAgg& b = buildings[g_buildingSelectedIdx];
+    const BuildingAgg& b = buildings[g_buildingSelectedIdx];
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f,0.95f,1.0f,1.0f));
     ImGui::SetWindowFontScale(1.15f);
@@ -885,10 +928,8 @@ static void DrawBuildingsScreen() {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.78f,1.0f,1.0f));
                     if (ImGui::Selectable(u.full_name.c_str())) OpenResidentLedger(u.id);
                     ImGui::PopStyleColor();
-                    for (auto& p : g_app.payments) {
-                        if (p.user_id != u.id || p.status == "future") continue;
-                        if (p.direction == "out") { po += p.amount_paid; if (p.balance > 0.005) oo += p.balance; }
-                        else                      { c += p.amount_paid;  if (p.balance > 0.005) oi += p.balance; }
+                    if (auto t = TotalsByUser().find(u.id); t != TotalsByUser().end()) {
+                        c = t->second.collected; po = t->second.paidOut; oi = t->second.owedIn; oo = t->second.owedOut;
                     }
                 }
                 if (uidx >= 0) {
@@ -1118,34 +1159,6 @@ static std::string FirstUtf8Char(const std::string& s) {
 // Fold text for searching: ASCII lower-cased; Greek lower/upper case, accents and the
 // final sigma are all mapped to one unaccented capital, so "παπαδοπουλος" matches
 // "ΠΑΠΑΔΟΠΟΥΛΟΣ" and "ελενη" matches "Ελένη".
-static std::string FoldGreek(const std::string& in) {
-    std::string out; out.reserve(in.size());
-    for (size_t i = 0; i < in.size();) {
-        unsigned char c = (unsigned char)in[i];
-        unsigned cp; int len;
-        if (c < 0x80) { out += (char)std::tolower(c); i++; continue; }
-        else if ((c >> 5) == 0x6 && i + 1 < in.size()) { cp = ((c & 0x1F) << 6) | ((unsigned char)in[i+1] & 0x3F); len = 2; }
-        else if ((c >> 4) == 0xE && i + 2 < in.size()) { cp = ((c & 0x0F) << 12) | (((unsigned char)in[i+1] & 0x3F) << 6) | ((unsigned char)in[i+2] & 0x3F); len = 3; }
-        else { out += (char)c; i++; continue; }
-        unsigned m = cp;
-        if (cp >= 0x3B1 && cp <= 0x3C9) m = (cp == 0x3C2) ? 0x3A3 : cp - 0x20;          // lower -> upper, final sigma
-        else switch (cp) {
-            case 0x386: case 0x3AC: m = 0x391; break;                                      // Ά ά
-            case 0x388: case 0x3AD: m = 0x395; break;                                      // Έ έ
-            case 0x389: case 0x3AE: m = 0x397; break;                                      // Ή ή
-            case 0x38A: case 0x3AF: case 0x3AA: case 0x3CA: case 0x390: m = 0x399; break; // Ί ί Ϊ ϊ ΐ
-            case 0x38C: case 0x3CC: m = 0x39F; break;                                      // Ό ό
-            case 0x38E: case 0x3CD: case 0x3AB: case 0x3CB: case 0x3B0: m = 0x3A5; break; // Ύ ύ Ϋ ϋ ΰ
-            case 0x38F: case 0x3CE: m = 0x3A9; break;                                      // Ώ ώ
-            default: break;
-        }
-        if (m < 0x80) out += (char)m;
-        else if (m < 0x800) { out += (char)(0xC0 | (m >> 6)); out += (char)(0x80 | (m & 0x3F)); }
-        else { out += (char)(0xE0 | (m >> 12)); out += (char)(0x80 | ((m >> 6) & 0x3F)); out += (char)(0x80 | (m & 0x3F)); }
-        i += len;
-    }
-    return out;
-}
 
 static bool SubstrCI(const std::string& hay, const std::string& needle) {
     if (needle.empty()) return true;
@@ -2094,28 +2107,34 @@ static void DrawMasterServicesScreen() {
         ImGui::TextColored(ImVec4(0.6f,0.9f,1.0f,1), "Πακέτο: %s  (%d υπηρεσίες)", sel->masterService.label.c_str(), N);
         ImGui::Separator();
 
-        // user id -> (services bought, sum of amount_due on them)
+        // user id -> (services bought, sum of amount_due on them); one GROUP BY per component, cached per package
         struct Buyer { int userId; std::vector<std::string> parts; double due = 0.0; };
-        std::map<int, Buyer> buyers;
-        for (auto& c : sel->components) {
-            std::set<int> seen;
-            for (auto& p : g_app.payments) {
-                if (p.service_id != c.id) continue;
-                auto& b = buyers[p.user_id];
-                b.userId = p.user_id;
-                b.due += p.amount_due;
-                if (seen.insert(p.user_id).second) b.parts.push_back(c.label);
+        static Cached<std::pair<std::vector<Buyer>, std::vector<Buyer>>> buyersCache;
+        const auto& fp = buyersCache.get(std::to_string(sel->masterService.id), [&] {
+            std::map<int, Buyer> buyers;
+            for (auto& c : sel->components) {
+                DataConn::PaymentFilter f; f.serviceId = c.id;
+                for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::User, f)) {
+                    int uid = std::atoi(g.key.c_str());
+                    auto& b = buyers[uid];
+                    b.userId = uid;
+                    b.due += g.t.dueAll;
+                    b.parts.push_back(c.label);
+                }
             }
-        }
-        std::vector<Buyer> full, partial;
-        for (auto& [uid, b] : buyers) (N > 0 && (int)b.parts.size() == N ? full : partial).push_back(b);
-        std::sort(partial.begin(), partial.end(), [](const Buyer& a, const Buyer& b) {
-            if (a.parts.size() != b.parts.size()) return a.parts.size() > b.parts.size();
-            return g_app.userName(a.userId) < g_app.userName(b.userId);
+            std::vector<Buyer> full, partial;
+            for (auto& [uid, b] : buyers) (N > 0 && (int)b.parts.size() == N ? full : partial).push_back(b);
+            std::sort(partial.begin(), partial.end(), [](const Buyer& a, const Buyer& b) {
+                if (a.parts.size() != b.parts.size()) return a.parts.size() > b.parts.size();
+                return g_app.userName(a.userId) < g_app.userName(b.userId);
+            });
+            std::sort(full.begin(), full.end(), [](const Buyer& a, const Buyer& b) {
+                return g_app.userName(a.userId) < g_app.userName(b.userId);
+            });
+            return std::make_pair(full, partial);
         });
-        std::sort(full.begin(), full.end(), [](const Buyer& a, const Buyer& b) {
-            return g_app.userName(a.userId) < g_app.userName(b.userId);
-        });
+        const std::vector<Buyer>& full = fp.first;
+        const std::vector<Buyer>& partial = fp.second;
 
         auto drawBuyers = [&](const char* tableId, const std::vector<Buyer>& list) {
             if (!ImGui::BeginTable(tableId, 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) return;
@@ -2378,10 +2397,10 @@ static void DrawPaymentDialog() {
                     {"Κατάσταση", old.status, np.status},
                 };
                 int id = g_paymentDialogId;
-                RequestConfirm("Επεξεργασία πληρωμής", diffs, [id, np]() { g_app.conn->editPayment(id, np); g_app.reloadPayments(); });
+                RequestConfirm("Επεξεργασία πληρωμής", diffs, [id, np]() { g_app.conn->editPayment(id, np); });
             } else {
                 std::vector<FieldDiff> diffs = { {"Χρήστης", "-", g_app.userName(np.user_id)}, {"Ποσό", "-", FormatMoney(np.amount_due)} };
-                RequestConfirm("Νέα πληρωμή", diffs, [np]() { g_app.conn->addPayment(np); g_app.reloadPayments(); });
+                RequestConfirm("Νέα πληρωμή", diffs, [np]() { g_app.conn->addPayment(np); });
             }
             g_showPaymentDialog = false;
             ImGui::CloseCurrentPopup();
@@ -2571,7 +2590,6 @@ static void DrawResolveDialog() {
             };
             RequestConfirm("Επίλυση μελλοντικής πληρωμής", diffs, [id, np]() {
                 g_app.conn->editPayment(id, np);
-                g_app.reloadPayments();
             });
             g_showResolveDialog = false;
             ImGui::CloseCurrentPopup();
@@ -2643,7 +2661,7 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
         if (ImGui::SmallButton("Διαγρ.")) {
             int id = p.id;
             RequestConfirm("Διαγραφή πληρωμής", { {"Πληρωμή #", std::to_string(id), "(διαγραφή)"} }, [id]() {
-                g_app.conn->removePayment(id); g_app.reloadPayments();
+                g_app.conn->removePayment(id);
             });
         }
         if (RowDoubleClicked(rowId)) OpenPaymentView(p.id);
@@ -2655,7 +2673,7 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
 static void DrawPaymentsScreen() {
     ImGui::TextDisabled("Προβολή πληρωμών. Για νέα χρέωση: Υπηρεσίες → Χρέωση, ή Πακέτα → Χρέωση πακέτου.");
     ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) { g_app.reloadPayments(); g_paymentsPager.Reset(); }
+    if (ImGui::Button("Ανανέωση")) { g_paymentsPager.Reset(); }
     if (!g_paymentsTableView) { ImGui::SameLine(); DrawSortMenu("paysort", kPaymentSortNames, kPaymentSortCols, 9, g_paymentsSort, g_paymentsPager); }
 
     // Κάρτες / Λίστα toggle right-aligned on the same row as the toolbar above.
@@ -2789,7 +2807,7 @@ static void DrawPaymentsScreen() {
         if (ImGui::SmallButton("Διαγρ.")) {
             int id = p.id;
             RequestConfirm("Διαγραφή πληρωμής", { {"Πληρωμή #", std::to_string(id), "(διαγραφή)"} }, [id]() {
-                g_app.conn->removePayment(id); g_app.reloadPayments();
+                g_app.conn->removePayment(id);
             });
         }
         EndCard();
@@ -3837,7 +3855,7 @@ static void DrawDashboardScreen() {
     // --- Header: reminders + refresh -----------------------------------
     if (ImGui::Button(("[!] Υπενθυμίσεις (" + std::to_string(future.size()) + ")").c_str())) g_showNotifPopup = true;
     ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) { g_app.reloadPayments(); g_dashPageOffset = 0; g_dashScrollToBoundary = true; }
+    if (ImGui::Button("Ανανέωση")) { g_dashPageOffset = 0; g_dashScrollToBoundary = true; }
 
     static bool notifOpen = false;
     if (g_showNotifPopup) {
@@ -3891,51 +3909,30 @@ static void DrawDashboardScreen() {
     EndCard();
     ImGui::Spacing();
 
-    // --- Compute filtered set + stats ------------------------------------
-    std::vector<Payment> shown;
+    // --- Stats + timeline rows come straight from SQL, cached until the data or a filter changes ----------
+    // (was: every frame, a copy + full sort of every payment, and a rescan of all of them per day banner)
     std::time_t nowT = std::time(nullptr);
     std::tm nowTm{}; localtime_s(&nowTm, &nowT);
     int curYear = nowTm.tm_year + 1900, curMonth = nowTm.tm_mon + 1, curDay = nowTm.tm_mday;
 
+    DataConn::PaymentFilter base;
+    base.fromDate = g_dashStartDate; base.toDate = g_dashEndDate;
+    base.userId = g_dashUserFilter;  base.serviceId = g_dashServiceFilter;
+    const std::string fkey = g_dashStartDate + "|" + g_dashEndDate + "|" + std::to_string(g_dashUserFilter) + "|" + std::to_string(g_dashServiceFilter);
+
     // --- 3x3 stat spec, verbatim per client: "total outcome, total input, the
     // sum, and then the same of future payments only, and then another time the
     // same with future and the past together as one."
-    //   Group A (resolved only, status != "future"): outcome/input from amount_paid.
-    //   Group B (future only,   status == "future"): outcome/input from amount_due
-    //                                                  (nothing has actually been
-    //                                                  paid yet, so amount_due is
-    //                                                  the only real figure).
+    //   Group A (resolved only): outcome/input from amount_paid.
+    //   Group B (future only): outcome/input from amount_due (nothing paid yet).
     //   Group C (combined): A + B for each of outcome/input/sum.
-    double outcomeA = 0, inputA = 0; // resolved
-    double outcomeB = 0, inputB = 0; // future
-    for (auto& p : g_app.payments) {
-        char payDate[16];
-        std::snprintf(payDate, sizeof(payDate), "%04d-%02d-%02d", p.year, p.month, p.day);
-        if (!g_dashStartDate.empty() && std::string(payDate) < g_dashStartDate) continue;
-        if (!g_dashEndDate.empty()   && std::string(payDate) > g_dashEndDate)   continue;
-        if (g_dashUserFilter >= 0 && p.user_id != g_dashUserFilter) continue;
-        if (g_dashServiceFilter >= 0 && p.service_id != g_dashServiceFilter) continue;
-        shown.push_back(p);
-
-        bool isOut = p.direction == "out";
-        if (p.status == "future") {
-            if (isOut) outcomeB += p.amount_due; else inputB += p.amount_due;
-        } else {
-            if (isOut) outcomeA += p.amount_paid; else inputA += p.amount_paid;
-        }
-    }
+    static Cached<DataConn::MoneyTotals> totCache;
+    const DataConn::MoneyTotals& tot = totCache.get(fkey, [&] { return g_app.conn->paymentTotals(base); });
+    double outcomeA = tot.paidOut,   inputA = tot.collected;   // resolved
+    double outcomeB = tot.futureOut, inputB = tot.futureIn;    // future
     double sumA = inputA - outcomeA;
     double sumB = inputB - outcomeB;
     double outcomeC = outcomeA + outcomeB, inputC = inputA + inputB, sumC = inputC - outcomeC;
-    // Newest-first (descending): the client wants "recent 20, then next recent 20"
-    // paging further down the list, so the most recent entry must sort to index 0.
-    std::sort(shown.begin(), shown.end(), [](const Payment& a, const Payment& b) {
-        if (a.year != b.year) return a.year > b.year;
-        if (a.month != b.month) return a.month > b.month;
-        if (a.day != b.day) return a.day > b.day;
-        return a.id > b.id;
-    });
-
     // Reset pagination whenever a filter actually changed since last frame (or the
     // caller pressed "Ανανέωση", handled separately below) -- a filter change makes
     // the previous offset window meaningless.
@@ -4045,44 +4042,44 @@ static void DrawDashboardScreen() {
     if (QuietFilter("Μελλοντικές", g_dashTypeFilter == 3)) ApplyTypeFilter(3);
     ImGui::Separator();
 
-    // --- Apply the type filter to `shown` (timeline only) -----------------
-    if (g_dashTypeFilter != 0) {
-        std::vector<Payment> typed;
-        typed.reserve(shown.size());
-        for (auto& p : shown) {
-            if (g_dashTypeFilter == 1 && p.direction != "in")   continue;
-            if (g_dashTypeFilter == 2 && p.direction != "out")  continue;
-            if (g_dashTypeFilter == 3 && p.status != "future")  continue;
-            typed.push_back(p);
+    // --- Timeline rows for the type chip: all future rows (top) + the resolved pages loaded so far ------
+    struct DashRows { std::vector<Payment> futureList, resolvedList; long long resolvedTotal = 0; std::map<std::string, double> dayNet; };
+    static Cached<DashRows> rowsCache;
+    const DashRows& rows = rowsCache.get(fkey + "|" + std::to_string(g_dashTypeFilter) + "|" + std::to_string(g_dashPageOffset), [&] {
+        DashRows r;
+        DataConn::PaymentFilter tf = base;
+        if (g_dashTypeFilter == 1) tf.direction = "in";
+        if (g_dashTypeFilter == 2) tf.direction = "out";
+        // Future: nearest-due at the BOTTOM (closest to the boundary); more distant ones above.
+        DataConn::PaymentFilter ff = tf; ff.status = 2;
+        r.futureList = g_app.conn->findPayments(ff, DataConn::PayOrder::ResolutionDesc, 0, 1000);
+        if (g_dashTypeFilter != 3) {
+            // Resolved: newest first, only as many as the pages loaded so far.
+            DataConn::PaymentFilter rf = tf; rf.status = 1;
+            r.resolvedList = g_app.conn->findPayments(rf, DataConn::PayOrder::DateDesc, 0, g_dashPageOffset + kDashPageSize);
+            // the total doesn't depend on how many pages are loaded: cached separately, so "load older" stays instant
+            static Cached<long long> totalCache;
+            r.resolvedTotal = totalCache.get(fkey + "|" + std::to_string(g_dashTypeFilter), [&] { return g_app.conn->countPaymentsWhere(rf); });
+            if (!r.resolvedList.empty()) {
+                // Day banner totals cover the WHOLE day, also rows not loaded yet (a day can span pages).
+                DataConn::PaymentFilter df = rf;
+                char a[16], b[16];
+                const Payment& oldest = r.resolvedList.back(); const Payment& newest = r.resolvedList.front();
+                std::snprintf(a, sizeof(a), "%04d-%02d-%02d", oldest.year, oldest.month, oldest.day);
+                std::snprintf(b, sizeof(b), "%04d-%02d-%02d", newest.year, newest.month, newest.day);
+                df.fromDate = a; df.toDate = b;
+                for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::Day, df)) r.dayNet[g.key] = g.t.collected - g.t.paidOut;
+            }
         }
-        shown.swap(typed);
-    }
-
-    if (shown.empty()) {
+        return r;
+    });
+    const std::vector<Payment>& futureList = rows.futureList;
+    const std::vector<Payment>& resolvedList = rows.resolvedList;
+    if (futureList.empty() && resolvedList.empty()) {
         ImGui::TextDisabled("Καμία κίνηση στο τρέχον φίλτρο.");
         return;
     }
-
-    // Split shown into future (top section) and resolved (bottom, paged).
-    std::vector<Payment> futureList, resolvedList;
-    for (auto& p : shown) {
-        if (p.status == "future") futureList.push_back(p);
-        else                      resolvedList.push_back(p);
-    }
-    // Future: nearest-due at the BOTTOM (closest to the boundary). More-distant
-    // ones sit above -- scroll up to see them. ISO dates sort lexicographically.
-    std::sort(futureList.begin(), futureList.end(), [](const Payment& a, const Payment& b) {
-        return a.resolution_date > b.resolution_date;
-    });
-    // Resolved: newest first.
-    std::sort(resolvedList.begin(), resolvedList.end(), [](const Payment& a, const Payment& b) {
-        if (a.year != b.year) return a.year > b.year;
-        if (a.month != b.month) return a.month > b.month;
-        if (a.day != b.day) return a.day > b.day;
-        return a.id > b.id;
-    });
-
-    int pageEnd = std::min((int)resolvedList.size(), g_dashPageOffset + kDashPageSize);
+    int pageEnd = (int)resolvedList.size();
 
     ImGui::BeginChild("timelinelist", ImVec2(0, 0), false);
 
@@ -4160,17 +4157,12 @@ static void DrawDashboardScreen() {
     // --- RESOLVED section (day banners + rows) ----------------------------
     int lastY = -1, lastM = -1, lastD = -1;
     for (int i = 0; i < pageEnd; i++) {
-        Payment& p = resolvedList[i];
+        const Payment& p = resolvedList[i];
         any = true;
         if (p.year != lastY || p.month != lastM || p.day != lastD) {
-            // Day net computed from the FULL resolved list (not just this page)
-            // so the banner total is truthful when a day spans a page boundary.
-            double dayNet = 0.0;
-            for (auto& q : resolvedList) {
-                if (q.year == p.year && q.month == p.month && q.day == p.day) {
-                    dayNet += (q.direction == "out") ? -q.amount_paid : q.amount_paid;
-                }
-            }
+            char dk[16]; std::snprintf(dk, sizeof(dk), "%04d-%02d-%02d", p.year, p.month, p.day);
+            auto dn = rows.dayNet.find(dk);
+            double dayNet = dn == rows.dayNet.end() ? 0.0 : dn->second;
             DrawSpineBigDot(ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f,0.65f,0.85f,1.0f)),
                             ImGui::GetCursorScreenPos().y + 18.0f);
             ImGui::Indent(kRowIndent);
@@ -4189,10 +4181,10 @@ static void DrawDashboardScreen() {
     if (!any) ImGui::TextDisabled("Καμία κίνηση στο τρέχον φίλτρο.");
 
     // --- LOAD OLDER -------------------------------------------------------
-    if (pageEnd < (int)resolvedList.size()) {
+    if (pageEnd < rows.resolvedTotal) {
         ImGui::Spacing();
         ImGui::Indent(kRowIndent);
-        int remaining = (int)resolvedList.size() - pageEnd;
+        int remaining = (int)(rows.resolvedTotal - pageEnd);
         // Large buffer on purpose: Greek chars are 2 UTF-8 bytes each, so the
         // old char[64] silently truncated the label mid-character and rendered
         // garbled text whenever the remaining count hit 3+ digits.
@@ -4377,11 +4369,12 @@ struct SqResults {
     std::vector<SqARow> apartments;
     std::vector<const Service*> services;
     std::vector<const DataConn::MasterServiceSummary*> packages;
-    std::vector<const Payment*> payments;
+    std::vector<Payment> payments;           // the rows to list (only fetched for the open category, capped)
+    long long payCount = 0;                  // all matches, for the chip / header
     double payDue = 0.0, payPaid = 0.0;
     int Count(int cat) const {
         switch (cat) { case 1: return (int)users.size(); case 2: return (int)buildings.size(); case 3: return (int)apartments.size();
-                       case 4: return (int)services.size(); case 5: return (int)packages.size(); case 6: return (int)payments.size(); default: return 0; }
+                       case 4: return (int)services.size(); case 5: return (int)packages.size(); case 6: return (int)payCount; default: return 0; }
     }
     int Total() const { int t = 0; for (int c = 1; c <= 6; c++) t += Count(c); return t; }
 };
@@ -4402,8 +4395,10 @@ static void SqCompute(int cat, bool form, const std::string& quick, SqResults& o
     switch (cat) {
     case 1: {
         std::set<int> bought; const bool useBought = form && !sq_u_service.str().empty();
-        if (useBought)
-            for (auto& p : g_app.payments) { auto it = cx.svcById.find(p.service_id); if (it != cx.svcById.end() && SqHit(it->second->label, sq_u_service)) bought.insert(p.user_id); }
+        if (useBought) {
+            DataConn::PaymentFilter f; f.serviceText = sq_u_service.str();
+            for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::User, f)) bought.insert(std::atoi(g.key.c_str()));
+        }
         for (auto& u : g_app.users) {
             std::string blob = u.full_name + " " + u.phone + " " + u.special_code + " " + u.address + " " + u.area + " " + u.postal_code + " " + u.apartment;
             if (!SqHit(blob, quick)) continue;
@@ -4474,30 +4469,24 @@ static void SqCompute(int cat, bool form, const std::string& quick, SqResults& o
             out.packages.push_back(&ms);
         }
         break;
-    case 6:
-        for (auto& p : g_app.payments) {
-            auto uit = cx.userById.find(p.user_id); auto sit = cx.svcById.find(p.service_id);
-            std::string client = uit != cx.userById.end() ? uit->second->full_name : "";
-            std::string svc = sit != cx.svcById.end() ? sit->second->label : "";
-            std::string bld = uit != cx.userById.end() ? uit->second->address : "";
-            char date[16]; std::snprintf(date, sizeof(date), "%04d-%02d-%02d", p.year, p.month, p.day);
-            if (!SqHit(client + " " + svc + " " + p.notes + " " + p.status + " " + date + " " + bld, quick)) continue;
-            if (form) {
-                if (!SqHit(client, sq_p_client) || !SqHit(svc, sq_p_service) || !SqHit(p.notes, sq_p_notes) || !SqHit(bld, sq_p_building)) continue;
-                if (!sq_p_from.empty() && std::string(date) < sq_p_from) continue;
-                if (!sq_p_to.empty() && std::string(date) > sq_p_to) continue;
-                if (sq_p_dir == 1 && p.direction != "in") continue;
-                if (sq_p_dir == 2 && p.direction != "out") continue;
-                if (sq_p_status == 1 && (p.status == "future" || p.balance > 0.005)) continue;
-                if (sq_p_status == 2 && p.status != "future") continue;
-                if (sq_p_status == 3 && !(p.status != "future" && p.balance > 0.005)) continue;
-                if (sq_p_min > 0.0 && p.amount_due < sq_p_min) continue;
-                if (sq_p_max > 0.0 && p.amount_due > sq_p_max) continue;
-            }
-            out.payments.push_back(&p);
-            out.payDue += p.amount_due; out.payPaid += p.amount_paid;
+    case 6: {
+        // In SQL, with the same accent/case-insensitive matching (fold()) as the rest of the search screen.
+        DataConn::PaymentFilter f; f.text = quick;
+        if (form) {
+            f.clientText = sq_p_client.str(); f.serviceText = sq_p_service.str();
+            f.notesText = sq_p_notes.str();   f.buildingText = sq_p_building.str();
+            f.fromDate = sq_p_from; f.toDate = sq_p_to;
+            if (sq_p_dir == 1) f.direction = "in";
+            if (sq_p_dir == 2) f.direction = "out";
+            if (sq_p_status == 1) f.owed = 1;          // settled
+            if (sq_p_status == 2) f.status = 2;        // future
+            if (sq_p_status == 3) f.owed = 2;          // still owed
+            f.minDue = sq_p_min; f.maxDue = sq_p_max;
         }
-        break;
+        auto t = g_app.conn->paymentTotals(f);
+        out.payCount = t.count; out.payDue = t.dueAll; out.payPaid = t.paidAll;
+        if (form) out.payments = g_app.conn->findPayments(f, DataConn::PayOrder::DateAsc, 0, 5000);   // oldest first, as before
+        break; }
     default: break;
     }
 }
@@ -4604,7 +4593,9 @@ static void DrawSearchScreen() {
     const float availW = ImGui::GetContentRegionAvail().x, availH = ImGui::GetContentRegionAvail().y;
     const float sp = ImGui::GetStyle().ItemSpacing.x;
 
-    // ---- data used by every category ------------------------------------------
+    // ---- data used by every category (cached: was rebuilt every frame with a query per apartment) ----
+    static Cached<SqContext> cxCache;
+    const SqContext& cx = cxCache.get("", [] {
     SqContext cx;
     for (auto& u : g_app.users) cx.userById[u.id] = &u;
     for (auto& s : g_app.services) cx.svcById[s.id] = &s;
@@ -4619,7 +4610,13 @@ static void DrawSearchScreen() {
             for (auto& r : g_app.conn->getResidencies(a.id)) if (seen.insert(r.user_id).second) cx.pastResidents[a.id] += (cx.pastResidents[a.id].empty() ? "" : ", ") + g_app.userName(r.user_id);
         }
     }
-    for (auto& p : g_app.payments) if (p.apartment_id > 0 && p.status != "future") cx.aptMoves[p.apartment_id]++;
+    {
+        DataConn::PaymentFilter f; f.status = 1;
+        for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::Apartment, f))
+            if (int apt = std::atoi(g.key.c_str()); apt > 0) cx.aptMoves[apt] = (int)g.t.count;
+    }
+    return cx;
+    });
     const int nApts = [&] { int n = 0; for (auto& kv : cx.aptsOf) n += (int)kv.second.size(); return n; }();
 
     // ---- landing <-> results animation -------------------------------------------
@@ -4678,8 +4675,32 @@ static void DrawSearchScreen() {
     }
 
     // ---- results for every category (counts on the chips) -------------------------
-    SqResults res;
-    for (int c = 1; c <= 6; c++) SqCompute(c, c == g_sqCat, quick, res, cx);
+    // recomputed only when the text, a form field, the category or the data changes (was: every frame)
+    auto computeResults = [&] {
+        static Cached<SqResults> resCache;
+        std::string key = quick + '\x1f' + std::to_string(g_sqCat);
+        for (TextBuf* b : { &sq_u_name, &sq_u_phone, &sq_u_code, &sq_u_addr, &sq_u_area, &sq_u_postal, &sq_u_apt, &sq_u_service,
+                            &sq_b_addr, &sq_b_area, &sq_b_postal, &sq_b_afm, &sq_a_building, &sq_a_label, &sq_a_resident,
+                            &sq_s_label, &sq_s_notes, &sq_s_pkg, &sq_k_name, &sq_k_service,
+                            &sq_p_client, &sq_p_service, &sq_p_notes, &sq_p_building }) key += '\x1f' + b->str();
+        char nums[160];
+        std::snprintf(nums, sizeof(nums), "|%d|%d|%d|%d|%.2f|%.2f|%.2f|%.2f|", sq_u_hasApt, sq_a_vacant, sq_p_dir, sq_p_status, sq_s_min, sq_s_max, sq_p_min, sq_p_max);
+        key += nums + sq_p_from + "|" + sq_p_to;
+        // Debounce: while the text/form is still changing (typing), keep showing the previous results; search
+        // once input has been still for 250 ms. On a large database one search can take a second.
+        // Only typing is debounced; a category switch or a quick-search click is answered at once (the old
+        // results would belong to another category).
+        static std::string pendingKey; static double changedAt = 0.0; static int lastCat = -1;
+        if (key != pendingKey) { pendingKey = key; changedAt = ImGui::GetTime(); }
+        bool sameCat = lastCat == g_sqCat; lastCat = g_sqCat;
+        if (sameCat && resCache.ver >= 0 && key != resCache.key && ImGui::GetTime() - changedAt < 0.25) return resCache.val;
+        return resCache.get(key, [&] {
+            SqResults r;
+            for (int c = 1; c <= 6; c++) SqCompute(c, c == g_sqCat, quick, r, cx);
+            return r;
+        });
+    };
+    SqResults res = computeResults();
 
     // ---- category chips (centred) ------------------------------------------------
     {
@@ -4746,7 +4767,8 @@ static void DrawSearchScreen() {
         ImGui::Dummy(ImVec2(0, 22));
         char stats[200];
         std::snprintf(stats, sizeof(stats), "%d πελάτες  ·  %d πολυκατοικίες  ·  %d διαμερίσματα  ·  %d υπηρεσίες  ·  %d πακέτα  ·  %d πληρωμές",
-                      (int)g_app.users.size(), (int)cx.buildings.size(), nApts, (int)g_app.services.size(), (int)cx.summaries.size(), (int)g_app.payments.size());
+                      (int)g_app.users.size(), (int)cx.buildings.size(), nApts, (int)g_app.services.size(), (int)cx.summaries.size(), (int)[] {
+                          static Cached<long long> n; return n.get("", [] { return g_app.conn->countPaymentsWhere({}); }); }());
         centeredText(stats, ImVec4(0.45f, 0.50f, 0.58f, 1.0f));
         return;
     }
@@ -4812,13 +4834,12 @@ static void DrawSearchScreen() {
         }
         ImGui::EndChild();
         // the form may have changed: recompute the selected category with the new values
-        SqResults again;
-        SqCompute(g_sqCat, true, quick, again, cx);
+        const SqResults& again = computeResults();
         switch (g_sqCat) {
             case 1: res.users = again.users; break;           case 2: res.buildings = again.buildings; break;
             case 3: res.apartments = again.apartments; break; case 4: res.services = again.services; break;
             case 5: res.packages = again.packages; break;
-            case 6: res.payments = again.payments; res.payDue = again.payDue; res.payPaid = again.payPaid; break;
+            case 6: res.payments = again.payments; res.payCount = again.payCount; res.payDue = again.payDue; res.payPaid = again.payPaid; break;
         }
     }
 
@@ -4988,15 +5009,23 @@ static void DrawSearchScreen() {
             ImGui::TableHeadersRow();
             for (int i = from; i < to; i++) {
                 const Service& s = *res.services[i];
-                std::set<int> clients;
-                for (auto& p : g_app.payments) if (p.service_id == s.id) clients.insert(p.user_id);
+                // distinct clients per service: one GROUP BY (client, service), cached
+                static Cached<std::unordered_map<int, int>> clientsPerService;
+                const auto& cps = clientsPerService.get("", [] {
+                    std::unordered_map<int, int> m;
+                    for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::UserService, {}))
+                        m[std::atoi(g.key.substr(g.key.find('|') + 1).c_str())]++;
+                    return m;
+                });
+                auto cpsIt = cps.find(s.id);
+                const int nClients = cpsIt == cps.end() ? 0 : cpsIt->second;
                 auto pit = cx.pkgsOfService.find(s.id);
                 ImGui::PushID(s.id); ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 if (SqLinkCell(s.label, hl)) OpenServiceDetail(s.id);
                 ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f €", s.suggested_price);
                 ImGui::TableSetColumnIndex(2); SqCell(pit != cx.pkgsOfService.end() ? pit->second : "—", hl);
-                ImGui::TableSetColumnIndex(3); ImGui::Text("%d", (int)clients.size());
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%d", nClients);
                 ImGui::TableSetColumnIndex(4); SqCell(s.extra_notes, hl);
                 ImGui::PopID();
             }
@@ -5025,7 +5054,9 @@ static void DrawSearchScreen() {
         }
         SqPagerDraw(g_sqCat, (int)res.packages.size(), pages, "pgk");
     } else if (g_sqCat == 6) {
-        beginSec("Πληρωμές", (int)res.payments.size(), ImVec4(0.95f, 0.45f, 0.55f, 1));
+        // header: every match; paging: only the rows actually loaded (capped), never past the end of the list
+        SqSection("Πληρωμές", (int)res.payCount, ImVec4(0.95f, 0.45f, 0.55f, 1));
+        pages = SqPageRange(g_sqCat, (int)res.payments.size(), pageSize, from, to);
         ImGui::TextDisabled("Σύνολο οφειλής: %.2f €   ·   Σύνολο πληρωμένου: %.2f €   (όλων των αποτελεσμάτων)", res.payDue, res.payPaid);
         if (ImGui::BeginTable("sqtp", 8, tf)) {
             ImGui::TableSetupColumn("Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 90.0f);
@@ -5038,7 +5069,7 @@ static void DrawSearchScreen() {
             ImGui::TableSetupColumn("Πληρωμένο", ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableHeadersRow();
             for (int i = from; i < to; i++) {
-                const Payment& p = *res.payments[i];
+                const Payment& p = res.payments[i];
                 auto uit = cx.userById.find(p.user_id);
                 ImGui::PushID(p.id); ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
@@ -5156,6 +5187,19 @@ static long long RepNextKey(long long key) {
     if (g_repPeriod == 2) return key + 1;
     if (g_repPeriod == 1) { int y = (int)(key / 100), m = (int)(key % 100) + 1; if (m > 12) { m = 1; y++; } return (long long)y * 100 + m; }
     return key + 7;
+}
+
+// First and last calendar day (ISO) covered by a bucket key, for SQL range filters.
+static std::string RepIso(long long days) { int y, m, d; RepCivilFromDays(days, y, m, d); char b[16]; std::snprintf(b, sizeof(b), "%04d-%02d-%02d", y, m, d); return b; }
+static std::string RepKeyFirstDay(long long key) {
+    if (g_repPeriod == 2) return std::to_string(key) + "-01-01";
+    if (g_repPeriod == 1) { char b[16]; std::snprintf(b, sizeof(b), "%04d-%02d-01", (int)(key / 100), (int)(key % 100)); return b; }
+    return RepIso(key);
+}
+static std::string RepKeyLastDay(long long key) {
+    if (g_repPeriod == 2) return std::to_string(key) + "-12-31";
+    if (g_repPeriod == 1) { long long nk = RepNextKey(key); return RepIso(RepDaysFromCivil((int)(nk / 100), (int)(nk % 100), 1) - 1); }
+    return RepIso(key + 6);
 }
 
 // Grouped vertical bars (collected green / paid-out red) with grid, an average line,
@@ -5348,15 +5392,25 @@ static void DrawReportsScreen() {
     if (ImGui::Button("Ανανέωση")) g_app.reloadAll();
 
     // ================================================================ buckets
-    std::map<long long, RepBucket> byKey;
-    double scheduled = 0.0;
-    for (auto& p : g_app.payments) {
-        if (p.status == "future") { scheduled += p.amount_due; continue; }
-        long long k = RepKeyOf(p);
-        auto& bk = byKey[k];
-        bk.key = k; bk.n++;
-        (p.direction == "out" ? bk.paidOut : bk.collected) += p.amount_paid;
-    }
+    // per-day totals from SQL (a few hundred rows a year), folded into the period buckets; cached
+    struct RepDays { std::map<long long, RepBucket> byKey; double scheduled = 0.0; };
+    static Cached<RepDays> daysCache;
+    const RepDays& rd = daysCache.get(std::to_string(g_repPeriod), [] {
+        RepDays r;
+        DataConn::PaymentFilter fut; fut.status = 2;
+        auto ft = g_app.conn->paymentTotals(fut);
+        r.scheduled = ft.futureIn + ft.futureOut;
+        DataConn::PaymentFilter res; res.status = 1;
+        for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::Day, res)) {
+            Payment d; std::sscanf(g.key.c_str(), "%d-%d-%d", &d.year, &d.month, &d.day);
+            long long k = RepKeyOf(d);
+            auto& bk = r.byKey[k];
+            bk.key = k; bk.collected += g.t.collected; bk.paidOut += g.t.paidOut; bk.n += (int)g.t.count;
+        }
+        return r;
+    });
+    const std::map<long long, RepBucket>& byKey = rd.byKey;
+    double scheduled = rd.scheduled;
     std::vector<RepBucket> buckets;
     if (!byKey.empty()) {
         long long last = byKey.rbegin()->first, first = byKey.begin()->first;
@@ -5365,7 +5419,7 @@ static void DrawReportsScreen() {
         for (long long k = first; k <= last && (int)keys.size() < 2000; k = RepNextKey(k)) keys.push_back(k);
         if ((int)keys.size() > maxBuckets) keys.erase(keys.begin(), keys.end() - maxBuckets);
         for (long long k : keys) {
-            RepBucket bk = byKey.count(k) ? byKey[k] : RepBucket();
+            RepBucket bk = byKey.count(k) ? byKey.at(k) : RepBucket();
             bk.key = k; bk.label = RepLabelOf(k);
             buckets.push_back(bk);
         }
@@ -5386,35 +5440,51 @@ static void DrawReportsScreen() {
     ImGui::Separator();
 
     // ================================================================ aggregates
-    std::map<int, RepRow> perSvc, perCli, perBld, perPkg;
-    std::map<int, std::string> bldOfUser;
-    for (auto& u : g_app.users) bldOfUser[u.id] = u.address.empty() ? "Χωρίς διαμέρισμα" : u.address;
-    std::map<int, std::string> pkgOfSvc;
-    for (auto& ms : g_app.conn->getMasterServiceSummaries())
-        for (auto& c : ms.components) if (!pkgOfSvc.count(c.id)) pkgOfSvc[c.id] = ms.masterService.label;
-    std::map<std::string, int> bldIdx, pkgIdx;       // name -> synthetic id
-    std::map<int, std::set<int>> bldClients, pkgSvcs, svcClients, cliSvcs;
-    double collected = 0, paidOut = 0, owed = 0; int payCount = 0;
-    std::set<int> activeClients, usedServices;
-    for (auto& p : g_app.payments) {
-        if (p.status == "future") continue;
-        long long k = RepKeyOf(p);
-        if (g_repSelKey >= 0 ? k != g_repSelKey : k < firstVisible) continue;
-        payCount++;
-        double c = p.direction == "out" ? 0.0 : p.amount_paid, o = p.direction == "out" ? p.amount_paid : 0.0;
-        double ow = p.balance > 0.005 ? p.balance : 0.0;
-        collected += c; paidOut += o; owed += ow;
-        activeClients.insert(p.user_id); usedServices.insert(p.service_id);
-        auto add = [&](RepRow& r) { r.n++; r.in += c; r.out += o; r.owed += ow; };
-        { auto& r = perSvc[p.service_id]; r.id = p.service_id; r.name = g_app.serviceLabel(p.service_id); add(r); svcClients[p.service_id].insert(p.user_id); r.others = (int)svcClients[p.service_id].size(); }
-        { auto& r = perCli[p.user_id];    r.id = p.user_id;    r.name = g_app.userName(p.user_id);       add(r); cliSvcs[p.user_id].insert(p.service_id); r.others = (int)cliSvcs[p.user_id].size(); }
-        { std::string bn = bldOfUser.count(p.user_id) ? bldOfUser[p.user_id] : "Χωρίς διαμέρισμα";
-          int bid = bldIdx.emplace(bn, (int)bldIdx.size()).first->second;
-          auto& r = perBld[bid]; r.id = -1; r.name = bn; add(r); bldClients[bid].insert(p.user_id); r.others = (int)bldClients[bid].size(); }
-        { std::string pn = pkgOfSvc.count(p.service_id) ? pkgOfSvc[p.service_id] : "Άλλες υπηρεσίες";
-          int pid = pkgIdx.emplace(pn, (int)pkgIdx.size()).first->second;
-          auto& r = perPkg[pid]; r.id = -1; r.name = pn; add(r); pkgSvcs[pid].insert(p.service_id); r.others = (int)pkgSvcs[pid].size(); }
-    }
+    // One SQL GROUP BY (client, service) over the visible range, folded into the four breakdowns exactly as
+    // the per-payment loop did. Cached per period/selection until the data changes.
+    struct RepAgg {
+        std::map<int, RepRow> perSvc, perCli, perBld, perPkg;
+        double collected = 0, paidOut = 0, owed = 0; int payCount = 0;
+        std::set<int> activeClients, usedServices;
+    };
+    static Cached<RepAgg> aggCache;
+    const RepAgg& agg = aggCache.get(std::to_string(g_repPeriod) + "|" + std::to_string(g_repSelKey) + "|" + std::to_string(firstVisible), [&] {
+        RepAgg a;
+        std::map<int, std::string> bldOfUser;
+        for (auto& u : g_app.users) bldOfUser[u.id] = u.address.empty() ? "Χωρίς διαμέρισμα" : u.address;
+        std::map<int, std::string> pkgOfSvc;
+        for (auto& ms : g_app.conn->getMasterServiceSummaries())
+            for (auto& c : ms.components) if (!pkgOfSvc.count(c.id)) pkgOfSvc[c.id] = ms.masterService.label;
+        std::map<std::string, int> bldIdx, pkgIdx;       // name -> synthetic id
+        std::map<int, std::set<int>> bldClients, pkgSvcs, svcClients, cliSvcs;
+
+        DataConn::PaymentFilter f; f.status = 1;
+        if (g_repSelKey >= 0) { f.fromDate = RepKeyFirstDay(g_repSelKey); f.toDate = RepKeyLastDay(g_repSelKey); }
+        else if (!buckets.empty()) f.fromDate = RepKeyFirstDay(firstVisible);
+        if (buckets.empty()) return a;
+        for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::UserService, f)) {
+            size_t bar = g.key.find('|');
+            int uid = std::atoi(g.key.substr(0, bar).c_str()), sid = std::atoi(g.key.substr(bar + 1).c_str());
+            int n = (int)g.t.count;
+            double c = g.t.collected, o = g.t.paidOut, ow = g.t.owedIn + g.t.owedOut;
+            a.payCount += n; a.collected += c; a.paidOut += o; a.owed += ow;
+            a.activeClients.insert(uid); a.usedServices.insert(sid);
+            auto add = [&](RepRow& r) { r.n += n; r.in += c; r.out += o; r.owed += ow; };
+            { auto& r = a.perSvc[sid]; r.id = sid; r.name = g_app.serviceLabel(sid); add(r); svcClients[sid].insert(uid); r.others = (int)svcClients[sid].size(); }
+            { auto& r = a.perCli[uid]; r.id = uid; r.name = g_app.userName(uid);    add(r); cliSvcs[uid].insert(sid);    r.others = (int)cliSvcs[uid].size(); }
+            { std::string bn = bldOfUser.count(uid) ? bldOfUser[uid] : "Χωρίς διαμέρισμα";
+              int bid = bldIdx.emplace(bn, (int)bldIdx.size()).first->second;
+              auto& r = a.perBld[bid]; r.id = -1; r.name = bn; add(r); bldClients[bid].insert(uid); r.others = (int)bldClients[bid].size(); }
+            { std::string pn = pkgOfSvc.count(sid) ? pkgOfSvc[sid] : "Άλλες υπηρεσίες";
+              int pid = pkgIdx.emplace(pn, (int)pkgIdx.size()).first->second;
+              auto& r = a.perPkg[pid]; r.id = -1; r.name = pn; add(r); pkgSvcs[pid].insert(sid); r.others = (int)pkgSvcs[pid].size(); }
+        }
+        return a;
+    });
+    const auto& perSvc = agg.perSvc; const auto& perCli = agg.perCli; const auto& perBld = agg.perBld; const auto& perPkg = agg.perPkg;
+    const double collected = agg.collected, paidOut = agg.paidOut, owed = agg.owed;
+    const int payCount = agg.payCount;
+    const auto& activeClients = agg.activeClients; const auto& usedServices = agg.usedServices;
     // last-vs-previous period (for the tiles' small print)
     double lastIn = 0, prevIn = 0, lastOut = 0, prevOut = 0; std::string lastLbl, prevLbl;
     if (!buckets.empty()) {
@@ -5635,24 +5705,31 @@ static void DrawApartmentsScreen() {
     }
     if (g_aptGotoBuilding > 0) { g_aptOpenB.insert(g_aptGotoBuilding); g_aptGotoBuilding = -1; }
 
-    // ---- every apartment with what happened there ----
-    std::map<int, std::vector<const Payment*>> payOf;                  // apartment -> its payments
-    for (auto& p : g_app.payments) if (p.apartment_id > 0) payOf[p.apartment_id].push_back(&p);
+    // ---- every apartment with what happened there (per-apartment totals from one GROUP BY; cached) ----
     struct AptEntry { Apartment a; std::string current; int moves = 0; double in = 0, out = 0; };
     struct BldEntry { Building b; std::vector<AptEntry> apts; int moves = 0; double total = 0; };
-    std::vector<BldEntry> blds;
-    for (auto& b : g_app.conn->getBuildings()) {
-        BldEntry be; be.b = b;
-        for (auto& a : g_app.conn->getApartmentsForBuilding(b.id)) {
-            AptEntry e; e.a = a;
-            for (auto& u : g_app.users) if (u.apartment_id == a.id) e.current += (e.current.empty() ? "" : ", ") + u.full_name;
-            for (auto* p : payOf[a.id]) { if (p->status == "future") continue; e.moves++; (p->direction == "out" ? e.out : e.in) += p->amount_paid; }
-            be.moves += e.moves; be.total += e.in + e.out;
-            be.apts.push_back(std::move(e));
+    static Cached<std::vector<BldEntry>> bldsCache;
+    const std::vector<BldEntry>& blds = bldsCache.get("", [] {
+        std::unordered_map<int, DataConn::MoneyTotals> byApt;
+        DataConn::PaymentFilter f; f.status = 1;
+        for (auto& g : g_app.conn->paymentTotalsBy(DataConn::PayGroup::Apartment, f)) byApt[std::atoi(g.key.c_str())] = g.t;
+        std::unordered_map<int, std::string> currentOf;
+        for (auto& u : g_app.users) if (u.apartment_id > 0) currentOf[u.apartment_id] += (currentOf[u.apartment_id].empty() ? "" : ", ") + u.full_name;
+        std::vector<BldEntry> out;
+        for (auto& b : g_app.conn->getBuildings()) {
+            BldEntry be; be.b = b;
+            for (auto& a : g_app.conn->getApartmentsForBuilding(b.id)) {
+                AptEntry e; e.a = a;
+                if (auto c = currentOf.find(a.id); c != currentOf.end()) e.current = c->second;
+                if (auto t = byApt.find(a.id); t != byApt.end()) { e.moves = (int)t->second.count; e.in = t->second.collected; e.out = t->second.paidOut; }
+                be.moves += e.moves; be.total += e.in + e.out;
+                be.apts.push_back(std::move(e));
+            }
+            out.push_back(std::move(be));
         }
-        blds.push_back(std::move(be));
-    }
-    std::sort(blds.begin(), blds.end(), [](const BldEntry& x, const BldEntry& y) { return x.b.address < y.b.address; });
+        std::sort(out.begin(), out.end(), [](const BldEntry& x, const BldEntry& y) { return x.b.address < y.b.address; });
+        return out;
+    });
     bool selOk = false; int allApts = 0;
     for (auto& b : blds) for (auto& a : b.apts) { allApts++; if (a.a.id == g_aptSelId) selOk = true; }
     if (!selOk) { g_aptSelId = -1; for (auto& b : blds) if (!b.apts.empty() && g_aptSelId < 0) { g_aptSelId = b.apts[0].a.id; g_aptOpenB.insert(b.b.id); } }
@@ -5713,7 +5790,11 @@ static void DrawApartmentsScreen() {
     for (auto& b : blds) for (auto& a : b.apts) if (a.a.id == g_aptSelId) { sel = &a; selB = &b.b; }
     ImGui::BeginChild("aptdetail", ImVec2(0, -1), false);
     if (sel && selB) {
-        auto& ps = payOf[sel->a.id];
+        // the selected apartment's own payments (one indexed query, cached per apartment)
+        static Cached<std::vector<Payment>> aptPayCache;
+        const std::vector<Payment>& aptPays = aptPayCache.get(std::to_string(sel->a.id), [&] { return g_app.conn->getPaymentsForApartment(sel->a.id); });
+        std::vector<const Payment*> ps; ps.reserve(aptPays.size());
+        for (auto& p : aptPays) ps.push_back(&p);
         auto residencies = g_app.conn->getResidencies(sel->a.id);
         const std::string pageKey = std::to_string(sel->a.id) + "_" + std::to_string(g_aptPeriod);
 

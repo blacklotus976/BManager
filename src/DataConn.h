@@ -119,8 +119,8 @@ public:
     virtual std::vector<Payment> getPaymentsForUser(int userId) = 0;
     virtual std::vector<Payment> getFuturePayments() = 0;
     virtual std::vector<Payment> getRecentPayments(int limit) = 0;
-    // All payments (past/current/future), unfiltered - backs the dashboard timeline, which
-    // applies date/user/service filters in memory since they combine (AND) and change live.
+    // All payments, unfiltered. Not used by any screen (they query with findPayments/paymentTotals);
+    // kept for exports and tests.
     virtual std::vector<Payment> getAllPayments() = 0;
     // Advanced payment search (Αναζήτηση tab): payment's own fields plus owner-name /
     // service-label substring match via JOIN against users/services. Any empty string
@@ -157,6 +157,37 @@ public:
     virtual std::vector<Receipt> getReceiptsForUser(int userId) = 0;
     virtual std::vector<int> getReceiptPaymentIds(int receiptId) = 0;
     virtual int getReceiptIdForPayment(int paymentId) = 0;                 // -1 = none
+
+    // --- Payment queries & totals in SQL (screens never load every payment into memory) ---
+    struct PaymentFilter {
+        std::string fromDate, toDate;        // inclusive ISO dates, "" = open
+        int userId = -1, serviceId = -1, apartmentId = -1;
+        std::string direction;               // "", "in", "out"
+        int status = 0;                      // 0 all, 1 resolved (not 'future'), 2 future
+        int owed = 0;                        // 0 any, 1 settled (resolved, balance <= 0), 2 still owed (resolved, balance > 0)
+        double minDue = 0.0, maxDue = 0.0;   // amount_due bounds, 0 = none
+        // Accent/case-insensitive substring filters (same matching as the search screen). `text` matches any of
+        // client, service, notes, status, date, client's building address.
+        std::string text, clientText, serviceText, notesText, buildingText;
+    };
+    // Sums in exact cents. "Resolved" = status != 'future'.
+    struct MoneyTotals {
+        long long count = 0;
+        double collected = 0, paidOut = 0;      // resolved: amount_paid by direction
+        double owedIn = 0, owedOut = 0;         // resolved: positive balance by direction
+        double futureIn = 0, futureOut = 0;     // future: amount_due by direction
+        double dueAll = 0, paidAll = 0;         // every matching row
+    };
+    enum class PayGroup { User, Service, Apartment, Day, UserService };
+    struct GroupedTotals { std::string key; MoneyTotals t; };   // key: id ("12"), date, or "user|service"
+    enum class PayOrder { DateDesc, DateAsc, ResolutionDesc };
+    virtual std::vector<Payment> findPayments(const PaymentFilter& f, PayOrder order, int offset, int limit) = 0;
+    virtual long long countPaymentsWhere(const PaymentFilter& f) = 0;
+    virtual MoneyTotals paymentTotals(const PaymentFilter& f) = 0;
+    virtual std::vector<GroupedTotals> paymentTotalsBy(PayGroup group, const PaymentFilter& f) = 0;
+    // Changes whenever this connection writes anything. Screens cache what they computed against it, so
+    // an unchanged screen costs nothing per frame.
+    virtual long long dataVersion() = 0;
 
     // --- Paged "phone book" pickers (dashboard filters) -------------------
     // These fetch only one page of rows at a time -- the dashboard pickers
