@@ -20,6 +20,14 @@ private:
     std::string toJson(const std::vector<std::string>& cols, const std::vector<std::string>& vals);
     std::vector<std::string> getColumnNames(const std::string& table);
     int insertPayment(const Payment& p, int batchId);
+    // building blocks, used inside a savepoint by the public operations
+    int insertCharge(const Payment& p, int batchId);
+    int insertMoney(const MoneyPayment& m);
+    bool allocate(int paymentId, int chargeId, double amount);
+    bool reconcilePaid(int chargeId, double desiredPaid);
+    bool savepoint(const char* name);
+    bool release(const char* name);
+    void rollbackTo(const char* name);
     int issueReceiptInTx(const Receipt& r, const std::vector<int>& paymentIds);   // caller owns the transaction
     void registerSqlFunctions();
     // (Re)creates the per-table audit triggers from the tables' current columns. Returns how many were
@@ -144,14 +152,27 @@ public:
     std::vector<Payment> pagePayments(const std::string& startDate, const std::string& endDate,
                                        int userId, int serviceId,
                                        const std::string& status, const std::string& direction,
-                                       int offset, int limit, const SortSpec& sort = {}) override;
+                                       int offset, int limit, const SortSpec& sort = {},
+                                       bool missingReceiptOnly = false) override;
     int countPayments(const std::string& startDate, const std::string& endDate,
                        int userId, int serviceId,
-                       const std::string& status, const std::string& direction) override;
+                       const std::string& status, const std::string& direction,
+                       bool missingReceiptOnly = false) override;
 
     int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) override;
     int addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel, const Receipt* receipt) override;
     int nextReceiptNumber(const std::string& series) override;
+    int recordPayment(const MoneyPayment& money, const std::vector<Allocation>& allocations, const Receipt* receipt) override;
+    std::vector<MoneyPayment> getMoneyForUser(int userId) override;
+    std::vector<MoneyPayment> getMoneyForCharge(int chargeId) override;
+    std::vector<Allocation> getAllocationsForMoney(int paymentId) override;
+    std::vector<Payment> getOpenCharges(int userId) override;
+    double getClientCredit(int userId) override;
+    int issueReceiptForMoney(const Receipt& r, const std::vector<int>& moneyIds) override;
+    std::vector<Receipt> searchReceipts(const ReceiptQuery& q, int offset, int limit) override;
+    long long countReceipts(const ReceiptQuery& q, double* total = nullptr) override;
+    std::vector<ReceiptLine> getReceiptLines(int receiptId) override;
+    std::vector<MoneyPayment> getReceiptMoney(int receiptId) override;
     bool editPaymentWithReceipt(int id, const Payment& payment, const Receipt& receipt) override;
     bool voidReceipt(int id, const std::string& reason) override;
     Receipt getReceiptById(int id) override;

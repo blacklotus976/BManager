@@ -17,12 +17,15 @@ static int pay(SqliteConn& db, int user, int svc, int y, int m, int d, int aptId
     Payment p; p.user_id = user; p.service_id = svc; p.year = y; p.month = m; p.day = d;
     p.amount_due = 40; p.amount_paid = 40; p.status = "paid"; p.direction = "in"; p.apartment_id = aptId;
     db.addPayment(p);
-    return lastId(db, "payments");
+    return lastId(db, "charges");
 }
 
 int main() {
-    std::string path = (std::filesystem::temp_directory_path() / "bmanager_history_test.db").string();
-    std::filesystem::remove(path);
+    // own folder: the database, its WAL files and the audit checkpoints all go away together
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "bmanager_history_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    std::string path = (dir / "data.db").string();
     {
         SqliteConn db(path);
         Building b; b.address = "ΠΑΤΗΣΙΩΝ 205"; int bid = db.addBuilding(b);
@@ -74,7 +77,7 @@ int main() {
         CHECK(db.setResidencyHistory(u1, {{-1, u1, a2, "2026-01-01", ""}}));
         CHECK(db.getPaymentById(pOld).apartment_id == a1);
     }
-    std::filesystem::remove(path);
+    std::filesystem::remove_all(dir);
     std::printf(fails ? "%d FAILED\n" : "all history tests passed\n", fails);
     return fails ? 1 : 0;
 }

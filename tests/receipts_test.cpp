@@ -12,7 +12,7 @@ static int fails = 0;
 
 static int lastPaymentId(SqliteConn& db) {
     std::vector<std::string> c; std::vector<std::vector<std::string>> rows; std::string err;
-    db.executeRawQuery("SELECT MAX(id) FROM payments", c, rows, err);
+    db.executeRawQuery("SELECT MAX(id) FROM charges", c, rows, err);
     return std::atoi(rows[0][0].c_str());
 }
 
@@ -21,7 +21,7 @@ static int addPay(SqliteConn& db, int user, int svc, double due, double paid, co
     p.amount_due = due; p.amount_paid = paid; p.status = status; p.direction = dir;
     db.addPayment(p);
     std::vector<std::string> c; std::vector<std::vector<std::string>> rows; std::string err;
-    db.executeRawQuery("SELECT MAX(id) FROM payments", c, rows, err);
+    db.executeRawQuery("SELECT MAX(id) FROM charges", c, rows, err);
     return std::atoi(rows[0][0].c_str());
 }
 
@@ -34,8 +34,11 @@ int main() {
     CHECK(IsValidRfCode(MakeRfCode("A0000001")));
     CHECK(MakeRfCode("") == "" && MakeRfCode("ABCDEFGHIJKLMNOPQRSTUV") == "");
 
-    std::string path = (std::filesystem::temp_directory_path() / "bmanager_receipts_test.db").string();
-    std::filesystem::remove(path);
+    // own folder: the database, its WAL files and the audit checkpoints all go away together
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "bmanager_receipts_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    std::string path = (dir / "data.db").string();
     {
         SqliteConn db(path);
         User u; u.full_name = "ΤΕΣΤ ΠΕΛΑΤΗΣ"; db.addUser(u);
@@ -126,7 +129,7 @@ int main() {
         CHECK(db.getReceiptPaymentIds(rid).empty());
         CHECK(!db.executeRawQuery("UPDATE receipts SET notes='x' WHERE id = " + std::to_string(rid), c, rows, err)); // void is final
     }
-    std::filesystem::remove(path);
+    std::filesystem::remove_all(dir);
     std::printf(fails ? "%d FAILED\n" : "all receipt tests passed\n", fails);
     return fails ? 1 : 0;
 }

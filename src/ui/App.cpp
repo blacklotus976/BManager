@@ -2833,14 +2833,21 @@ static void DrawPaymentsScreen() {
     ImGui::TextDisabled("Τύπος:"); ImGui::SameLine();
     ImGui::SetNextItemWidth(150);
     ImGui::Combo("##filt_direction", &g_payDirectionFilter, kDirectionFilterNames, 3);
+    ImGui::SameLine();
+    // money came in for these lines but no (valid) receipt covers it -- the to-do list for issuing receipts
+    static bool missingReceiptOnly = false;
+    ImGui::Checkbox("Μόνο χωρίς απόδειξη", &missingReceiptOnly);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Εισπράξεις για τις οποίες δεν έχει εκδοθεί απόδειξη (ή η απόδειξή τους ακυρώθηκε).");
     ImGui::Separator();
 
     // --- Detect filter changes -> reset pager ---
     static std::string lastStart, lastEnd;
     static int lastUser = -2, lastSvc = -2, lastStat = -1, lastDir = -1;
+    static bool lastMissing = false;
     if (lastStart != g_payStartDate || lastEnd != g_payEndDate ||
         lastUser != g_payUserFilter || lastSvc != g_payServiceFilter ||
-        lastStat != g_payStatusFilter || lastDir != g_payDirectionFilter) {
+        lastStat != g_payStatusFilter || lastDir != g_payDirectionFilter || lastMissing != missingReceiptOnly) {
+        lastMissing = missingReceiptOnly;
         g_paymentsPager.Reset();
         lastStart = g_payStartDate; lastEnd = g_payEndDate;
         lastUser = g_payUserFilter; lastSvc = g_payServiceFilter;
@@ -2853,16 +2860,23 @@ static void DrawPaymentsScreen() {
     std::string dirStr    = (g_payDirectionFilter == 1) ? "in" :
                             (g_payDirectionFilter == 2) ? "out" : "";
 
-    // --- Query one page from SQL ---
-    std::vector<Payment> page = g_app.conn->pagePayments(
-        g_payStartDate, g_payEndDate,
-        g_payUserFilter, g_payServiceFilter,
-        statusStr, dirStr,
-        g_paymentsPager.offset, g_paymentsPager.pageSize, g_paymentsSort.keys);
-    g_paymentsPager.total = g_app.conn->countPayments(
-        g_payStartDate, g_payEndDate,
-        g_payUserFilter, g_payServiceFilter,
-        statusStr, dirStr);
+    // --- Query one page from SQL (cached until data, filters, page or sort change) ---
+    std::string sortKey;
+    for (auto& k : g_paymentsSort.keys) sortKey += std::to_string(k.first) + (k.second ? "a" : "d");
+    char pk[256];
+    std::snprintf(pk, sizeof(pk), "%s|%s|%d|%d|%s|%s|%d|%d|%d|%s", g_payStartDate.c_str(), g_payEndDate.c_str(), g_payUserFilter,
+                  g_payServiceFilter, statusStr.c_str(), dirStr.c_str(), g_paymentsPager.offset, g_paymentsPager.pageSize,
+                  (int)missingReceiptOnly, sortKey.c_str());
+    static Cached<std::pair<std::vector<Payment>, int>> pageCache;
+    const auto& pc = pageCache.get(pk, [&] {
+        return std::make_pair(
+            g_app.conn->pagePayments(g_payStartDate, g_payEndDate, g_payUserFilter, g_payServiceFilter, statusStr, dirStr,
+                                     g_paymentsPager.offset, g_paymentsPager.pageSize, g_paymentsSort.keys, missingReceiptOnly),
+            g_app.conn->countPayments(g_payStartDate, g_payEndDate, g_payUserFilter, g_payServiceFilter, statusStr, dirStr,
+                                      missingReceiptOnly));
+    });
+    const std::vector<Payment>& page = pc.first;
+    g_paymentsPager.total = pc.second;
 
     std::vector<const Payment*> payRows;
     payRows.reserve(page.size());

@@ -38,19 +38,21 @@ int main() {
         Payment p; p.user_id = 1; p.service_id = svc; p.year = 2026; p.month = 10; p.day = 11;
         p.amount_due = 40; p.amount_paid = 40; p.status = "paid"; p.notes = "με \"εισαγωγικά\" και \\ backslash";
         db.addPayment(p);
-        pid = std::atoi(one(db, "SELECT MAX(id) FROM payments").c_str());
+        pid = std::atoi(one(db, "SELECT MAX(id) FROM charges").c_str());
         db.setAuditReason("Διόρθωση ποσού μετά από τηλεφώνημα");
         p = db.getPaymentById(pid); p.amount_paid = 35;
         CHECK(db.editPayment(pid, p));
         db.setAuditReason("");
 
         // dates are one ISO column; the app still sees the parts
-        CHECK(one(db, "SELECT pay_date FROM payments WHERE id = " + std::to_string(pid)) == "2026-10-11");
+        CHECK(one(db, "SELECT pay_date FROM charges WHERE id = " + std::to_string(pid)) == "2026-10-11");
         CHECK(db.getPaymentById(pid).year == 2026 && db.getPaymentById(pid).day == 11);
         CHECK(db.getPaymentById(pid).created_at.size() == 19);
 
         // the edit was recorded by the DB, with actor, reason, valid JSON before/after
-        std::string where = " FROM audit_log WHERE table_name='payments' AND action_type='UPDATE' AND record_id=" + std::to_string(pid);
+        // the bill's paid amount follows the money: recorded on the charge, by the DB, with actor + reason
+        std::string where = " FROM audit_log WHERE table_name='charges' AND action_type='UPDATE' AND record_id=" + std::to_string(pid) +
+                            " AND json_extract(new_data,'$.amount_paid') = 35.0";
         CHECK(one(db, "SELECT actor" + where) == "γραμματεία@pc1");
         CHECK(one(db, "SELECT reason" + where) == "Διόρθωση ποσού μετά από τηλεφώνημα");
         CHECK(one(db, "SELECT json_extract(old_data,'$.amount_paid') || '>' || json_extract(new_data,'$.amount_paid')" + where) == "40.0>35.0");
@@ -92,18 +94,18 @@ int main() {
         p.amount_due = 10; p.amount_paid = 10; p.status = "paid"; db.addPayment(p);
         CHECK(db.verifyAuditLog().ok);
     }
-    CHECK(raw(path2.string(), "DROP TRIGGER audit_payments_upd; UPDATE payments SET amount_paid = 1;"));
+    CHECK(raw(path2.string(), "DROP TRIGGER audit_charges_upd; UPDATE charges SET notes = 'σιωπηλή αλλαγή';"));
     {
         SqliteConn db(path2.string());
         CHECK(!db.takeLastError().empty());
         auto chk = db.verifyAuditLog();
         bool silent = false;
-        for (auto& pr : chk.problems) if (pr.find("payments #1") != std::string::npos) silent = true;
+        for (auto& pr : chk.problems) if (pr.find("charges #1") != std::string::npos) silent = true;
         CHECK(!chk.ok && silent);
     }
 
     // payment dates must be real ISO dates
-    CHECK(!raw(path2.string(), "DROP TRIGGER audit_payments_ins; INSERT INTO payments (service_id, pay_date) VALUES (1, '2026-2-30')"));
+    CHECK(!raw(path2.string(), "DROP TRIGGER audit_charges_ins; INSERT INTO charges (service_id, pay_date) VALUES (1, '2026-2-30')"));
 
     fs::remove_all(dir);
     std::printf(fails ? "%d FAILED\n" : "all audit tests passed\n", fails);

@@ -6,6 +6,7 @@
 #include "models/Payment.h"
 #include "models/Note.h"
 #include "models/Receipt.h"
+#include "models/MoneyPayment.h"
 #include <vector>
 #include <string>
 #include <utility>
@@ -140,6 +141,42 @@ public:
                                                           const std::string& idQuery = "", const std::string& serviceIdQuery = "",
                                                           const std::string& userIdQuery = "") = 0;
 
+    // --- Bills (charges) and money (payments) ---
+    // The `Payment` struct used by the screens is a CHARGE line (what is owed), with amount_paid / balance
+    // maintained by the database from the money allocated to it. Money itself is a MoneyPayment.
+    //
+    // Records money and what it settles, optionally with its receipt, all-or-nothing. Allocations may be fewer
+    // than the amount (the rest is the client's credit). Returns the new payment id or -1.
+    virtual int recordPayment(const MoneyPayment& money, const std::vector<Allocation>& allocations, const Receipt* receipt) = 0;
+    virtual std::vector<MoneyPayment> getMoneyForUser(int userId) = 0;                 // newest first
+    virtual std::vector<MoneyPayment> getMoneyForCharge(int chargeId) = 0;             // .allocated = the part for this charge
+    virtual std::vector<Allocation> getAllocationsForMoney(int paymentId) = 0;
+    virtual std::vector<Payment> getOpenCharges(int userId) = 0;                       // resolved, balance > 0, oldest first
+    virtual double getClientCredit(int userId) = 0;                                    // money in not yet allocated
+    // Receipt for money already recorded (payment ids, not charge ids). Same rules as issueReceipt.
+    virtual int issueReceiptForMoney(const Receipt& r, const std::vector<int>& moneyIds) = 0;
+
+    // --- Receipts search (Αποδείξεις screen) ---
+    // Conditions over what a receipt covers, combined with ALL (AND) or ANY (OR); each can be negated (NOT).
+    struct ReceiptCond {
+        enum Field { Client, Service, Package, Building, Method } field = Client;
+        int id = -1;              // client / service / package / building id
+        std::string text;         // method code for Method
+        bool negate = false;
+    };
+    struct ReceiptQuery {
+        std::vector<ReceiptCond> conds;
+        bool matchAll = true;
+        std::string fromDate, toDate;     // issue date, inclusive
+        int status = 0;                   // 0 all, 1 issued, 2 void
+        std::string number;               // substring of "A-123" / paper / bank reference / RF
+    };
+    virtual std::vector<Receipt> searchReceipts(const ReceiptQuery& q, int offset, int limit) = 0;   // newest first
+    virtual long long countReceipts(const ReceiptQuery& q, double* total = nullptr) = 0;
+    struct ReceiptLine { Payment charge; double amount = 0.0; };      // what a receipt pays, per charge
+    virtual std::vector<ReceiptLine> getReceiptLines(int receiptId) = 0;
+    virtual std::vector<MoneyPayment> getReceiptMoney(int receiptId) = 0;
+
     // --- Receipts (N payments -> 1 receipt) ---
     // issueReceipt links the given payments to one new receipt and returns its id (-1 + takeLastError()
     // on refusal). Rules: at least one payment; each one exists, is resolved (not 'future'), is a
@@ -173,6 +210,7 @@ public:
         std::string direction;               // "", "in", "out"
         int status = 0;                      // 0 all, 1 resolved (not 'future'), 2 future
         int owed = 0;                        // 0 any, 1 settled (resolved, balance <= 0), 2 still owed (resolved, balance > 0)
+        bool missingReceipt = false;         // money came in for it but no issued receipt covers that money
         double minDue = 0.0, maxDue = 0.0;   // amount_due bounds, 0 = none
         // Accent/case-insensitive substring filters (same matching as the search screen). `text` matches any of
         // client, service, notes, status, date, client's building address.
@@ -307,12 +345,15 @@ public:
     // Payments: full filter set at SQL level (dates as YYYY-MM-DD strings,
     // userId/serviceId -1 = no filter, status "" | "future" | "resolved",
     // direction "" | "in" | "out").
+    // missingReceiptOnly: only lines whose incoming money has no issued receipt.
     virtual std::vector<Payment> pagePayments(const std::string& startDate, const std::string& endDate,
                                                int userId, int serviceId,
                                                const std::string& status, const std::string& direction,
-                                               int offset, int limit, const SortSpec& sort = {}) = 0;
+                                               int offset, int limit, const SortSpec& sort = {},
+                                               bool missingReceiptOnly = false) = 0;
     virtual int countPayments(const std::string& startDate, const std::string& endDate,
                                int userId, int serviceId,
-                               const std::string& status, const std::string& direction) = 0;
+                               const std::string& status, const std::string& direction,
+                               bool missingReceiptOnly = false) = 0;
 
 };
