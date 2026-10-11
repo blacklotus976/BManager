@@ -285,3 +285,20 @@ one well-defined migration" is.
   changes; nothing loads all payments.
 - Remaining structural gap: bill vs payment are still one row (partial payments against one bill, one transfer
   for several bills). Next: see `docs/UI_PROPOSALS.md` §3 for scale, and the charges/allocations model in §5.
+
+## 15. State after migrations v9–v10
+
+- **Bills vs money (v9)**: `charges` = what is owed (the former payment lines, same ids); `payments` = money that
+  moved (date, amount, method, reference, optional receipt); `allocations` = which money settles which charge.
+  Partial payments, instalments, one transfer for several bills and client credit (unallocated money) all work.
+  `charges.amount_paid`/`balance` are kept by triggers from allocations, so every existing screen shows the same
+  numbers as before (verified tab by tab against the previous build).
+- **Receipts** belong to money. One receipt per payment, or one for payments recorded together (same batch,
+  same client). An issued receipt freezes its money, its allocations and the billed fields of the charges it
+  settles; corrections = void with reason + new receipt for the same money.
+- **Receipts screen**: AND/OR/NOT conditions over client, service, package, building, payment method; EXISTS
+  sub-queries over indexed joins, paged.
+- **Attachments (v10)**: files next to the DB under their SHA-256, rows audited and never deleted; photo and video
+  viewers in the app. **Backups**: the daily backup copies the database; copy the `attachments/` folder together
+  with it (next step: include it in the backup routine).
+- **Promotions/contracts**: designed in `docs/PROMOTIONS_DESIGN.md`.
