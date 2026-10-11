@@ -91,6 +91,29 @@ int main() {
         ed = db.getPaymentById(p1); ed.notes = "σημείωση";
         CHECK(db.editPayment(p1, ed));
 
+        // payment + receipt recorded together; a bad receipt leaves NOTHING behind
+        {
+            int before = lastPaymentId(db);
+            Payment np; np.user_id = 1; np.service_id = svc; np.year = 2026; np.month = 10; np.day = 2;
+            np.amount_due = 25; np.amount_paid = 25; np.status = "paid"; np.direction = "in";
+            Receipt bad; bad.user_id = 1; bad.method = "bank"; bad.rf_code = "RF00BAD";
+            CHECK(db.addPaymentsWithReceipt({np}, "", &bad) == -1); db.takeLastError();
+            CHECK(lastPaymentId(db) == before);
+            int next = db.nextReceiptNumber("A");
+            Receipt good; good.user_id = 1; good.method = "ebanking"; good.bank_ref = "TRX-77"; good.paper_ref = "4521";
+            int pid = db.addPaymentsWithReceipt({np}, "", &good);
+            CHECK(pid > 0);
+            int rcpt = db.getReceiptIdForPayment(pid);
+            CHECK(rcpt > 0 && db.getReceiptById(rcpt).number == next && db.getReceiptById(rcpt).bank_ref == "TRX-77");
+            // resolving a future payment with its receipt
+            Payment f = db.getPaymentById(fut); f.amount_paid = 15; f.status = "paid";
+            CHECK(db.editPaymentWithReceipt(fut, f, good));
+            CHECK(db.getReceiptIdForPayment(fut) > 0 && db.getPaymentById(fut).status == "paid");
+            Payment o = db.getPaymentById(out); o.notes = "x";
+            CHECK(!db.editPaymentWithReceipt(out, o, good)); db.takeLastError();   // outgoing: refused...
+            CHECK(db.getPaymentById(out).notes.empty());                            // ...and the edit rolled back too
+        }
+
         // void -> payments unlock -> re-receipt gets the next number
         CHECK(!db.voidReceipt(rid, "  ")); db.takeLastError();
         CHECK(db.voidReceipt(rid, "Λάθος ποσό στην p3"));
@@ -99,7 +122,7 @@ int main() {
         ed = db.getPaymentById(p3); ed.amount_paid = 15;
         CHECK(db.editPayment(p3, ed));
         int rid2 = db.issueReceipt(r, {p1, p2, p3});
-        CHECK(rid2 > 0 && db.getReceiptById(rid2).number == 4 && ToCents(db.getReceiptById(rid2).total) == 4500);
+        CHECK(rid2 > 0 && db.getReceiptById(rid2).number == 6 && ToCents(db.getReceiptById(rid2).total) == 4500);
         CHECK(db.getReceiptPaymentIds(rid).empty());
         CHECK(!db.executeRawQuery("UPDATE receipts SET notes='x' WHERE id = " + std::to_string(rid), c, rows, err)); // void is final
     }

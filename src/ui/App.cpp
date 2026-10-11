@@ -15,6 +15,7 @@
 #include "Config.h"
 #include "Money.h"
 #include "TextFold.h"
+#include "Rf.h"
 #include "Seed.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -2222,6 +2223,78 @@ static bool g_showPaymentDialog = false;
 static bool g_paymentDialogWasOpen = false;
 static bool g_paymentDialogIsEdit = false;
 static int g_paymentDialogId = -1;
+// ---------------------------------------------------------------------------
+// Receipt details asked when money comes in. Until the client's real receipt book / invoicing provider is
+// known, a receipt is: the app's own sequential number (series A), how the money came in, and the references
+// that prove it (number of a handwritten receipt, bank transaction reference, RF code). All optional except
+// the method; the number is assigned automatically and can never repeat.
+// ---------------------------------------------------------------------------
+struct ReceiptForm { bool issue = true; int method = 0; TextBuf paper, bank, rf; };
+static const char* kReceiptMethodCodes[] = { "cash", "collector", "bank", "ebanking", "card", "iris", "other" };
+static const char* kReceiptMethodNames[] = { "Μετρητά", "Εισπράκτορας", "Κατάθεση σε τράπεζα", "e-banking", "Κάρτα", "IRIS", "Άλλο" };
+static std::string ReceiptMethodName(const std::string& code) {
+    for (int i = 0; i < IM_ARRAYSIZE(kReceiptMethodCodes); i++) if (code == kReceiptMethodCodes[i]) return kReceiptMethodNames[i];
+    return code;
+}
+
+// Draws the section; returns false while something typed is invalid (Save stays blocked).
+static bool DrawReceiptForm(const char* id, ReceiptForm& f, double total, int payments) {
+    ImGui::PushID(id);
+    ImGui::Spacing();
+    ImGui::SeparatorText("Απόδειξη είσπραξης");
+    ImGui::Checkbox("Έκδοση απόδειξης", &f.issue);
+    bool ok = true;
+    if (f.issue) {
+        static Cached<int> next;
+        int n = next.get("A", [] { return g_app.conn->nextReceiptNumber("A"); });
+        ImGui::SameLine();
+        ImGui::TextDisabled("θα εκδοθεί Α-%06d · %s €%s", n, FormatMoney(total).c_str(),
+                            payments > 1 ? ("  (" + std::to_string(payments) + " πληρωμές, μία απόδειξη)").c_str() : "");
+        if (ToCents(total) <= 0) { ImGui::TextColored(kInvalidMoneyCol, "Η απόδειξη χρειάζεται πληρωμένο ποσό μεγαλύτερο από 0."); ok = false; }
+        ImGui::SetNextItemWidth(220);
+        ImGui::Combo("Τρόπος πληρωμής", &f.method, kReceiptMethodNames, IM_ARRAYSIZE(kReceiptMethodNames));
+        bool electronic = f.method >= 2 && f.method <= 5;
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputTextWithHint("Αρ. χειρόγραφης απόδειξης", "αν κόψατε από μπλοκ", f.paper.data, sizeof(f.paper.data));
+        if (electronic) {
+            ImGui::SetNextItemWidth(220);
+            ImGui::InputTextWithHint("Αναφορά συναλλαγής", "αρ. συναλλαγής", f.bank.data, sizeof(f.bank.data));
+        }
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputTextWithHint("Κωδικός RF", "αυτόματο αν μείνει κενό", f.rf.data, sizeof(f.rf.data));
+        if (!f.rf.str().empty() && !IsValidRfCode(f.rf.str())) {
+            ImGui::SameLine(); ImGui::TextColored(kInvalidMoneyCol, "μη έγκυρος κωδικός RF");
+            ok = false;
+        }
+    } else {
+        ImGui::TextDisabled("Χωρίς απόδειξη τώρα. Μπορεί να εκδοθεί αργότερα από την πληρωμή.");
+    }
+    ImGui::PopID();
+    return ok;
+}
+
+static Receipt ReceiptFromForm(const ReceiptForm& f, int userId) {
+    Receipt r;
+    r.user_id = userId;
+    r.method = kReceiptMethodCodes[f.method];
+    r.paper_ref = f.paper.str();
+    r.bank_ref = (f.method >= 2 && f.method <= 5) ? f.bank.str() : "";
+    r.rf_code = f.rf.str();
+    return r;
+}
+
+// One line for confirm dialogs.
+static std::string ReceiptSummary(const ReceiptForm& f) {
+    if (!f.issue) return "όχι";
+    char num[24]; std::snprintf(num, sizeof(num), "Α-%06d", g_app.conn->nextReceiptNumber("A"));
+    std::string s = std::string(num) + " · " + kReceiptMethodNames[f.method];
+    if (!f.paper.str().empty()) s += " · χειρόγρ. " + f.paper.str();
+    if (!f.bank.str().empty() && f.method >= 2 && f.method <= 5) s += " · αναφ. " + f.bank.str();
+    return s;
+}
+
+static ReceiptForm pb_receipt, rb_receipt, pc_receipt;
+
 static int pb_userId = -1, pb_serviceId = -1;
 // Apartment the payment is FOR. -1 = automatic: the apartment the client lived in on the payment date
 // (residency history). Picked by hand e.g. for arrears of a previous apartment paid after moving.
@@ -2255,6 +2328,7 @@ static void OpenAddPayment() {
     pb_due.set("0"); pb_paid.set("0"); pb_notes.set(""); pb_resolutionDate.clear();
     pb_direction = 0; pb_isFuture = false; pb_lockUser = false; pb_lockService = false;
     pb_aptId = -1; pb_aptUser = -1;
+    pb_receipt = ReceiptForm{};
 }
 
 // "Πατησίων 205 – Α1" for an apartment id ("" if unknown). Small query; used by dialogs only.
@@ -2367,6 +2441,21 @@ static void DrawPaymentDialog() {
         // Notes/comment is a normal, always-visible, optional attribute of every
         // payment -- never a substitute for the amount fields (per client correction).
         ImGui::InputTextMultiline("Σημειώσεις/Σχόλιο", pb_notes.data, sizeof(pb_notes.data), ImVec2(0, 60));
+        // Receipt: asked for money coming in now; future payments get theirs when resolved, payments made on the
+        // client's behalf are backed by the supplier's document instead.
+        const bool askReceipt = !g_paymentDialogIsEdit && !pb_isFuture && pb_direction == 0;
+        if (askReceipt) {
+            double paidNow = 0.0; ParseMoney(pb_paid.str(), paidNow);
+            amountsOk = DrawReceiptForm("pbrec", pb_receipt, paidNow, 1) && amountsOk;
+        } else if (g_paymentDialogIsEdit) {
+            int rid = g_app.conn->getReceiptIdForPayment(g_paymentDialogId);
+            Receipt rc = rid > 0 ? g_app.conn->getReceiptById(rid) : Receipt{};
+            ImGui::Spacing();
+            if (rc.id > 0) ImGui::TextColored(rc.status == "issued" ? ImVec4(0.55f, 0.80f, 0.55f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1),
+                                              "Απόδειξη %s-%06d · %s · %s%s", rc.series.c_str(), rc.number, ReceiptMethodName(rc.method).c_str(),
+                                              rc.issue_date.c_str(), rc.status == "void" ? " · ΑΚΥΡΩΜΕΝΗ" : "  (τα ποσά είναι κλειδωμένα)");
+            else ImGui::TextDisabled("Χωρίς απόδειξη.");
+        }
         ImGui::Spacing();
         if (ImGui::Button("Αποθήκευση", ImVec2(150, 0)) && amountsOk) {
             Payment np;
@@ -2400,7 +2489,13 @@ static void DrawPaymentDialog() {
                 RequestConfirm("Επεξεργασία πληρωμής", diffs, [id, np]() { g_app.conn->editPayment(id, np); });
             } else {
                 std::vector<FieldDiff> diffs = { {"Χρήστης", "-", g_app.userName(np.user_id)}, {"Ποσό", "-", FormatMoney(np.amount_due)} };
-                RequestConfirm("Νέα πληρωμή", diffs, [np]() { g_app.conn->addPayment(np); });
+                bool withReceipt = askReceipt && pb_receipt.issue;
+                Receipt rc = ReceiptFromForm(pb_receipt, np.user_id);
+                if (askReceipt) diffs.push_back({"Απόδειξη", "-", ReceiptSummary(pb_receipt)});
+                // payment + receipt in one transaction: both saved or neither
+                RequestConfirm("Νέα πληρωμή", diffs, [np, withReceipt, rc]() {
+                    g_app.conn->addPaymentsWithReceipt({np}, "", withReceipt ? &rc : nullptr);
+                });
             }
             g_showPaymentDialog = false;
             ImGui::CloseCurrentPopup();
@@ -2431,6 +2526,7 @@ static void OpenPackageCharge(int pkgId) {
     pc_userId = g_app.users.empty() ? -1 : g_app.users[0].id;
     pc_pkgId = pkgId; pc_checkedFor = -2;
     pc_dateStr = CurrentDateString(); pc_resolutionDate.clear();
+    pc_receipt = ReceiptForm{};
     pc_direction = 0; pc_isFuture = false;
 }
 
@@ -2505,14 +2601,20 @@ static void DrawPackageChargeDialog() {
         ImGui::Text("Σύνολο: %.2f € σε %d πληρωμές", total, (int)charge.size());
         ImGui::Spacing();
         bool ok = pc_userId >= 0 && !charge.empty() && (!pc_isFuture || !pc_resolutionDate.empty());
+        const bool askReceipt = !pc_isFuture && pc_direction == 0;   // collected now -> one receipt for the whole package
+        if (askReceipt) ok = DrawReceiptForm("pcrec", pc_receipt, total, (int)charge.size()) && ok;
         ImGui::BeginDisabled(!ok);
         if (ImGui::Button("Χρέωση", ImVec2(150, 0))) {
             int iy = 0, im = 0, id = 0;
             std::sscanf(pc_dateStr.c_str(), "%d-%d-%d", &iy, &im, &id);
             int uid = pc_userId; bool fut = pc_isFuture; std::string dir = pc_direction == 1 ? "out" : "in";
             std::string res = pc_resolutionDate, note = "Πακέτο: " + pkgName;
-            RequestConfirm("Χρέωση πακέτου", { {"Πελάτης", "-", g_app.userName(uid)}, {"Πακέτο", "-", pkgName},
-                                                 {"Πληρωμές", "-", std::to_string(charge.size()) + " / " + std::to_string((int)(total + 0.5)) + " €"} },
+            bool withReceipt = askReceipt && pc_receipt.issue;
+            Receipt rc = ReceiptFromForm(pc_receipt, uid);
+            std::vector<FieldDiff> cdiffs = { {"Πελάτης", "-", g_app.userName(uid)}, {"Πακέτο", "-", pkgName},
+                                              {"Πληρωμές", "-", std::to_string(charge.size()) + " / " + FormatMoney(total) + " €"} };
+            if (askReceipt) cdiffs.push_back({"Απόδειξη", "-", ReceiptSummary(pc_receipt)});
+            RequestConfirm("Χρέωση πακέτου", cdiffs,
                 [=]() {
                     // one action -> one batch: all-or-nothing, and these payments may share one receipt
                     std::vector<Payment> batch;
@@ -2529,7 +2631,8 @@ static void DrawPackageChargeDialog() {
                         p.notes = note;
                         batch.push_back(p);
                     }
-                    g_app.conn->addPaymentBatch(batch, note);
+                    // one batch, and (if asked) its single receipt, in one transaction
+                    g_app.conn->addPaymentsWithReceipt(batch, note, withReceipt ? &rc : nullptr);
                     g_app.reloadAll();
                 });
             g_showPkgChargeDialog = false;
@@ -2558,6 +2661,7 @@ static void OpenResolvePayment(const Payment& p) {
     g_showResolveDialog = true;
     g_resolveDialogId = p.id;
     rb_paid.set(FormatMoney(p.amount_due));
+    rb_receipt = ReceiptForm{};
 }
 
 static void DrawResolveDialog() {
@@ -2575,6 +2679,8 @@ static void DrawResolveDialog() {
         ImGui::Separator();
         ImGui::InputText("Τελικό πληρωμένο ποσό", rb_paid.data, sizeof(rb_paid.data));
         bool paidOk = MoneyFieldHint(rb_paid);
+        const bool askReceipt = p.direction == "in";
+        if (askReceipt) { double v = 0.0; ParseMoney(rb_paid.str(), v); paidOk = DrawReceiptForm("rbrec", rb_receipt, v, 1) && paidOk; }
         ImGui::Spacing();
         if (ImGui::Button("Επίλυση", ImVec2(150, 0)) && paidOk) {
             Payment np = p; // preserve year/month/day and everything else not explicitly changed
@@ -2588,8 +2694,12 @@ static void DrawResolveDialog() {
                 {"Πληρωμένο", FormatMoney(p.amount_paid), FormatMoney(np.amount_paid)},
                 {"Επιλύθηκε στις", "-", np.resolved_at},
             };
-            RequestConfirm("Επίλυση μελλοντικής πληρωμής", diffs, [id, np]() {
-                g_app.conn->editPayment(id, np);
+            bool withReceipt = askReceipt && rb_receipt.issue;
+            Receipt rc = ReceiptFromForm(rb_receipt, np.user_id);
+            if (askReceipt) diffs.push_back({"Απόδειξη", "-", ReceiptSummary(rb_receipt)});
+            RequestConfirm("Επίλυση μελλοντικής πληρωμής", diffs, [id, np, withReceipt, rc]() {
+                if (withReceipt) g_app.conn->editPaymentWithReceipt(id, np, rc);   // both or neither
+                else g_app.conn->editPayment(id, np);
             });
             g_showResolveDialog = false;
             ImGui::CloseCurrentPopup();

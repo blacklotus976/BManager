@@ -20,6 +20,7 @@ private:
     std::string toJson(const std::vector<std::string>& cols, const std::vector<std::string>& vals);
     std::vector<std::string> getColumnNames(const std::string& table);
     int insertPayment(const Payment& p, int batchId);
+    int issueReceiptInTx(const Receipt& r, const std::vector<int>& paymentIds);   // caller owns the transaction
     void registerSqlFunctions();
     // (Re)creates the per-table audit triggers from the tables' current columns. Returns how many were
     // missing or altered (tampering signal once they have been installed).
@@ -149,6 +150,9 @@ public:
                        const std::string& status, const std::string& direction) override;
 
     int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) override;
+    int addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel, const Receipt* receipt) override;
+    int nextReceiptNumber(const std::string& series) override;
+    bool editPaymentWithReceipt(int id, const Payment& payment, const Receipt& receipt) override;
     bool voidReceipt(int id, const std::string& reason) override;
     Receipt getReceiptById(int id) override;
     std::vector<Receipt> getReceipts(int offset, int limit) override;

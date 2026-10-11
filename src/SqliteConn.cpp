@@ -1646,24 +1646,13 @@ int SqliteConn::insertPayment(const Payment& in, int batchId) {
 }
 
 int SqliteConn::addPaymentBatch(const std::vector<Payment>& payments, const std::string& label) {
-    if (payments.empty()) { lastError_ = "Δεν υπάρχουν πληρωμές για καταχώριση."; return -1; }
-    if (!executeQuery("BEGIN IMMEDIATE;")) return -1;
-    sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "INSERT INTO payment_batches (label) VALUES (?)", -1, &st, nullptr);
-    sqlite3_bind_text(st, 1, label.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(st);
+    if (payments.size() < 2) return addPaymentsWithReceipt(payments, label, nullptr) > 0 ? 0 : -1;
+    if (addPaymentsWithReceipt(payments, label, nullptr) < 0) return -1;
+    sqlite3_stmt* st = nullptr; int id = -1;
+    sqlite3_prepare_v2(db, "SELECT MAX(id) FROM payment_batches", -1, &st, nullptr);
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
-    int batchId = rc == SQLITE_DONE ? (int)sqlite3_last_insert_rowid(db) : -1;
-    for (const auto& p : payments) {
-        if (batchId < 0 || insertPayment(p, batchId) < 0) {
-            std::string why = lastError_;
-            executeQuery("ROLLBACK;");
-            lastError_ = "Η ομαδική καταχώριση απέτυχε, δεν αποθηκεύτηκε καμία πληρωμή: " + why;
-            return -1;
-        }
-    }
-    if (!executeQuery("COMMIT;")) { executeQuery("ROLLBACK;"); return -1; }
-    return batchId;
+    return id;
 }
 
 // NOTE: STUB (not present in transcript) — added to satisfy DataConn interface.
@@ -2503,7 +2492,61 @@ static std::string receiptToJson(const Receipt& r, const std::vector<int>& payme
            "\", \"status\": \"" + JsonEsc(r.status) + "\", \"payments\": [" + ids + "] }";
 }
 
-int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentIdsIn) {
+int SqliteConn::issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) {
+    // BEGIN IMMEDIATE: takes the write lock now, so the receipt number cannot be handed out twice.
+    if (!executeQuery("BEGIN IMMEDIATE;")) return -1;
+    int id = issueReceiptInTx(r, paymentIds);
+    if (id < 0) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = why; return -1; }
+    if (!executeQuery("COMMIT;")) { executeQuery("ROLLBACK;"); lastError_ = "Αποτυχία ολοκλήρωσης της απόδειξης."; return -1; }
+    return id;
+}
+
+int SqliteConn::addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel, const Receipt* receipt) {
+    if (payments.empty()) { lastError_ = "Δεν υπάρχουν πληρωμές για καταχώριση."; return -1; }
+    if (!executeQuery("BEGIN IMMEDIATE;")) return -1;
+    auto fail = [&]() { std::string why = lastError_; executeQuery("ROLLBACK;");
+                        lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + why; return -1; };
+    int batchId = -1;
+    if (payments.size() > 1) {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "INSERT INTO payment_batches (label) VALUES (?)", -1, &st, nullptr);
+        sqlite3_bind_text(st, 1, batchLabel.c_str(), -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+        batchId = (int)sqlite3_last_insert_rowid(db);
+    }
+    std::vector<int> ids;
+    for (const auto& p : payments) {
+        int id = insertPayment(p, batchId);
+        if (id < 0) return fail();
+        ids.push_back(id);
+    }
+    if (receipt && issueReceiptInTx(*receipt, ids) < 0) return fail();
+    if (!executeQuery("COMMIT;")) return fail();
+    return ids.front();
+}
+
+bool SqliteConn::editPaymentWithReceipt(int id, const Payment& payment, const Receipt& receipt) {
+    if (!executeQuery("BEGIN IMMEDIATE;")) return false;
+    if (!editPayment(id, payment) || issueReceiptInTx(receipt, {id}) < 0) {
+        std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + why; return false;
+    }
+    if (!executeQuery("COMMIT;")) { executeQuery("ROLLBACK;"); return false; }
+    return true;
+}
+
+int SqliteConn::nextReceiptNumber(const std::string& series) {
+    int n = 1;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(number),0) + 1 FROM receipts WHERE series = ?", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, (series.empty() ? std::string("A") : series).c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+int SqliteConn::issueReceiptInTx(const Receipt& in, const std::vector<int>& paymentIdsIn) {
     auto refuse = [&](const std::string& why) { lastError_ = why; return -1; };
     std::vector<int> paymentIds = paymentIdsIn;
     std::sort(paymentIds.begin(), paymentIds.end());
@@ -2517,9 +2560,7 @@ int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentI
     std::string rf = NormalizeRfCode(in.rf_code);
     if (!rf.empty() && !IsValidRfCode(rf)) return refuse("Μη έγκυρος κωδικός RF: " + in.rf_code);
 
-    // BEGIN IMMEDIATE: takes the write lock now, so the receipt number cannot be handed out twice.
-    if (!executeQuery("BEGIN IMMEDIATE;")) return -1;
-    auto rollback = [&](const std::string& why) { executeQuery("ROLLBACK;"); lastError_ = why; return -1; };
+    auto rollback = [&](const std::string& why) { lastError_ = why; return -1; };   // the caller rolls back
 
     long long totalCents = 0;
     std::set<int> batches, users;
@@ -2596,7 +2637,6 @@ int SqliteConn::issueReceipt(const Receipt& in, const std::vector<int>& paymentI
         sqlite3_finalize(up);
         if (rc != SQLITE_DONE) return rollback(std::string("Αποτυχία σύνδεσης πληρωμής: ") + sqlite3_errmsg(db));
     }
-    if (!executeQuery("COMMIT;")) return rollback("Αποτυχία ολοκλήρωσης της απόδειξης.");
     return r.id;
 }
 

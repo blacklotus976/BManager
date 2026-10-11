@@ -149,6 +149,14 @@ public:
     // Once issued, the DB itself refuses to change/delete those payments' amounts, client, service or
     // receipt link, and refuses any edit of the receipt except voiding it.
     virtual int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) = 0;
+    // Records payments (one, or several as one batch) AND, if `receipt` is given, their receipt -- all in one
+    // transaction: either everything is saved or nothing. Returns the first new payment id, -1 on failure.
+    virtual int addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel,
+                                       const Receipt* receipt) = 0;
+    // The number the next receipt of a series will get (for showing "θα εκδοθεί Α-124").
+    virtual int nextReceiptNumber(const std::string& series) = 0;
+    // Edits a payment (e.g. resolving a future one) and issues its receipt in the same transaction.
+    virtual bool editPaymentWithReceipt(int id, const Payment& payment, const Receipt& receipt) = 0;
     // Voids an issued receipt (reason required). Its payments become free to edit or re-receipt;
     // they keep pointing at the voided receipt until they are put on a new one, so history stays.
     virtual bool voidReceipt(int id, const std::string& reason) = 0;
