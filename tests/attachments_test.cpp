@@ -50,6 +50,14 @@ int main() {
         CHECK(!c.removeAttachment(a2, "ξανά")); c.takeLastError();               // already removed: final
         CHECK(c.verifyAuditLog().ok);
     }
+    {   // a stored file that disappears is reported by the integrity check
+        SqliteConn c(db);
+        auto list = c.getAttachments("charge", 1);
+        if (!list.empty()) std::filesystem::remove(std::filesystem::u8path(c.attachmentFullPath(list[0])));
+        auto chk = c.verifyAuditLog();
+        bool missing = false; for (auto& p : chk.problems) if (p.find("συνημμένο") != std::string::npos) missing = true;
+        CHECK(!chk.ok && missing);
+    }
     {   // outside tools can't delete or rewrite attachment rows
         sqlite3* d = nullptr; sqlite3_open(db.c_str(), &d);
         CHECK(sqlite3_exec(d, "DELETE FROM attachments", nullptr, nullptr, nullptr) != SQLITE_OK);

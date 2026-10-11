@@ -2965,6 +2965,20 @@ static DataConn::AuditCheck VerifyAudit(sqlite3* db, const std::string& dbPath_)
         sqlite3_finalize(st);
     }
 
+    // 3b. attachment files are still there, with the recorded size (the content hash is their file name)
+    if (TableExists(db, "attachments")) {
+        namespace fs = std::filesystem;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT id, stored_path, size_bytes, file_name FROM attachments WHERE removed_at IS NULL", -1, &st, nullptr);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            fs::path f = fs::path(dbPath_).parent_path() / fs::u8path((const char*)sqlite3_column_text(st, 1));
+            std::error_code ec;
+            if (!fs::exists(f, ec) || (long long)fs::file_size(f, ec) != sqlite3_column_int64(st, 2))
+                problem(std::string("Το συνημμένο «") + (const char*)sqlite3_column_text(st, 3) + "» λείπει ή έχει αλλοιωθεί");
+        }
+        sqlite3_finalize(st);
+    }
+
     // 4. daily anchors written outside the database still match
     namespace fs = std::filesystem;
     fs::path anchor = fs::path(dbPath_).parent_path() / "backups" / (fs::path(dbPath_).stem().string() + "_audit_anchor.txt");
