@@ -88,3 +88,9 @@ endif()
 # has for a long time) -- it was a leftover from the project's very first draft,
 # copied into every release for no functional reason. Correcting that here:
 # nothing needs copying post-build anymore.
+
+# ---- Unit tests (no GUI deps): cmake --build <dir> --target money_test && ctest --test-dir <dir> ----
+enable_testing()
+add_executable(money_test EXCLUDE_FROM_ALL tests/money_test.cpp)
+target_include_directories(money_test PRIVATE src)
+add_test(NAME money COMMAND money_test)

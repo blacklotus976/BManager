@@ -1,5 +1,6 @@
 ﻿#include "SqliteConn.h"
 #include "Platform.h"
+#include "Money.h"
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
@@ -63,7 +64,7 @@ static User MapUserRow(sqlite3_stmt* s) {
 }
 
 static std::string serviceToJson(const Service& s) {
-    return "{ \"id\": " + std::to_string(s.id) + ", \"label\": \"" + s.label + "\", \"suggested_price\": " + std::to_string(s.suggested_price) + " }";
+    return "{ \"id\": " + std::to_string(s.id) + ", \"label\": \"" + s.label + "\", \"suggested_price\": " + FormatMoney(s.suggested_price) + " }";
 }
 
 // Direction is a 2-value attribute (in/out) after the client's revert away from
@@ -78,7 +79,14 @@ static std::string NormalizeDirection(const char* raw) {
 }
 
 static std::string paymentToJson(const Payment& p) {
-    return "{ \"id\": " + std::to_string(p.id) + ", \"service_id\": " + std::to_string(p.service_id) + ", \"user_id\": " + std::to_string(p.user_id) + ", \"year\": " + std::to_string(p.year) + ", \"month\": " + std::to_string(p.month) + ", \"amount_due\": " + std::to_string(p.amount_due) + ", \"amount_paid\": " + std::to_string(p.amount_paid) + ", \"status\": \"" + p.status + "\", \"direction\": \"" + p.direction + "\", \"resolution_date\": \"" + p.resolution_date + "\", \"resolved_at\": \"" + p.resolved_at + "\" }";
+    return "{ \"id\": " + std::to_string(p.id) + ", \"service_id\": " + std::to_string(p.service_id) + ", \"user_id\": " + std::to_string(p.user_id) + ", \"year\": " + std::to_string(p.year) + ", \"month\": " + std::to_string(p.month) + ", \"amount_due\": " + FormatMoney(p.amount_due) + ", \"amount_paid\": " + FormatMoney(p.amount_paid) + ", \"status\": \"" + p.status + "\", \"direction\": \"" + p.direction + "\", \"resolution_date\": \"" + p.resolution_date + "\", \"resolved_at\": \"" + p.resolved_at + "\" }";
+}
+
+static int UserVersion(sqlite3* db) {
+    int v = 0; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &st, nullptr) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return v;
 }
 
 SqliteConn::SqliteConn(const std::string& dbPath) {
@@ -463,7 +471,27 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
                      "UPDATE payments SET apartment_id = (SELECT apartment_id FROM users WHERE users.id = payments.user_id) WHERE apartment_id IS NULL;"
                      "UPDATE payments SET created_at = printf('%04d-%02d-%02d 00:00:00', year, month, day) WHERE created_at IS NULL;"
                      "CREATE INDEX IF NOT EXISTS idx_payments_apartment ON payments(apartment_id);");
-        executeQuery("PRAGMA user_version = 2;");
+        if (UserVersion(db) < 2) executeQuery("PRAGMA user_version = 2;");
+    }
+
+    // --- Migration v3: money is euros with exactly two decimals. Older rows could hold float noise
+    // (e.g. 182.52499999999998) or a balance that drifted from due - paid; snap every amount to whole
+    // cents and re-derive balance in cents. One transaction, logged once, never re-run. ---
+    if (UserVersion(db) < 3) {
+        auto fixed = [&](const char* sql) { executeQuery(sql); return sqlite3_changes(db); };
+        executeQuery("BEGIN;");
+        int nPay = fixed("UPDATE payments SET "
+                         " amount_due  = ROUND(COALESCE(amount_due,0), 2),"
+                         " amount_paid = ROUND(COALESCE(amount_paid,0), 2),"
+                         " balance     = (CAST(ROUND(COALESCE(amount_due,0)*100) AS INTEGER) - CAST(ROUND(COALESCE(amount_paid,0)*100) AS INTEGER)) / 100.0 "
+                         "WHERE amount_due IS NOT ROUND(COALESCE(amount_due,0), 2) OR amount_paid IS NOT ROUND(COALESCE(amount_paid,0), 2) "
+                         "   OR balance IS NOT (CAST(ROUND(COALESCE(amount_due,0)*100) AS INTEGER) - CAST(ROUND(COALESCE(amount_paid,0)*100) AS INTEGER)) / 100.0;");
+        int nSvc = fixed("UPDATE services SET suggested_price = ROUND(suggested_price, 2) WHERE suggested_price IS NOT ROUND(suggested_price, 2);");
+        executeQuery("PRAGMA user_version = 3;");
+        executeQuery("COMMIT;");
+        if (nPay + nSvc > 0)
+            logAction("migration", 3, "MONEY_TO_CENTS", "",
+                      "{ \"payments_fixed\": " + std::to_string(nPay) + ", \"services_fixed\": " + std::to_string(nSvc) + " }", "db");
     }
 
     greekHeaders["users"] = {"ΚΩΔ", "ΟΝΟΜΑ", "ΤΗΛ", "ΗΜ/ΝΙΑ ΔΗΜ.", "ΕΙΔ. ΚΩΔ.", "ΚΩΔ ΔΙΑΜΕΡΙΣΜΑΤΟΣ"};
@@ -972,7 +1000,8 @@ bool SqliteConn::addService(int userId, const Service& s) {
     return addServiceGetId(userId, s) >= 0;
 }
 
-int SqliteConn::addServiceGetId(int userId, const Service& s) {
+int SqliteConn::addServiceGetId(int userId, const Service& in) {
+    Service s = in; s.suggested_price = RoundMoney(s.suggested_price);
     if (s.suggested_price <= 0.0) return -1;   // every service must carry a price
     std::string sql = "INSERT INTO services (label, extra_notes, suggested_price) VALUES (?,?,?)";
     sqlite3_stmt* stmt;
@@ -984,6 +1013,7 @@ int SqliteConn::addServiceGetId(int userId, const Service& s) {
     sqlite3_finalize(stmt);
     if(rc != SQLITE_DONE) return -1;
     int id = sqlite3_last_insert_rowid(db);
+    s.id = id;
     logAction("services", id, "INSERT", "", serviceToJson(s), "business");
     if (userId >= 0 && !addServiceUser(id, userId)) return -1;   // userId < 0: independent service, no roster row
     return id;
@@ -1013,7 +1043,8 @@ std::vector<User> SqliteConn::getUsersForService(int serviceId) {
     return results;
 }
 
-bool SqliteConn::editService(int id, const Service& s) {
+bool SqliteConn::editService(int id, const Service& in) {
+    Service s = in; s.suggested_price = RoundMoney(s.suggested_price);
     if (s.suggested_price <= 0.0) return false;
     Service old = getServiceById(id);
     std::string sql = "UPDATE services SET label=?, extra_notes=?, suggested_price=? WHERE id=?";
@@ -1181,7 +1212,11 @@ std::vector<DataConn::MasterServiceSummary> SqliteConn::getMasterServiceSummarie
 }
 
 // --- PAYMENTS (Including Future) ---
-bool SqliteConn::addPayment(const Payment& p) {
+bool SqliteConn::addPayment(const Payment& in) {
+    Payment p = in;                                   // money snapped to cents; balance always due - paid
+    p.amount_due = RoundMoney(p.amount_due);
+    p.amount_paid = RoundMoney(p.amount_paid);
+    p.balance = MoneySub(p.amount_due, p.amount_paid);
     int aptId = p.apartment_id >= 0 ? p.apartment_id : apartmentAt(p.user_id, p.year, p.month, p.day);
     std::string sql = "INSERT INTO payments (service_id, year, month, day, amount_due, amount_paid, balance, status, notes, user_id, direction, resolution_date, resolved_at, apartment_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(?15, datetime('now','localtime')))";
     sqlite3_stmt* stmt;
@@ -1198,12 +1233,16 @@ bool SqliteConn::addPayment(const Payment& p) {
     if (p.created_at.empty()) sqlite3_bind_null(stmt,15); else sqlite3_bind_text(stmt,15,p.created_at.c_str(),-1,SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { int id = sqlite3_last_insert_rowid(db); logAction("payments", id, "INSERT", "", paymentToJson(p), "business"); return true; }
+    if(rc == SQLITE_DONE) { int id = sqlite3_last_insert_rowid(db); p.id = id; logAction("payments", id, "INSERT", "", paymentToJson(p), "business"); return true; }
     return false;
 }
 
 // NOTE: STUB (not present in transcript) — added to satisfy DataConn interface.
-bool SqliteConn::editPayment(int id, const Payment& p) {
+bool SqliteConn::editPayment(int id, const Payment& in) {
+    Payment p = in;                                   // money snapped to cents; balance always due - paid
+    p.amount_due = RoundMoney(p.amount_due);
+    p.amount_paid = RoundMoney(p.amount_paid);
+    p.balance = MoneySub(p.amount_due, p.amount_paid);
     Payment old = getPaymentById(id);
     int aptId = p.apartment_id;
     if (aptId < 0) {
@@ -1225,7 +1264,7 @@ bool SqliteConn::editPayment(int id, const Payment& p) {
     sqlite3_bind_int(stmt,14,id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if(rc == SQLITE_DONE) { logAction("payments", id, "UPDATE", paymentToJson(old), paymentToJson(p), "business"); return true; }
+    if(rc == SQLITE_DONE) { p.id = id; logAction("payments", id, "UPDATE", paymentToJson(old), paymentToJson(p), "business"); return true; }
     return false;
 }
 
@@ -1539,7 +1578,7 @@ std::vector<std::string> SqliteConn::getTimelineActions(const std::string& dateF
 // --- METRICS ---
 double SqliteConn::getTotalPaid(int year, int month, int userId, int serviceId) {
     double total = 0;
-    std::string sql = "SELECT SUM(amount_paid) FROM payments WHERE year=? AND month=? AND status != 'future'";
+    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM payments WHERE year=? AND month=? AND status != 'future'";
     if(userId != -1) sql += " AND user_id=" + std::to_string(userId);
     if(serviceId != -1) sql += " AND service_id=" + std::to_string(serviceId);
     sqlite3_stmt* stmt;
@@ -1552,7 +1591,7 @@ double SqliteConn::getTotalPaid(int year, int month, int userId, int serviceId) 
 
 double SqliteConn::getTotalPending(int year, int month, int userId, int serviceId) {
     double total = 0;
-    std::string sql = "SELECT SUM(amount_due - amount_paid) FROM payments WHERE year=? AND month=? AND status='pending'";
+    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_due*100) AS INTEGER) - CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM payments WHERE year=? AND month=? AND status='pending'";
     if(userId != -1) sql += " AND user_id=" + std::to_string(userId);
     if(serviceId != -1) sql += " AND service_id=" + std::to_string(serviceId);
     sqlite3_stmt* stmt;
@@ -1712,26 +1751,25 @@ std::vector<DataConn::JointServiceSummary> SqliteConn::getJointServices() {
         jss.userTotalPaid.clear();
         jss.userTotalDue.clear();
         jss.userNet.clear();
-        jss.totalDue = 0.0;
-        jss.totalPaid = 0.0;
-        jss.totalNet = 0.0;
+        long long totDue = 0, totPaid = 0, totNet = 0;    // cents: the net must hit exactly 0
         for (auto& u : jss.users) {
             auto payments = getPaymentsForUser(u.id); // only this user's payments
-            double due = 0.0, paid = 0.0, paidOut = 0.0, collected = 0.0;
+            long long due = 0, paid = 0, paidOut = 0, collected = 0;
             for (auto& p : payments) {
                 if (p.service_id == s.id && p.status != "future") { // only payments for this service, excl. future
-                    due += p.amount_due;
-                    paid += p.amount_paid;
-                    if (p.direction == "out") paidOut += p.amount_paid; else collected += p.amount_paid;
+                    due += ToCents(p.amount_due);
+                    paid += ToCents(p.amount_paid);
+                    if (p.direction == "out") paidOut += ToCents(p.amount_paid); else collected += ToCents(p.amount_paid);
                 }
             }
-            jss.userTotalDue.push_back(due);
-            jss.userTotalPaid.push_back(paid);
-            jss.userNet.push_back(paidOut - collected);
-            jss.totalDue += due;
-            jss.totalPaid += paid;
-            jss.totalNet += (paidOut - collected);
+            jss.userTotalDue.push_back(FromCents(due));
+            jss.userTotalPaid.push_back(FromCents(paid));
+            jss.userNet.push_back(FromCents(paidOut - collected));
+            totDue += due; totPaid += paid; totNet += paidOut - collected;
         }
+        jss.totalDue = FromCents(totDue);
+        jss.totalPaid = FromCents(totPaid);
+        jss.totalNet = FromCents(totNet);
         results.push_back(jss);
     }
     sqlite3_finalize(stmt);

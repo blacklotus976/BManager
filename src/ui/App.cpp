@@ -13,6 +13,7 @@
 #include "models/Payment.h"
 #include "models/Note.h"
 #include "Config.h"
+#include "Money.h"
 #include "Seed.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -257,6 +258,44 @@ struct TextBuf {
     void set(const std::string& s) { std::snprintf(data, sizeof(data), "%s", s.c_str()); }
     std::string str() const { return std::string(data); }
 };
+
+// ---------------------------------------------------------------------------
+// Money inputs. Amounts are euros with exactly two decimals; people type "12,50" as often as
+// "12.50", so plain InputDouble/atof (which stop at the comma -> 12) are never used for money.
+// ---------------------------------------------------------------------------
+static const ImVec4 kInvalidMoneyCol(0.95f, 0.40f, 0.35f, 1.0f);
+
+// Red hint after a money text field that does not parse. Returns whether it is valid.
+static bool MoneyFieldHint(const TextBuf& b) {
+    double v = 0.0;
+    bool ok = ParseMoney(b.str(), v);
+    if (!ok) { ImGui::SameLine(); ImGui::TextColored(kInvalidMoneyCol, "μη έγκυρο ποσό (π.χ. 12,50)"); }
+    return ok;
+}
+
+// Drop-in for ImGui::InputDouble on money: while focused it keeps the typed text, otherwise it
+// shows the value as 0.00. *v only changes to a valid, cent-exact amount. Returns true on change.
+static bool InputMoney(const char* label, double* v) {
+    static std::map<ImGuiID, std::string> editing;   // text of the field(s) currently being typed in
+    ImGuiID id = ImGui::GetID(label);
+    auto it = editing.find(id);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s", it != editing.end() ? it->second.c_str() : FormatMoney(*v).c_str());
+    ImGui::InputText(label, buf, sizeof(buf));
+    bool changed = false;
+    if (ImGui::IsItemActive()) {
+        editing[id] = buf;
+        double parsed = 0.0;
+        if (ParseMoney(buf, parsed)) {
+            if (ToCents(parsed) != ToCents(*v)) { *v = parsed; changed = true; }
+        } else if (buf[0]) {
+            ImGui::SameLine(); ImGui::TextColored(kInvalidMoneyCol, "μη έγκυρο ποσό");
+        }
+    } else {
+        editing.erase(id);
+    }
+    return changed;
+}
 
 // ---------------------------------------------------------------------------
 // Global app state
@@ -1558,7 +1597,7 @@ static void DrawPackageServiceForm() {
     ImGui::InputTextWithHint("##pkgnewsvc", "Νέα υπηρεσία (π.χ. Πετρέλαιο)", sb_pkgNewServiceLabel.data, sizeof(sb_pkgNewServiceLabel.data));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(90);
-    ImGui::InputDouble("€##pkgnewprice", &sb_pkgNewServicePrice, 0.0, 0.0, "%.2f");
+    InputMoney("€##pkgnewprice", &sb_pkgNewServicePrice);
     ImGui::SameLine();
     if (ImGui::Button("+ Νέα Υπηρεσία") && sb_pkgNewServicePrice > 0.0) {
         std::string lbl = sb_pkgNewServiceLabel.str();
@@ -1629,7 +1668,7 @@ static void DrawServiceDialog() {
         // A service is an independent catalog entry: only its own attributes here.
         ImGui::InputText("Ετικέτα", sb_label.data, sizeof(sb_label.data));
         ImGui::InputTextMultiline("Σημειώσεις", sb_notes.data, sizeof(sb_notes.data), ImVec2(0, 60));
-        ImGui::InputDouble("Προτεινόμενη τιμή (€)", &sb_price, 1.0, 10.0, "%.2f");
+        InputMoney("Προτεινόμενη τιμή (€)", &sb_price);
         ImGui::Spacing();
         bool needPrice = sb_price <= 0.0;
         if (needPrice) ImGui::TextColored(ImVec4(1,0.5f,0.3f,1), "Η τιμή είναι υποχρεωτική (> 0).");
@@ -1867,7 +1906,7 @@ static void DrawJointDialog() {
     if (BeginGuardedModal("Νέα Κοινόχρηστη Υπηρεσία", g_showJointDialog, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::InputText("Ετικέτα", jb_label.data, sizeof(jb_label.data));
         ImGui::InputTextMultiline("Σημειώσεις", jb_notes.data, sizeof(jb_notes.data), ImVec2(0, 50));
-        ImGui::InputDouble("Προτεινόμενη τιμή (€)", &jb_price, 1.0, 10.0, "%.2f");
+        InputMoney("Προτεινόμενη τιμή (€)", &jb_price);
         ImGui::Separator();
         ImGui::Text("Επιλογή συνιδιοκτητών (2+):");
         if (jb_selected.size() != g_app.users.size()) jb_selected.assign(g_app.users.size(), 0);
@@ -2209,7 +2248,7 @@ static void DrawPaymentDialog() {
         DiffAdd(d, "Ημερομηνία", od, pb_dateStr);
         if (o.user_id != pb_userId) d.push_back({"Πελάτης", g_app.userName(o.user_id), g_app.userName(pb_userId)});
         if (o.service_id != pb_serviceId) d.push_back({"Υπηρεσία", g_app.serviceLabel(o.service_id), g_app.serviceLabel(pb_serviceId)});
-        double nd = atof(pb_due.str().c_str()), np = atof(pb_paid.str().c_str());
+        double nd = 0.0, np = 0.0; ParseMoney(pb_due.str(), nd); ParseMoney(pb_paid.str(), np);
         char a[32], b[32];
         if (std::fabs(o.amount_due - nd) > 0.004) { std::snprintf(a, sizeof(a), "%.2f", o.amount_due); std::snprintf(b, sizeof(b), "%.2f", nd); d.push_back({"Οφειλή", a, b}); }
         if (!pb_isFuture && std::fabs(o.amount_paid - np) > 0.004) { std::snprintf(a, sizeof(a), "%.2f", o.amount_paid); std::snprintf(b, sizeof(b), "%.2f", np); d.push_back({"Πληρωμένο", a, b}); }
@@ -2243,6 +2282,7 @@ static void DrawPaymentDialog() {
         ImGui::RadioButton("Πληρωμή εκ μέρους πελάτη", &pb_direction, 1);
         ImGui::Spacing();
         ImGui::InputText("Οφειλόμενο ποσό", pb_due.data, sizeof(pb_due.data));
+        bool amountsOk = MoneyFieldHint(pb_due);
         ImGui::Checkbox("Μελλοντική πληρωμή", &pb_isFuture);
         if (pb_isFuture) {
             ImGui::TextDisabled("Δεν έχει πληρωθεί ακόμα -- δεν προσμετράται σε κανένα σύνολο μέχρι να επιλυθεί.");
@@ -2254,25 +2294,26 @@ static void DrawPaymentDialog() {
             ImGui::TextDisabled("Πότε αναμένεται αυτή η μελλοντική πληρωμή να γίνει πραγματική.");
         } else {
             ImGui::InputText("Πληρωμένο ποσό", pb_paid.data, sizeof(pb_paid.data));
+            amountsOk = MoneyFieldHint(pb_paid) && amountsOk;
         }
         // Notes/comment is a normal, always-visible, optional attribute of every
         // payment -- never a substitute for the amount fields (per client correction).
         ImGui::InputTextMultiline("Σημειώσεις/Σχόλιο", pb_notes.data, sizeof(pb_notes.data), ImVec2(0, 60));
         ImGui::Spacing();
-        if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) {
+        if (ImGui::Button("Αποθήκευση", ImVec2(150, 0)) && amountsOk) {
             Payment np;
             np.user_id = pb_userId; np.service_id = pb_serviceId;
                         int iy = 0, im = 0, id = 0;
             std::sscanf(pb_dateStr.c_str(), "%d-%d-%d", &iy, &im, &id);
             np.year = iy; np.month = im; np.day = id;
             if (pb_isFuture) {
-                np.amount_due = atof(pb_due.str().c_str()); np.amount_paid = 0.0;
+                ParseMoney(pb_due.str(), np.amount_due); np.amount_paid = 0.0;
                 np.balance = np.amount_due;
                 np.status = "future";
                 np.direction = pb_direction == 1 ? "out" : "in";
             } else {
-                np.amount_due = atof(pb_due.str().c_str()); np.amount_paid = atof(pb_paid.str().c_str());
-                np.balance = np.amount_due - np.amount_paid;
+                ParseMoney(pb_due.str(), np.amount_due); ParseMoney(pb_paid.str(), np.amount_paid);
+                np.balance = MoneySub(np.amount_due, np.amount_paid);
                 np.status = "paid"; // resolved immediately -- same status value the Resolve flow uses
                 np.direction = pb_direction == 1 ? "out" : "in";
             }
@@ -2282,14 +2323,14 @@ static void DrawPaymentDialog() {
                 Payment old = g_app.conn->getPaymentById(g_paymentDialogId);
                 np.resolved_at = old.resolved_at; // editing via the normal dialog never touches resolved_at
                 std::vector<FieldDiff> diffs = {
-                    {"Ποσό οφειλής", std::to_string(old.amount_due), std::to_string(np.amount_due)},
-                    {"Πληρωμένο", std::to_string(old.amount_paid), std::to_string(np.amount_paid)},
+                    {"Ποσό οφειλής", FormatMoney(old.amount_due), FormatMoney(np.amount_due)},
+                    {"Πληρωμένο", FormatMoney(old.amount_paid), FormatMoney(np.amount_paid)},
                     {"Κατάσταση", old.status, np.status},
                 };
                 int id = g_paymentDialogId;
                 RequestConfirm("Επεξεργασία πληρωμής", diffs, [id, np]() { g_app.conn->editPayment(id, np); g_app.reloadPayments(); });
             } else {
-                std::vector<FieldDiff> diffs = { {"Χρήστης", "-", g_app.userName(np.user_id)}, {"Ποσό", "-", std::to_string(np.amount_due)} };
+                std::vector<FieldDiff> diffs = { {"Χρήστης", "-", g_app.userName(np.user_id)}, {"Ποσό", "-", FormatMoney(np.amount_due)} };
                 RequestConfirm("Νέα πληρωμή", diffs, [np]() { g_app.conn->addPayment(np); g_app.reloadPayments(); });
             }
             g_showPaymentDialog = false;
@@ -2331,8 +2372,8 @@ static void OpenChargeService(int serviceId) {
     pb_serviceId = serviceId;
     pb_lockService = true;   // opened from this specific service -- locked
     Service s = g_app.conn->getServiceById(serviceId);
-    pb_due.set(std::to_string(s.suggested_price));
-    pb_paid.set(std::to_string(s.suggested_price));
+    pb_due.set(FormatMoney(s.suggested_price));
+    pb_paid.set(FormatMoney(s.suggested_price));
 }
 
 static void DrawPackageChargeDialog() {
@@ -2410,7 +2451,7 @@ static void DrawPackageChargeDialog() {
                         p.year = iy; p.month = im; p.day = id;
                         p.amount_due = s.suggested_price;
                         p.amount_paid = fut ? 0.0 : s.suggested_price;
-                        p.balance = p.amount_due - p.amount_paid;
+                        p.balance = MoneySub(p.amount_due, p.amount_paid);
                         p.status = fut ? "future" : "paid";
                         p.direction = dir;
                         p.resolution_date = fut ? res : "";
@@ -2444,7 +2485,7 @@ static TextBuf rb_paid;
 static void OpenResolvePayment(const Payment& p) {
     g_showResolveDialog = true;
     g_resolveDialogId = p.id;
-    rb_paid.set(std::to_string(p.amount_due));
+    rb_paid.set(FormatMoney(p.amount_due));
 }
 
 static void DrawResolveDialog() {
@@ -2461,17 +2502,18 @@ static void DrawResolveDialog() {
         if (!p.resolution_date.empty()) ImGui::TextDisabled("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
         ImGui::Separator();
         ImGui::InputText("Τελικό πληρωμένο ποσό", rb_paid.data, sizeof(rb_paid.data));
+        bool paidOk = MoneyFieldHint(rb_paid);
         ImGui::Spacing();
-        if (ImGui::Button("Επίλυση", ImVec2(150, 0))) {
+        if (ImGui::Button("Επίλυση", ImVec2(150, 0)) && paidOk) {
             Payment np = p; // preserve year/month/day and everything else not explicitly changed
-            np.amount_paid = atof(rb_paid.str().c_str());
-            np.balance = np.amount_due - np.amount_paid;
+            ParseMoney(rb_paid.str(), np.amount_paid);
+            np.balance = MoneySub(np.amount_due, np.amount_paid);
             np.status = "paid";
             np.resolved_at = CurrentTimestampString();
             int id = g_resolveDialogId;
             std::vector<FieldDiff> diffs = {
                 {"Κατάσταση", p.status, np.status},
-                {"Πληρωμένο", std::to_string(p.amount_paid), std::to_string(np.amount_paid)},
+                {"Πληρωμένο", FormatMoney(p.amount_paid), FormatMoney(np.amount_paid)},
                 {"Επιλύθηκε στις", "-", np.resolved_at},
             };
             RequestConfirm("Επίλυση μελλοντικής πληρωμής", diffs, [id, np]() {
@@ -2534,7 +2576,7 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
             char db[16];
             std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
             pb_dateStr = db;
-            pb_due.set(std::to_string(p.amount_due)); pb_paid.set(std::to_string(p.amount_paid));
+            pb_due.set(FormatMoney(p.amount_due)); pb_paid.set(FormatMoney(p.amount_paid));
             pb_isFuture = (p.status == "future"); pb_notes.set(p.notes); pb_resolutionDate = p.resolution_date;
             pb_direction = p.direction == "out" ? 1 : 0;
             pb_lockService = false;   // editing an existing payment -- service is editable
@@ -2680,7 +2722,7 @@ static void DrawPaymentsScreen() {
                         char db[16];
             std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
             pb_dateStr = db;
-            pb_due.set(std::to_string(p.amount_due)); pb_paid.set(std::to_string(p.amount_paid));
+            pb_due.set(FormatMoney(p.amount_due)); pb_paid.set(FormatMoney(p.amount_paid));
             pb_isFuture = (p.status == "future"); pb_notes.set(p.notes); pb_resolutionDate = p.resolution_date;
             pb_direction = p.direction == "out" ? 1 : 0;
             pb_lockService = false;   // editing an existing payment -- service is editable
@@ -3142,7 +3184,7 @@ static void DrawServiceDetailWindow() {
             std::string line = std::string(DirectionBadge(p.direction)) + "  " +
                 g_app.userName(p.user_id) + "  |  " +
                 std::to_string(p.year) + "-" + std::to_string(p.month) + "-" + std::to_string(p.day) +
-                "  " + p.status + "  " + std::to_string(p.amount_paid) + "/" + std::to_string(p.amount_due) +
+                "  " + p.status + "  " + FormatMoney(p.amount_paid) + "/" + FormatMoney(p.amount_due) +
                 (p.status == "future" && !p.resolution_date.empty() ? "  (αναμ. " + p.resolution_date + ")" : std::string());
             ImGui::PushStyleColor(ImGuiCol_Text, DirectionColor(p.direction));
             bool clicked = ImGui::Selectable(line.c_str());
@@ -3158,7 +3200,7 @@ static void DrawServiceDetailWindow() {
                     char db[16];
                     std::snprintf(db, sizeof(db), "%04d-%02d-%02d", p.year, p.month, p.day);
                     pb_dateStr = db;
-                    pb_due.set(std::to_string(p.amount_due)); pb_paid.set(std::to_string(p.amount_paid));
+                    pb_due.set(FormatMoney(p.amount_due)); pb_paid.set(FormatMoney(p.amount_paid));
                     pb_isFuture = (p.status == "future"); pb_notes.set(p.notes); pb_resolutionDate = p.resolution_date;
                     pb_direction = p.direction == "out" ? 1 : 0;
                     pb_lockService = false;   // editing an existing payment -- service is editable
@@ -4671,7 +4713,7 @@ static void DrawSearchScreen() {
         };
         auto money = [](const char* hint, double& v, float w) {
             ImGui::SetNextItemWidth(w);
-            ImGui::InputDouble((std::string("##sqm") + hint).c_str(), &v, 0.0, 0.0, "%.2f");
+            InputMoney((std::string("##sqm") + hint).c_str(), &v);
             ImGui::SameLine(); ImGui::TextDisabled("%s", hint);
         };
         switch (g_sqCat) {

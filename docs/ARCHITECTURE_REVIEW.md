@@ -30,7 +30,7 @@ important property is: *money records can be trusted and disputes can be settled
 
 | # | Issue | Evidence | Why it matters |
 |---|---|---|---|
-| 1 | **Money stored as `REAL` (float)** | `payments.amount_paid` contains `182.52499999999998` | Rounding drift in totals; banks/AADE need exact cents. |
+| 1 | ~~Money stored as `REAL` with float noise~~ **Fixed** — see §10 | `payments.amount_paid` contained `182.52499999999998` | Rounding drift in totals; banks/AADE need exact cents. |
 | 2 | **Payments are mutable and deletable** (`UPDATE`/`DELETE payments`) | `editPayment`, `removePayment` | Exactly the dispute scenario the client fears: a recorded payment can silently change. |
 | 3 | **Audit log is not trustworthy** | 16 of 407 entries are invalid JSON (strings concatenated without escaping); INSERT logs record `"id": -1`; DELETE logs store no old data; user/apartment deletes lose content | You can't reconstruct what was deleted, and the history can't be parsed reliably. |
 | 4 | **Audit log can be tampered with** | Raw SQL console (`executeRawQuery`) can `DELETE FROM audit_log`; no hash chain | Anyone with the app can rewrite history. |
@@ -170,3 +170,39 @@ sudo apt install cmake g++ libglfw3-dev libgl-dev
 ./build-linux/PropertyManager
 ```
 Windows build (`build_imgui.bat` + vcpkg) is unchanged.
+
+## 10. Money handling (implemented)
+
+- `src/Money.h`: `ToCents`/`FromCents`/`RoundMoney`/`MoneySub`/`FormatMoney`/`ParseMoney`.
+- Every amount written by `addPayment`/`editPayment`/`addService*`/`editService` is snapped to whole
+  cents, and `balance` is always re-derived as `due − paid` in integer cents (the DB layer owns this rule).
+- SQL totals and joint-service nets are summed in integer cents, so "net = 0" is exactly 0.
+- Migration v3 (`PRAGMA user_version = 3`): cleans existing rows once, in a transaction, logged to `audit_log`.
+- UI: all money inputs accept `12,50`, `12.50`, `1.234,56`, `€ 40`; invalid/3-decimal input is shown in red
+  and blocks Save (previously `atof("12,50")` silently stored **12.00**). Prefills show `35.00`, not `35.000000`.
+- `tests/money_test.cpp` (run by `build_linux.sh` via ctest).
+- Columns stay `REAL` euros so the raw view, CSV and SQL console read naturally; on PostgreSQL use `NUMERIC(12,2)`.
+
+## 11. The client's business (expresshomeservice.gr)
+
+EXPRESS HOME SERVICE Ε.Π.Ε., Νέα Ερυθραία. Offering (from the site/catalog seeded in `Seed.cpp`): building
+management & κοινόχρηστα, heating oil, burner/boiler service, disinfection/pest control, drain unblocking,
+fire extinguishers (buy / lend / service / refill), cleaning crews. **Introductory packages (πακέτα γνωριμίας):**
+- **BASIC — from €15/month**: κοινόχρηστα issuing, 2 disinfection/pest-control visits, burner service, free public-liability insurance.
+- **ALL IN ONE — from €40/month**: full management, expense transparency, fuel cost allocation, multiple payment methods, legal receipts.
+
+What that implies for the admin panel:
+1. **Packages are subscriptions with entitlements**, not just groupings: "€15/month includes 2 pest-control
+   visits/year + 1 burner service". Needed: `contracts` (customer/building ↔ package, start/end, monthly price)
+   and an **entitlement counter** (used 1 of 2 visits) so extra visits are billed and included ones are €0.
+2. **"From €X"** = price depends on building size → per-contract price override, frozen on each charge.
+3. **Promotions** like "free extinguisher lending inside a package", "1 in 4 fuel additive orders free",
+   introductory price for N months → promotion rules applied at charge time and stored on the charge line.
+4. **Customer is often the building (πολυκατοικία, own ΑΦΜ)**, not a person: the building pays the management
+   fee, apartments owe κοινόχρηστα shares. Model "who is billed" as either a building or a resident.
+5. **Expense transparency & legal receipts** are part of what he sells: every expense (`direction='out'`)
+   should carry the supplier, document number and an attachment (scan/PDF), visible to residents later on the portal.
+6. **Fuel allocation** (κατανομή πετρελαίου by χιλιοστά/hours) is a calculation the ALL IN ONE package promises —
+   a future module: apartment `millesimal shares` per expense category.
+7. **Scheduled service work** (annual extinguisher check, burner service, pest control twice a year) →
+   a service-visit calendar with reminders; this is the "controller" side of the admin panel.
