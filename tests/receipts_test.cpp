@@ -128,6 +128,51 @@ int main() {
         CHECK(rid2 > 0 && db.getReceiptById(rid2).number == 6 && ToCents(db.getReceiptById(rid2).total) == 4500);
         CHECK(db.getReceiptPaymentIds(rid).empty());
         CHECK(!db.executeRawQuery("UPDATE receipts SET notes='x' WHERE id = " + std::to_string(rid), c, rows, err)); // void is final
+
+        // ---- bills vs money: one transfer for two bills, partially; the rest stays as credit ----
+        {
+            User u2; u2.full_name = "ΔΕΥΤΕΡΟΣ"; db.addUser(u2);
+            int c2 = 2;
+            Service s2; s2.label = "ΚΑΘΑΡΙΟΤΗΤΑ"; s2.suggested_price = 50; int svc2 = db.addServiceGetId(c2, s2);
+            int b1 = addPay(db, c2, svc2, 50, 0), b2 = addPay(db, c2, svc2, 30, 0);     // two unpaid bills
+            CHECK(db.getOpenCharges(c2).size() == 2);
+            MoneyPayment m; m.user_id = c2; m.pay_date = "2026-10-05"; m.amount = 100;
+            Receipt rr; rr.user_id = c2; rr.method = "bank"; rr.bank_ref = "TRX-9";
+            int mid = db.recordPayment(m, {{-1, b1, 50}, {-1, b2, 20}}, &rr);
+            CHECK(mid > 0);
+            CHECK(ToCents(db.getPaymentById(b1).balance) == 0 && ToCents(db.getPaymentById(b2).balance) == 1000);
+            CHECK(ToCents(db.getClientCredit(c2)) == 3000);                                  // 100 - 50 - 20
+            CHECK(db.getOpenCharges(c2).size() == 1);
+            CHECK(db.getReceiptIdForPayment(b1) > 0 && db.getReceiptIdForPayment(b1) == db.getReceiptIdForPayment(b2));
+            // a second instalment on b2, no receipt yet -> shows up in "missing receipt"
+            MoneyPayment m2; m2.user_id = c2; m2.pay_date = "2026-10-20"; m2.amount = 10;
+            CHECK(db.recordPayment(m2, {{-1, b2, 10}}, nullptr) > 0);
+            CHECK(ToCents(db.getPaymentById(b2).balance) == 0);
+            CHECK(db.getMoneyForCharge(b2).size() == 2);
+            CHECK(db.countPayments("", "", c2, -1, "", "", true) == 1);                    // b2 has un-receipted money
+            // over-allocation is refused, nothing saved
+            MoneyPayment m3; m3.user_id = c2; m3.pay_date = "2026-10-21"; m3.amount = 5;
+            CHECK(db.recordPayment(m3, {{-1, b1, 5}}, nullptr) == -1); db.takeLastError();   // b1 already settled
+            CHECK(db.getMoneyForUser(c2).size() == 2);
+
+            // ---- receipt search: AND / OR / NOT ----
+            DataConn::ReceiptQuery q;
+            DataConn::ReceiptCond byClient; byClient.field = DataConn::ReceiptCond::Client; byClient.id = c2;
+            DataConn::ReceiptCond bySvc; bySvc.field = DataConn::ReceiptCond::Service; bySvc.id = svc2;
+            DataConn::ReceiptCond byBank; byBank.field = DataConn::ReceiptCond::Method; byBank.text = "bank";
+            q.conds = {byClient, bySvc};
+            CHECK(db.countReceipts(q) == 1);
+            q.conds = {byClient}; q.conds[0].negate = true;                                  // NOT client 2
+            long long others = db.countReceipts(q);
+            DataConn::ReceiptQuery all;
+            CHECK(others == db.countReceipts(all) - 1);
+            q.matchAll = false; q.conds = {bySvc, byBank};                                   // svc2 OR bank
+            CHECK(db.countReceipts(q) >= 1);
+            q.matchAll = true; q.conds = {bySvc}; q.conds[0].id = svc;                       // first service's receipts
+            CHECK(db.countReceipts(q) >= 1);
+            auto lines = db.getReceiptLines(db.getReceiptIdForPayment(b1));
+            CHECK(lines.size() == 2);
+        }
     }
     std::filesystem::remove_all(dir);
     std::printf(fails ? "%d FAILED\n" : "all receipt tests passed\n", fails);
