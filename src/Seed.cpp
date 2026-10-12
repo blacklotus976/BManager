@@ -679,6 +679,20 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
         }
     }
 
+    // ---- offers: one for everyone, one for a single client, one ended, one cancelled ----
+    {
+        auto svc = [&](const char* label) { auto it = idByLabel.find(label); return it == idByLabel.end() ? -1 : it->second; };
+        Offer a; a.name = "Φθινοπωρινή απεντόμωση"; a.kind = "percent"; a.value = 15; a.target_type = "service"; a.target_id = svc("ΑΠΕΝΤΟΜΩΣΗ");
+        a.valid_from = "2026-10-01"; a.valid_to = "2026-11-15"; a.note = "Για όλους τους πελάτες";
+        db->saveOffer(a);
+        Offer b; b.name = "Πιστός πελάτης"; b.kind = "fixed"; b.value = 10; b.user_id = uid[0]; b.target_type = "all";
+        b.valid_from = "2026-10-01"; b.valid_to = "2026-10-20"; db->saveOffer(b);
+        Offer c; c.name = "Καλοκαιρινή προσφορά καυστήρα"; c.kind = "percent"; c.value = 20; c.target_type = "service";
+        c.target_id = svc("ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΠΕΤΡΕΛΑΙΟΥ"); c.valid_from = "2026-06-01"; c.valid_to = "2026-08-31"; db->saveOffer(c);
+        Offer d; d.name = "Διπλή καταχώριση"; d.kind = "percent"; d.value = 5; d.valid_from = "2026-10-01"; d.valid_to = "2026-12-31";
+        int did = db->saveOffer(d); if (did > 0) db->cancelOffer(did, "Καταχωρίστηκε κατά λάθος δύο φορές");
+    }
+
     // ---- attachments: real files copied next to the database (see docs/JOINT_CHARGES.md → «Συνημμένα») ----
     if (!mediaDir.empty()) {
         auto f = [&](const char* name) { return mediaDir + "/" + name; };

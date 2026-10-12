@@ -155,7 +155,7 @@ static std::string JsonRowExpr(sqlite3* db, const std::string& table, const std:
 static const char* kAuditedTables[] = {
     "buildings", "apartments", "users", "residencies", "services", "service_users", "master_services",
     "master_service_components", "payment_batches", "charges", "payments", "allocations", "receipts", "notes",
-    "attachments", "joint_services", "joint_ops", "joint_shares", "payment_plans",
+    "attachments", "joint_services", "joint_ops", "joint_shares", "payment_plans", "offers", "offer_uses",
 };
 
 static bool TableExists(sqlite3* db, const std::string& t) {
@@ -1228,12 +1228,56 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v12) απέτυχε: " + why; }
     }
 
+    // --- Migration v13: offers (discounts) and which charges used them. ---
+    if (UserVersion(db) < 13) {
+        bool ok = executeQuery(R"(
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS offers (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT    NOT NULL CHECK (TRIM(name) <> ''),
+                kind          TEXT    NOT NULL CHECK (kind IN ('percent','fixed')),
+                value         REAL    NOT NULL CHECK (value > 0 AND (kind = 'fixed' OR value <= 100)),
+                user_id       INTEGER REFERENCES users(id),
+                target_type   TEXT    NOT NULL CHECK (target_type IN ('all','service','package')),
+                target_id     INTEGER,
+                valid_from    TEXT    NOT NULL CHECK (valid_from IS date(valid_from)),
+                valid_to      TEXT    NOT NULL CHECK (valid_to IS date(valid_to) AND valid_to >= valid_from),
+                status        TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active','cancelled')),
+                note          TEXT,
+                cancel_reason TEXT,
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                CHECK (target_type = 'all' OR target_id IS NOT NULL),
+                CHECK (status = 'active' OR TRIM(COALESCE(cancel_reason,'')) <> '')
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_offers_no_delete BEFORE DELETE ON offers
+            BEGIN SELECT RAISE(ABORT, 'Οι προσφορές δεν διαγράφονται - ακυρώνονται με αιτιολογία'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_offers_cancelled_fixed BEFORE UPDATE ON offers WHEN OLD.status = 'cancelled'
+            BEGIN SELECT RAISE(ABORT, 'Η προσφορά έχει ακυρωθεί και δεν αλλάζει'); END;
+            CREATE TABLE IF NOT EXISTS offer_uses (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                offer_id   INTEGER NOT NULL REFERENCES offers(id),
+                charge_id  INTEGER NOT NULL,
+                list_price REAL    NOT NULL CHECK (list_price >= 0),
+                discount   REAL    NOT NULL CHECK (discount > 0 AND discount <= list_price),
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_offer_uses_offer ON offer_uses(offer_id);
+            CREATE INDEX IF NOT EXISTS idx_offer_uses_charge ON offer_uses(charge_id);
+            CREATE TRIGGER IF NOT EXISTS trg_offer_uses_fixed BEFORE UPDATE ON offer_uses
+            BEGIN SELECT RAISE(ABORT, 'Η χρήση προσφοράς δεν αλλάζει'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_offer_uses_no_delete BEFORE DELETE ON offer_uses
+            BEGIN SELECT RAISE(ABORT, 'Η χρήση προσφοράς δεν διαγράφεται'); END;
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 13; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v13) απέτυχε: " + why; }
+    }
+
     executeQuery("CREATE INDEX IF NOT EXISTS idx_joint_shares_user ON joint_shares(user_id);");
 
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
     // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
     {
-        bool migratedNow = versionAtOpen < 12;
+        bool migratedNow = versionAtOpen < 13;
         int restored = ensureAuditTriggers();
         if (restored > 0 && !migratedNow) {
             logAction("audit", 0, "TRIGGERS_RESTORED", "", "{\"count\": " + std::to_string(restored) + "}", "db");
@@ -3311,7 +3355,21 @@ int SqliteConn::insertCharge(const Payment& in, int batchId) {
     int rc = sqlite3_step(st);
     if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
     sqlite3_finalize(st);
-    return rc == SQLITE_DONE ? (int)sqlite3_last_insert_rowid(db) : -1;
+    if (rc != SQLITE_DONE) return -1;
+    int cid = (int)sqlite3_last_insert_rowid(db);
+    if (in.offer_id > 0) {                     // the claimed offer: list price and discount, next to the charge
+        double list = RoundMoney(in.list_price), disc = MoneySub(list, p.amount_due);
+        if (ToCents(disc) > 0) {
+            sqlite3_prepare_v2(db, "INSERT INTO offer_uses (offer_id, charge_id, list_price, discount) VALUES (?,?,?,?)", -1, &st, nullptr);
+            sqlite3_bind_int(st, 1, in.offer_id); sqlite3_bind_int(st, 2, cid);
+            sqlite3_bind_double(st, 3, list); sqlite3_bind_double(st, 4, disc);
+            rc = sqlite3_step(st);
+            if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+            sqlite3_finalize(st);
+            if (rc != SQLITE_DONE) return -1;
+        }
+    }
+    return cid;
 }
 
 int SqliteConn::insertMoney(const MoneyPayment& in) {
@@ -3523,6 +3581,7 @@ bool SqliteConn::editPayment(int id, const Payment& in) {
 }
 
 bool SqliteConn::removePayment(int id) {
+    int batch = getPaymentById(id).batch_id;
     if (!savepoint("remove_line")) return false;
     std::string sid = std::to_string(id);
     // the money that paid only this line goes with it; money on an issued receipt is refused by the triggers
@@ -3534,6 +3593,8 @@ bool SqliteConn::removePayment(int id) {
         "DELETE FROM payments WHERE id IN (SELECT id FROM _gone);"
         "DELETE FROM charges WHERE id = " + sid + ";");
     if (!ok) { rollbackTo("remove_line"); return false; }
+    // removing the last open installment can complete a plan -> its one receipt
+    if (!closePlanIfPaid(batch)) { rollbackTo("remove_line"); return false; }
     return release("remove_line");
 }
 
@@ -3702,6 +3763,11 @@ std::vector<MoneyPayment> SqliteConn::getMoneyForUser(int userId) {
     return QueryMoney(db, std::string("SELECT ") + kMoneyCols +
         "COALESCE((SELECT SUM(CAST(ROUND(a.amount*100) AS INTEGER)) FROM allocations a WHERE a.payment_id = m.id), 0) / 100.0 "
         "FROM payments m WHERE m.user_id = ? ORDER BY m.pay_date DESC, m.id DESC", userId);
+}
+std::vector<MoneyPayment> SqliteConn::getRecentMoney(int limit) {
+    return QueryMoney(db, std::string("SELECT ") + kMoneyCols +
+        "COALESCE((SELECT SUM(CAST(ROUND(a.amount*100) AS INTEGER)) FROM allocations a WHERE a.payment_id = m.id), 0) / 100.0 "
+        "FROM payments m ORDER BY m.pay_date DESC, m.created_at DESC, m.id DESC LIMIT ?", limit);
 }
 std::vector<MoneyPayment> SqliteConn::getMoneyForCharge(int chargeId) {
     return QueryMoney(db, std::string("SELECT ") + kMoneyCols + "a.amount "
@@ -4338,4 +4404,86 @@ std::vector<DataConn::DebtRow> SqliteConn::debtAging(const std::string& asOf) {
     }
     sqlite3_finalize(st);
     return out;
+}
+
+// --- OFFERS ------------------------------------------------------------------------------------------------------
+static const char* kOfferCols =
+    "o.id, o.name, o.kind, o.value, COALESCE(o.user_id,-1), o.target_type, COALESCE(o.target_id,-1), o.valid_from, o.valid_to, "
+    "o.status, COALESCE(o.note,''), COALESCE(o.cancel_reason,''), datetime(o.created_at,'localtime'), "
+    "(SELECT COUNT(*) FROM offer_uses u WHERE u.offer_id = o.id), "
+    "(SELECT COALESCE(SUM(CAST(ROUND(u.discount*100) AS INTEGER)),0) FROM offer_uses u WHERE u.offer_id = o.id) ";
+
+static std::vector<Offer> ReadOffers(sqlite3_stmt* st) {
+    std::vector<Offer> out;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        Offer o;
+        o.id = sqlite3_column_int(st, 0); o.name = ColText(st, 1); o.kind = ColText(st, 2); o.value = sqlite3_column_double(st, 3);
+        o.user_id = sqlite3_column_int(st, 4); o.target_type = ColText(st, 5); o.target_id = sqlite3_column_int(st, 6);
+        o.valid_from = ColText(st, 7); o.valid_to = ColText(st, 8); o.status = ColText(st, 9); o.note = ColText(st, 10);
+        o.cancel_reason = ColText(st, 11); o.created_at = ColText(st, 12); o.uses = sqlite3_column_int(st, 13);
+        o.given = FromCents(sqlite3_column_int64(st, 14));
+        out.push_back(o);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<Offer> SqliteConn::getOffers() {
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kOfferCols + "FROM offers o ORDER BY o.id DESC").c_str(), -1, &st, nullptr);
+    return ReadOffers(st);
+}
+
+int SqliteConn::saveOffer(const Offer& in) {
+    Offer o = in;
+    if (o.name.find_first_not_of(" \t") == std::string::npos) { lastError_ = "Η προσφορά χρειάζεται όνομα."; return -1; }
+    if (o.value <= 0 || (o.kind == "percent" && o.value > 100)) { lastError_ = "Μη έγκυρη τιμή έκπτωσης."; return -1; }
+    if (o.valid_to < o.valid_from) { lastError_ = "Η λήξη είναι πριν από την έναρξη."; return -1; }
+    if (o.kind == "fixed") o.value = RoundMoney(o.value);
+    sqlite3_stmt* st = nullptr;
+    if (o.id <= 0)
+        sqlite3_prepare_v2(db, "INSERT INTO offers (name, kind, value, user_id, target_type, target_id, valid_from, valid_to, note) "
+                               "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", -1, &st, nullptr);
+    else
+        sqlite3_prepare_v2(db, "UPDATE offers SET name=?1, kind=?2, value=?3, user_id=?4, target_type=?5, target_id=?6, valid_from=?7, "
+                               "valid_to=?8, note=?9 WHERE id=?10", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, o.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, o.kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 3, o.value);
+    if (o.user_id > 0) sqlite3_bind_int(st, 4, o.user_id); else sqlite3_bind_null(st, 4);
+    sqlite3_bind_text(st, 5, o.target_type.c_str(), -1, SQLITE_TRANSIENT);
+    if (o.target_type != "all" && o.target_id > 0) sqlite3_bind_int(st, 6, o.target_id); else sqlite3_bind_null(st, 6);
+    sqlite3_bind_text(st, 7, o.valid_from.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, o.valid_to.c_str(), -1, SQLITE_TRANSIENT);
+    if (o.note.empty()) sqlite3_bind_null(st, 9); else sqlite3_bind_text(st, 9, o.note.c_str(), -1, SQLITE_TRANSIENT);
+    if (o.id > 0) sqlite3_bind_int(st, 10, o.id);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
+    return o.id > 0 ? o.id : (int)sqlite3_last_insert_rowid(db);
+}
+
+bool SqliteConn::cancelOffer(int id, const std::string& reason) {
+    if (reason.find_first_not_of(" \t") == std::string::npos) { lastError_ = "Η ακύρωση χρειάζεται αιτιολογία."; return false; }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE offers SET status = 'cancelled', cancel_reason = ? WHERE id = ? AND status = 'active'", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, id);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE && sqlite3_changes(db) == 1;
+}
+
+std::vector<Offer> SqliteConn::findOffers(int userId, int serviceId, int packageId, const std::string& date) {
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kOfferCols +
+        "FROM offers o WHERE o.status = 'active' AND o.valid_from <= ?1 AND o.valid_to >= ?1 "
+        "AND (o.user_id IS NULL OR o.user_id = ?2) "
+        "AND (o.target_type = 'all' OR (o.target_type = 'service' AND o.target_id = ?3) OR (o.target_type = 'package' AND o.target_id = ?4)) "
+        "ORDER BY o.user_id IS NULL, o.id").c_str(), -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, userId); sqlite3_bind_int(st, 3, serviceId); sqlite3_bind_int(st, 4, packageId);
+    return ReadOffers(st);
 }

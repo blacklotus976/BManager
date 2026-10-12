@@ -4,6 +4,7 @@
 #include "models/Service.h"
 #include "models/MasterService.h"
 #include "models/Joint.h"
+#include "models/Offer.h"
 #include "models/Payment.h"
 #include "models/Note.h"
 #include "models/Receipt.h"
@@ -152,7 +153,8 @@ public:
     // Records money and what it settles, optionally with its receipt, all-or-nothing. Allocations may be fewer
     // than the amount (the rest is the client's credit). Returns the new payment id or -1.
     virtual int recordPayment(const MoneyPayment& money, const std::vector<Allocation>& allocations, const Receipt* receipt) = 0;
-    virtual std::vector<MoneyPayment> getMoneyForUser(int userId) = 0;                 // newest first
+    virtual std::vector<MoneyPayment> getMoneyForUser(int userId) = 0;
+    virtual std::vector<MoneyPayment> getRecentMoney(int limit) = 0;                    // newest entered first                 // newest first
     virtual std::vector<MoneyPayment> getMoneyForCharge(int chargeId) = 0;             // .allocated = the part for this charge
     virtual std::vector<Allocation> getAllocationsForMoney(int paymentId) = 0;
     virtual std::vector<Payment> getOpenCharges(int userId) = 0;                       // resolved, balance > 0, oldest first
@@ -344,6 +346,13 @@ public:
     virtual int addInstallmentPlan(const std::vector<Payment>& lines, const std::string& label, int installments,
                                    const std::string& every, const std::string& receiptMode, const Receipt* firstReceipt) = 0;
     virtual PaymentPlan getPlanForBatch(int batchId) = 0;           // id -1 = the batch is not a plan
+
+    // --- Offers (προσφορές) ---
+    virtual std::vector<Offer> getOffers() = 0;                                    // all, newest first, with uses
+    virtual int saveOffer(const Offer& o) = 0;                                     // insert (id -1) or update; id or -1
+    virtual bool cancelOffer(int id, const std::string& reason) = 0;               // reason required
+    // active offers that fit a charge: the client (or everyone), the service or package (or all), and the date
+    virtual std::vector<Offer> findOffers(int userId, int serviceId, int packageId, const std::string& date) = 0;
 
     // --- Report queries ---
     struct MethodTotal { std::string method; long long count = 0; double total = 0.0, receipted = 0.0; };

@@ -74,6 +74,11 @@ public:
     int addInstallmentPlan(const std::vector<Payment>& lines, const std::string& label, int installments,
                            const std::string& every, const std::string& receiptMode, const Receipt* firstReceipt) override;
     PaymentPlan getPlanForBatch(int batchId) override;
+    std::vector<Offer> getOffers() override;
+    std::vector<MoneyPayment> getRecentMoney(int limit) override;
+    int saveOffer(const Offer& o) override;
+    bool cancelOffer(int id, const std::string& reason) override;
+    std::vector<Offer> findOffers(int userId, int serviceId, int packageId, const std::string& date) override;
     std::vector<MethodTotal> moneyByMethod(const std::string& fromDate, const std::string& toDate) override;
     std::vector<DebtRow> debtAging(const std::string& asOf) override;
     std::vector<JointService> getJointCatalog(bool includeInactive = false) override;
