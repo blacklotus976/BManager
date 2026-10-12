@@ -347,6 +347,30 @@ public:
                                    const std::string& every, const std::string& receiptMode, const Receipt* firstReceipt) = 0;
     virtual PaymentPlan getPlanForBatch(int batchId) = 0;           // id -1 = the batch is not a plan
 
+    // --- Paged lookups (everything assumes millions of rows: search + offset/limit in SQL) ---
+    // text is matched accent/case-insensitively; sortCol/asc pick the ORDER BY.
+    virtual std::vector<Building> pageBuildings(const std::string& text, int offset, int limit) = 0;   // address, area, ΤΚ, ΑΦΜ
+    virtual int countBuildings(const std::string& text) = 0;
+    struct PackageRow { MasterService pkg; int components = 0; double total = 0.0; std::string parts; };   // parts: "Α (10,00), Β (5,00)"
+    // sortCol: 0 name, 1 services count, 2 total price
+    virtual std::vector<PackageRow> pagePackages(const std::string& text, int sortCol, bool asc, int offset, int limit) = 0;
+    virtual int countPackages(const std::string& text) = 0;
+    virtual std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit) = 0;
+    virtual int countJointCatalog(const std::string& text) = 0;
+    // Joint charges, newest first by default. sortCol: 0 date, 1 building, 2 label, 3 kind, 4 total, 5 paid, 6 remaining,
+    // 7 completion %, 8 charged, 9 excluded. text: label / building address. totals (optional): sum of total / paid.
+    virtual std::vector<JointOp> pageJointOps(int buildingId, const std::string& text, int sortCol, bool asc, int offset, int limit) = 0;
+    virtual int countJointOps(int buildingId, const std::string& text, double* total = nullptr, double* paid = nullptr) = 0;
+    // Clients who bought services of a package. show: 0 all, 1 whole package, 2 part. sortCol: 0 name, 1 services, 3 charged,
+    // 4 paid, 5 remaining.
+    struct PackageBuyer { int user_id = -1; std::string name, parts; int count = 0; double due = 0, paid = 0; };
+    virtual std::vector<PackageBuyer> pagePackageBuyers(int pkgId, const std::string& text, int show, int sortCol, bool asc, int offset, int limit) = 0;
+    virtual int countPackageBuyers(int pkgId, const std::string& text, int show) = 0;
+    // The clients living now in a building's apartments (for charging a building).
+    virtual std::vector<User> getBuildingResidents(int buildingId) = 0;
+    virtual std::string getPackageLabel(int pkgId) = 0;                 // "" if none
+    virtual JointService getJointServiceById(int id) = 0;               // id -1 if none
+
     // --- Offers (προσφορές) ---
     virtual std::vector<Offer> getOffers() = 0;                                    // all, newest first, with uses
     virtual int saveOffer(const Offer& o) = 0;                                     // insert (id -1) or update; id or -1

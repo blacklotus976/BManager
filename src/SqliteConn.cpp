@@ -4487,3 +4487,174 @@ std::vector<Offer> SqliteConn::findOffers(int userId, int serviceId, int package
     sqlite3_bind_int(st, 2, userId); sqlite3_bind_int(st, 3, serviceId); sqlite3_bind_int(st, 4, packageId);
     return ReadOffers(st);
 }
+
+// --- PAGED LOOKUPS -------------------------------------------------------------------------------------------------
+// Everything below searches and pages in SQL, so the screens stay instant whatever the number of rows.
+static void BindText(sqlite3_stmt* st, int i, const std::string& s) { sqlite3_bind_text(st, i, s.c_str(), -1, SQLITE_TRANSIENT); }
+
+static const char* kBldWhere = " WHERE (?1 = '' OR instr(fold(address || ' ' || COALESCE(area,'') || ' ' || COALESCE(postal_code,'') || ' ' || COALESCE(afm,'')), fold(?1)) > 0) ";
+std::vector<Building> SqliteConn::pageBuildings(const std::string& text, int offset, int limit) {
+    std::vector<Building> out; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT id, address, area, postal_code, afm, created_at FROM buildings") + kBldWhere +
+                            "ORDER BY address, id LIMIT ?2 OFFSET ?3").c_str(), -1, &st, nullptr);
+    BindText(st, 1, text); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        Building b; b.id = sqlite3_column_int(st, 0); b.address = ColText(st, 1); b.area = ColText(st, 2);
+        b.postal_code = ColText(st, 3); b.afm = ColText(st, 4); b.created_at = ColText(st, 5); out.push_back(b);
+    }
+    sqlite3_finalize(st); return out;
+}
+int SqliteConn::countBuildings(const std::string& text) {
+    sqlite3_stmt* st = nullptr; int n = 0;
+    sqlite3_prepare_v2(db, (std::string("SELECT COUNT(*) FROM buildings") + kBldWhere).c_str(), -1, &st, nullptr);
+    BindText(st, 1, text);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st); return n;
+}
+
+static const char* kPkgFrom =
+    " FROM master_services m LEFT JOIN master_service_components mc ON mc.master_service_id = m.id "
+    " LEFT JOIN services s ON s.id = mc.service_id GROUP BY m.id "
+    " HAVING (?1 = '' OR instr(fold(m.label || ' ' || COALESCE(group_concat(s.label, ' '), '')), fold(?1)) > 0) ";
+std::vector<DataConn::PackageRow> SqliteConn::pagePackages(const std::string& text, int sortCol, bool asc, int offset, int limit) {
+    std::vector<PackageRow> out; sqlite3_stmt* st = nullptr;
+    std::string order = sortCol == 1 ? "n" : sortCol == 2 ? "tc" : "fold(m.label)";
+    std::string sql = std::string("SELECT m.id, m.label, m.created_at, COUNT(s.id) AS n, "
+        "COALESCE(SUM(CAST(ROUND(s.suggested_price*100) AS INTEGER)), 0) AS tc, "
+        "COALESCE(group_concat(s.label || ' (' || replace(printf('%.2f', s.suggested_price), '.', ',') || ' €)', ', '), '')") + kPkgFrom +
+        "ORDER BY " + order + (asc ? " ASC" : " DESC") + ", m.id LIMIT ?2 OFFSET ?3";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    BindText(st, 1, text); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        PackageRow r; r.pkg.id = sqlite3_column_int(st, 0); r.pkg.label = ColText(st, 1);
+        r.components = sqlite3_column_int(st, 3); r.total = FromCents(sqlite3_column_int64(st, 4)); r.parts = ColText(st, 5);
+        out.push_back(r);
+    }
+    sqlite3_finalize(st); return out;
+}
+int SqliteConn::countPackages(const std::string& text) {
+    sqlite3_stmt* st = nullptr; int n = 0;
+    sqlite3_prepare_v2(db, (std::string("SELECT COUNT(*) FROM (SELECT m.id") + kPkgFrom + ")").c_str(), -1, &st, nullptr);
+    BindText(st, 1, text);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st); return n;
+}
+
+static const char* kJcWhere = " WHERE (?1 = '' OR instr(fold(s.label || ' ' || COALESCE(s.extra_notes,'')), fold(?1)) > 0) ";
+std::vector<JointService> SqliteConn::pageJointCatalog(const std::string& text, int offset, int limit) {
+    std::vector<JointService> out; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT j.id, s.id, s.label, s.extra_notes, s.created_at, j.kind, j.active, s.suggested_price "
+                            "FROM joint_services j JOIN services s ON s.id = j.service_id") + kJcWhere +
+                            "ORDER BY fold(s.label), j.id LIMIT ?2 OFFSET ?3").c_str(), -1, &st, nullptr);
+    BindText(st, 1, text); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        JointService j; j.id = sqlite3_column_int(st, 0); j.service.id = sqlite3_column_int(st, 1); j.service.label = ColText(st, 2);
+        j.service.extra_notes = ColText(st, 3); j.service.created_at = ColText(st, 4); j.kind = ColText(st, 5);
+        j.active = sqlite3_column_int(st, 6) != 0; j.service.suggested_price = RoundMoney(sqlite3_column_double(st, 7));
+        out.push_back(j);
+    }
+    sqlite3_finalize(st); return out;
+}
+int SqliteConn::countJointCatalog(const std::string& text) {
+    sqlite3_stmt* st = nullptr; int n = 0;
+    sqlite3_prepare_v2(db, (std::string("SELECT COUNT(*) FROM joint_services j JOIN services s ON s.id = j.service_id") + kJcWhere).c_str(), -1, &st, nullptr);
+    BindText(st, 1, text);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st); return n;
+}
+
+// same columns as kJointOpCols (ReadJointOp), plus sortable aliases
+static const char* kJointOpPaged =
+    "SELECT o.id, COALESCE(o.building_id, -1), o.source_type, o.source_id, o.kind, o.label, o.total, o.op_date, o.params_json, "
+    "COALESCE(o.note,''), o.batch_id, datetime(o.created_at,'localtime'), COALESCE(b.address,'') AS addr, "
+    "(SELECT COUNT(*) FROM joint_shares s WHERE s.op_id = o.id AND s.included = 1) AS inc, "
+    "(SELECT COUNT(*) FROM joint_shares s WHERE s.op_id = o.id AND s.included = 0) AS exc, "
+    "(SELECT COALESCE(SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)), 0) FROM charges c WHERE c.batch_id = o.batch_id) AS paidc, "
+    "CAST(ROUND(o.total*100) AS INTEGER) AS totc "
+    "FROM joint_ops o LEFT JOIN buildings b ON b.id = o.building_id "
+    "WHERE (?1 <= 0 OR o.building_id = ?1) AND (?2 = '' OR instr(fold(o.label || ' ' || COALESCE(b.address,'')), fold(?2)) > 0) ";
+std::vector<JointOp> SqliteConn::pageJointOps(int buildingId, const std::string& text, int sortCol, bool asc, int offset, int limit) {
+    static const char* cols[] = { "o.op_date", "fold(addr)", "fold(o.label)", "o.kind", "totc", "MIN(paidc, totc)", "(totc - MIN(paidc, totc))",
+                                  "(CASE WHEN totc > 0 THEN MIN(paidc, totc) * 1.0 / totc ELSE 1 END)", "inc", "exc" };
+    std::string order = (sortCol >= 0 && sortCol < 10) ? cols[sortCol] : "o.op_date";
+    std::vector<JointOp> out; sqlite3_stmt* st = nullptr;
+    std::string sql = std::string(kJointOpPaged) + "ORDER BY " + order + (asc ? " ASC" : " DESC") + ", o.id DESC LIMIT ?3 OFFSET ?4";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, buildingId); BindText(st, 2, text); sqlite3_bind_int(st, 3, limit); sqlite3_bind_int(st, 4, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadJointOp(st));
+    sqlite3_finalize(st); return out;
+}
+int SqliteConn::countJointOps(int buildingId, const std::string& text, double* total, double* paid) {
+    sqlite3_stmt* st = nullptr; int n = 0;
+    std::string sql = std::string("SELECT COUNT(*), COALESCE(SUM(totc),0), COALESCE(SUM(MIN(paidc, totc)),0) FROM (") + kJointOpPaged + ")";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return 0; }
+    sqlite3_bind_int(st, 1, buildingId); BindText(st, 2, text);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+        if (total) *total = FromCents(sqlite3_column_int64(st, 1));
+        if (paid) *paid = FromCents(sqlite3_column_int64(st, 2));
+    }
+    sqlite3_finalize(st); return n;
+}
+
+static const char* kBuyersFrom =
+    " FROM charges ch JOIN master_service_components mc ON mc.service_id = ch.service_id AND mc.master_service_id = ?1 "
+    " JOIN users u ON u.id = ch.user_id JOIN services s ON s.id = ch.service_id "
+    " GROUP BY ch.user_id "
+    " HAVING (?2 = '' OR instr(fold(u.full_name), fold(?2)) > 0) "
+    " AND (?3 = 0 OR (?3 = 1 AND COUNT(DISTINCT ch.service_id) = (SELECT COUNT(*) FROM master_service_components x WHERE x.master_service_id = ?1)) "
+    "            OR (?3 = 2 AND COUNT(DISTINCT ch.service_id) < (SELECT COUNT(*) FROM master_service_components x WHERE x.master_service_id = ?1))) ";
+std::vector<DataConn::PackageBuyer> SqliteConn::pagePackageBuyers(int pkgId, const std::string& text, int show, int sortCol, bool asc, int offset, int limit) {
+    static const char* cols[] = { "fold(u.full_name)", "cnt", "cnt", "duec", "paidc", "(duec - paidc)" };
+    std::string order = (sortCol >= 0 && sortCol < 6) ? cols[sortCol] : "cnt";
+    std::vector<PackageBuyer> out; sqlite3_stmt* st = nullptr;
+    std::string sql = std::string("SELECT ch.user_id, u.full_name, COUNT(DISTINCT ch.service_id) AS cnt, "
+        "(SELECT group_concat(label, ', ') FROM (SELECT DISTINCT s2.label FROM charges c2 JOIN services s2 ON s2.id = c2.service_id "
+        "   JOIN master_service_components m2 ON m2.service_id = c2.service_id AND m2.master_service_id = ?1 WHERE c2.user_id = ch.user_id)), "
+        "SUM(CAST(ROUND(ch.amount_due*100) AS INTEGER)) AS duec, SUM(CAST(ROUND(ch.amount_paid*100) AS INTEGER)) AS paidc") + kBuyersFrom +
+        "ORDER BY " + order + (asc ? " ASC" : " DESC") + ", fold(u.full_name) LIMIT ?4 OFFSET ?5";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, pkgId); BindText(st, 2, text); sqlite3_bind_int(st, 3, show); sqlite3_bind_int(st, 4, limit); sqlite3_bind_int(st, 5, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        PackageBuyer b; b.user_id = sqlite3_column_int(st, 0); b.name = ColText(st, 1); b.count = sqlite3_column_int(st, 2);
+        b.parts = ColText(st, 3); b.due = FromCents(sqlite3_column_int64(st, 4)); b.paid = FromCents(sqlite3_column_int64(st, 5));
+        out.push_back(b);
+    }
+    sqlite3_finalize(st); return out;
+}
+int SqliteConn::countPackageBuyers(int pkgId, const std::string& text, int show) {
+    sqlite3_stmt* st = nullptr; int n = 0;
+    if (sqlite3_prepare_v2(db, (std::string("SELECT COUNT(*) FROM (SELECT ch.user_id") + kBuyersFrom + ")").c_str(), -1, &st, nullptr) != SQLITE_OK) {
+        lastError_ = sqlite3_errmsg(db); return 0; }
+    sqlite3_bind_int(st, 1, pkgId); BindText(st, 2, text); sqlite3_bind_int(st, 3, show);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st); return n;
+}
+
+std::vector<User> SqliteConn::getBuildingResidents(int buildingId) {
+    std::vector<User> out; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string(kUserSelect) + "WHERE b.id = ? ORDER BY a.label, u.full_name").c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, buildingId);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(MapUserRow(st));
+    sqlite3_finalize(st); return out;
+}
+
+std::string SqliteConn::getPackageLabel(int pkgId) {
+    sqlite3_stmt* st = nullptr; std::string l;
+    sqlite3_prepare_v2(db, "SELECT label FROM master_services WHERE id = ?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, pkgId);
+    if (sqlite3_step(st) == SQLITE_ROW) l = ColText(st, 0);
+    sqlite3_finalize(st); return l;
+}
+JointService SqliteConn::getJointServiceById(int id) {
+    JointService j; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT j.id, s.id, s.label, s.extra_notes, s.created_at, j.kind, j.active, s.suggested_price "
+                           "FROM joint_services j JOIN services s ON s.id = j.service_id WHERE j.id = ?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        j.id = sqlite3_column_int(st, 0); j.service.id = sqlite3_column_int(st, 1); j.service.label = ColText(st, 2);
+        j.service.extra_notes = ColText(st, 3); j.service.created_at = ColText(st, 4); j.kind = ColText(st, 5);
+        j.active = sqlite3_column_int(st, 6) != 0; j.service.suggested_price = RoundMoney(sqlite3_column_double(st, 7));
+    }
+    sqlite3_finalize(st); return j;
+}
