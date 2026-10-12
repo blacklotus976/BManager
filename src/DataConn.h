@@ -104,7 +104,8 @@ public:
     virtual int addMasterService(const std::string& label) = 0;
     virtual bool addMasterServiceComponent(int masterServiceId, int serviceId) = 0;
     virtual bool removeMasterServiceComponent(int masterServiceId, int serviceId) = 0;
-    virtual bool removeMasterService(int id) = 0;
+    virtual bool removeMasterService(int id) = 0;          // retires it (kept for history, hidden from lists)
+    virtual bool renameMasterService(int id, const std::string& label) = 0;
     struct MasterServiceSummary {
         MasterService masterService;
         std::vector<Service> components;
@@ -226,6 +227,8 @@ public:
         int owed = 0;                        // 0 any, 1 settled (resolved, balance <= 0), 2 still owed (resolved, balance > 0)
         bool missingReceipt = false;         // money came in for it but no issued receipt covers that money
         double minDue = 0.0, maxDue = 0.0;   // amount_due bounds, 0 = none
+        int joint = 0;                       // 0 any, 1 only shares of joint charges (κοινόχρηστα), 2 only the client's own charges
+        int jointOpId = -1;                  // only the lines of this joint charge
         // Accent/case-insensitive substring filters (same matching as the search screen). `text` matches any of
         // client, service, notes, status, date, client's building address.
         std::string text, clientText, serviceText, notesText, buildingText;
@@ -376,6 +379,8 @@ public:
     virtual int saveOffer(const Offer& o) = 0;                                     // insert (id -1) or update; id or -1
     virtual bool cancelOffer(int id, const std::string& reason) = 0;               // reason required
     // active offers that fit a charge: the client (or everyone), the service or package (or all), and the date
+    // active offers for a client (his own and the ones for everyone) that have not ended by `date`, soonest end first
+    virtual std::vector<Offer> getClientOffers(int userId, const std::string& date) = 0;
     virtual std::vector<Offer> findOffers(int userId, int serviceId, int packageId, const std::string& date) = 0;
 
     // --- Report queries ---

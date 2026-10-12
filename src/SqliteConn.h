@@ -86,11 +86,13 @@ public:
     std::vector<PackageBuyer> pagePackageBuyers(int pkgId, const std::string& text, int show, int sortCol, bool asc, int offset, int limit) override;
     int countPackageBuyers(int pkgId, const std::string& text, int show) override;
     std::vector<User> getBuildingResidents(int buildingId) override;
+    bool renameMasterService(int id, const std::string& label) override;
     std::string getPackageLabel(int pkgId) override;
     JointService getJointServiceById(int id) override;
     std::vector<MoneyPayment> getRecentMoney(int limit) override;
     int saveOffer(const Offer& o) override;
     bool cancelOffer(int id, const std::string& reason) override;
+    std::vector<Offer> getClientOffers(int userId, const std::string& date) override;
     std::vector<Offer> findOffers(int userId, int serviceId, int packageId, const std::string& date) override;
     std::vector<MethodTotal> moneyByMethod(const std::string& fromDate, const std::string& toDate) override;
     std::vector<DebtRow> debtAging(const std::string& asOf) override;

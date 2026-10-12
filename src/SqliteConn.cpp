@@ -1272,6 +1272,18 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v13) απέτυχε: " + why; }
     }
 
+    // --- Migration v14: packages are never deleted or rewritten, so history keeps what was once offered. ---
+    //  * master_services.active = 0 retires a package (hidden from lists and pickers, still readable).
+    //  * master_service_components.removed_at marks a service taken out of a package (kept, not deleted).
+    if (UserVersion(db) < 14) {
+        bool ok = executeQuery("BEGIN;") &&
+                  executeQuery("ALTER TABLE master_services ADD COLUMN active INTEGER NOT NULL DEFAULT 1;") &&
+                  executeQuery("ALTER TABLE master_services ADD COLUMN retired_at TEXT;") &&
+                  executeQuery("ALTER TABLE master_service_components ADD COLUMN removed_at TEXT;");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 14; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v14) απέτυχε: " + why; }
+    }
+
     executeQuery("CREATE INDEX IF NOT EXISTS idx_joint_shares_user ON joint_shares(user_id);");
 
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
@@ -1925,7 +1937,7 @@ std::vector<Service> SqliteConn::getServicesForUser(int userId) {
 // to one real component service + one user exactly as before, unchanged). ---
 std::vector<MasterService> SqliteConn::getMasterServices() {
     std::vector<MasterService> results;
-    std::string sql = "SELECT id, label FROM master_services ORDER BY label";
+    std::string sql = "SELECT id, label FROM master_services WHERE active = 1 ORDER BY label";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1942,7 +1954,7 @@ std::vector<Service> SqliteConn::getMasterServiceComponents(int masterServiceId)
     std::vector<Service> results;
     std::string sql = "SELECT s.id, s.label, s.extra_notes, s.created_at FROM services s "
                        "JOIN master_service_components msc ON msc.service_id = s.id "
-                       "WHERE msc.master_service_id=? ORDER BY s.label";
+                       "WHERE msc.master_service_id=? AND msc.removed_at IS NULL ORDER BY s.label";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,masterServiceId);
@@ -1972,7 +1984,8 @@ int SqliteConn::addMasterService(const std::string& label) {
 }
 
 bool SqliteConn::addMasterServiceComponent(int masterServiceId, int serviceId) {
-    std::string sql = "INSERT OR IGNORE INTO master_service_components (master_service_id, service_id) VALUES (?,?)";
+    std::string sql = "INSERT INTO master_service_components (master_service_id, service_id) VALUES (?1,?2) "
+                      "ON CONFLICT(master_service_id, service_id) DO UPDATE SET removed_at = NULL WHERE removed_at IS NOT NULL";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,masterServiceId);
@@ -1986,7 +1999,7 @@ bool SqliteConn::addMasterServiceComponent(int masterServiceId, int serviceId) {
 }
 
 bool SqliteConn::removeMasterServiceComponent(int masterServiceId, int serviceId) {
-    std::string sql = "DELETE FROM master_service_components WHERE master_service_id=? AND service_id=?";
+    std::string sql = "UPDATE master_service_components SET removed_at = datetime('now') WHERE master_service_id=? AND service_id=? AND removed_at IS NULL";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,masterServiceId);
@@ -2000,7 +2013,8 @@ bool SqliteConn::removeMasterServiceComponent(int masterServiceId, int serviceId
 }
 
 bool SqliteConn::removeMasterService(int id) {
-    std::string sql = "DELETE FROM master_services WHERE id=?";
+    // retired, never deleted: charges made from it and its old contents stay explainable
+    std::string sql = "UPDATE master_services SET active = 0, retired_at = datetime('now') WHERE id=? AND active = 1";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int(stmt,1,id);
@@ -3176,6 +3190,9 @@ PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
     if (f.missingReceipt) w.where += kMissingReceiptSql;
     if (f.minDue > 0) w.num(" AND p.amount_due >= ?", f.minDue);
     if (f.maxDue > 0) w.num(" AND p.amount_due <= ?", f.maxDue);
+    if (f.joint == 1) w.where += " AND p.batch_id IN (SELECT batch_id FROM joint_ops)";
+    if (f.joint == 2) w.where += " AND (p.batch_id IS NULL OR p.batch_id NOT IN (SELECT batch_id FROM joint_ops))";
+    if (f.jointOpId >= 0) w.num(" AND p.batch_id = (SELECT batch_id FROM joint_ops WHERE id = ?)", f.jointOpId);
     bool needNames = !f.text.empty() || !f.clientText.empty() || !f.serviceText.empty() || !f.buildingText.empty();
     if (needNames)
         w.joins = " LEFT JOIN users u ON u.id = p.user_id LEFT JOIN services s ON s.id = p.service_id"
@@ -4476,6 +4493,15 @@ bool SqliteConn::cancelOffer(int id, const std::string& reason) {
     return rc == SQLITE_DONE && sqlite3_changes(db) == 1;
 }
 
+std::vector<Offer> SqliteConn::getClientOffers(int userId, const std::string& date) {
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kOfferCols +
+        "FROM offers o WHERE o.status = 'active' AND o.valid_to >= ?1 AND (o.user_id IS NULL OR o.user_id = ?2) "
+        "ORDER BY o.valid_to, o.id").c_str(), -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, userId);
+    return ReadOffers(st);
+}
 std::vector<Offer> SqliteConn::findOffers(int userId, int serviceId, int packageId, const std::string& date) {
     sqlite3_stmt* st = nullptr;
     sqlite3_prepare_v2(db, (std::string("SELECT ") + kOfferCols +
@@ -4513,8 +4539,8 @@ int SqliteConn::countBuildings(const std::string& text) {
 }
 
 static const char* kPkgFrom =
-    " FROM master_services m LEFT JOIN master_service_components mc ON mc.master_service_id = m.id "
-    " LEFT JOIN services s ON s.id = mc.service_id GROUP BY m.id "
+    " FROM master_services m LEFT JOIN master_service_components mc ON mc.master_service_id = m.id AND mc.removed_at IS NULL "
+    " LEFT JOIN services s ON s.id = mc.service_id WHERE m.active = 1 GROUP BY m.id "
     " HAVING (?1 = '' OR instr(fold(m.label || ' ' || COALESCE(group_concat(s.label, ' '), '')), fold(?1)) > 0) ";
 std::vector<DataConn::PackageRow> SqliteConn::pagePackages(const std::string& text, int sortCol, bool asc, int offset, int limit) {
     std::vector<PackageRow> out; sqlite3_stmt* st = nullptr;
@@ -4600,19 +4626,19 @@ int SqliteConn::countJointOps(int buildingId, const std::string& text, double* t
 }
 
 static const char* kBuyersFrom =
-    " FROM charges ch JOIN master_service_components mc ON mc.service_id = ch.service_id AND mc.master_service_id = ?1 "
+    " FROM charges ch JOIN master_service_components mc ON mc.service_id = ch.service_id AND mc.master_service_id = ?1 AND mc.removed_at IS NULL "
     " JOIN users u ON u.id = ch.user_id JOIN services s ON s.id = ch.service_id "
     " GROUP BY ch.user_id "
     " HAVING (?2 = '' OR instr(fold(u.full_name), fold(?2)) > 0) "
-    " AND (?3 = 0 OR (?3 = 1 AND COUNT(DISTINCT ch.service_id) = (SELECT COUNT(*) FROM master_service_components x WHERE x.master_service_id = ?1)) "
-    "            OR (?3 = 2 AND COUNT(DISTINCT ch.service_id) < (SELECT COUNT(*) FROM master_service_components x WHERE x.master_service_id = ?1))) ";
+    " AND (?3 = 0 OR (?3 = 1 AND COUNT(DISTINCT ch.service_id) = (SELECT COUNT(*) FROM master_service_components x WHERE x.master_service_id = ?1 AND x.removed_at IS NULL)) "
+    "            OR (?3 = 2 AND COUNT(DISTINCT ch.service_id) < (SELECT COUNT(*) FROM master_service_components x WHERE x.master_service_id = ?1 AND x.removed_at IS NULL))) ";
 std::vector<DataConn::PackageBuyer> SqliteConn::pagePackageBuyers(int pkgId, const std::string& text, int show, int sortCol, bool asc, int offset, int limit) {
     static const char* cols[] = { "fold(u.full_name)", "cnt", "cnt", "duec", "paidc", "(duec - paidc)" };
     std::string order = (sortCol >= 0 && sortCol < 6) ? cols[sortCol] : "cnt";
     std::vector<PackageBuyer> out; sqlite3_stmt* st = nullptr;
     std::string sql = std::string("SELECT ch.user_id, u.full_name, COUNT(DISTINCT ch.service_id) AS cnt, "
         "(SELECT group_concat(label, ', ') FROM (SELECT DISTINCT s2.label FROM charges c2 JOIN services s2 ON s2.id = c2.service_id "
-        "   JOIN master_service_components m2 ON m2.service_id = c2.service_id AND m2.master_service_id = ?1 WHERE c2.user_id = ch.user_id)), "
+        "   JOIN master_service_components m2 ON m2.service_id = c2.service_id AND m2.master_service_id = ?1 AND m2.removed_at IS NULL WHERE c2.user_id = ch.user_id)), "
         "SUM(CAST(ROUND(ch.amount_due*100) AS INTEGER)) AS duec, SUM(CAST(ROUND(ch.amount_paid*100) AS INTEGER)) AS paidc") + kBuyersFrom +
         "ORDER BY " + order + (asc ? " ASC" : " DESC") + ", fold(u.full_name) LIMIT ?4 OFFSET ?5";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -4641,6 +4667,14 @@ std::vector<User> SqliteConn::getBuildingResidents(int buildingId) {
     sqlite3_finalize(st); return out;
 }
 
+bool SqliteConn::renameMasterService(int id, const std::string& label) {
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE master_services SET label = ? WHERE id = ? AND active = 1", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, label.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 2, id);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return false; }
+    return true;
+}
 std::string SqliteConn::getPackageLabel(int pkgId) {
     sqlite3_stmt* st = nullptr; std::string l;
     sqlite3_prepare_v2(db, "SELECT label FROM master_services WHERE id = ?", -1, &st, nullptr);
