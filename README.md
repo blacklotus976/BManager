@@ -35,3 +35,4 @@ sudo apt install libavformat-dev libavcodec-dev libswscale-dev libavutil-dev   #
 - `docs/UI_PROPOSALS.md` — edit history / receipts UI, search at 70k clients
 - `docs/PROMOTIONS_DESIGN.md` — contracts, promotions and offers (design)
 - `docs/JOINT_CHARGES.md` — Κοινόχρηστα: costs split across a building's apartments; error log
+- `docs/INSTALLMENTS.md` — installment plans and their single receipt

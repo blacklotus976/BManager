@@ -118,6 +118,6 @@ int main() {
         return RunApp(conn.get(), dbPath);
     } catch (const std::exception& e) {
         errlog::Write("crash", e.what());     // logs/errors.csv: what stopped the app, for the next start
-        throw;
+        return 1;
     }
 }

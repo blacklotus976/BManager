@@ -26,6 +26,7 @@ private:
     bool allocate(int paymentId, int chargeId, double amount);
     bool reconcilePaid(int chargeId, double desiredPaid);
     bool savepoint(const char* name);
+    bool closePlanIfPaid(int batchId);   // "end"-mode plan fully paid -> its one receipt
     bool release(const char* name);
     void rollbackTo(const char* name);
     int issueReceiptInTx(const Receipt& r, const std::vector<int>& paymentIds);   // caller owns the transaction
@@ -70,6 +71,11 @@ public:
     int getApartmentOnDate(int userId, int y, int m, int d) override { return apartmentAt(userId, y, m, d); }
     std::string takeLastError() override;
     std::string errorLogPath() override;
+    int addInstallmentPlan(const std::vector<Payment>& lines, const std::string& label, int installments,
+                           const std::string& every, const std::string& receiptMode, const Receipt* firstReceipt) override;
+    PaymentPlan getPlanForBatch(int batchId) override;
+    std::vector<MethodTotal> moneyByMethod(const std::string& fromDate, const std::string& toDate) override;
+    std::vector<DebtRow> debtAging(const std::string& asOf) override;
     std::vector<JointService> getJointCatalog(bool includeInactive = false) override;
     int addJointService(const Service& s, const std::string& kind) override;
     bool editJointService(int id, const Service& s, const std::string& kind, bool active) override;

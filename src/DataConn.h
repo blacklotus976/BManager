@@ -181,6 +181,7 @@ public:
         std::string fromDate, toDate;     // issue date, inclusive
         int status = 0;                   // 0 all, 1 issued, 2 void
         std::string number;               // substring of "A-123" / paper / bank reference / RF
+        std::string text;                 // free text: number fields above OR the client's name (accent-insensitive)
     };
     virtual std::vector<Receipt> searchReceipts(const ReceiptQuery& q, int offset, int limit) = 0;   // newest first
     virtual long long countReceipts(const ReceiptQuery& q, double* total = nullptr) = 0;
@@ -325,6 +326,32 @@ public:
         double totalNet = 0.0;
     };
     virtual std::vector<JointServiceSummary> getJointServices() = 0;   // legacy: services shared by several clients
+
+    // --- Installment plans (δόσεις) ---
+    // A charge (a service, or a package's services) split into N installments every month/week. All lines are one
+    // batch; installments not paid yet are 'future' charges with their due date as resolution date.
+    // receiptMode "end": ONE receipt, issued automatically when the last installment is paid, covering all the money
+    // of the plan (a receipt can only be for money received). "each": every installment gets its own receipt.
+    struct PaymentPlan {
+        int id = -1, batch_id = -1, installments = 0;
+        std::string every, receipt_mode, label, created_at;
+        double total = 0.0, paid = 0.0;
+        int paidInstallments = 0;          // installments with nothing left to pay
+        int receipt_id = -1;               // "end" mode: the receipt once issued
+    };
+    // lines: every charge of every installment, already dated (see the dialog). firstReceipt: receipt for money paid
+    // now, used in "each" mode (in "end" mode only its method is kept on the money). Returns the plan id or -1.
+    virtual int addInstallmentPlan(const std::vector<Payment>& lines, const std::string& label, int installments,
+                                   const std::string& every, const std::string& receiptMode, const Receipt* firstReceipt) = 0;
+    virtual PaymentPlan getPlanForBatch(int batchId) = 0;           // id -1 = the batch is not a plan
+
+    // --- Report queries ---
+    struct MethodTotal { std::string method; long long count = 0; double total = 0.0, receipted = 0.0; };
+    // money received (direction in) between two dates (inclusive, "" = open), per payment method
+    virtual std::vector<MethodTotal> moneyByMethod(const std::string& fromDate, const std::string& toDate) = 0;
+    struct DebtRow { int user_id = -1; double upTo30 = 0, upTo90 = 0, over90 = 0, total = 0; std::string oldest; };
+    // what each client still owes (resolved, collections, balance > 0) by age of the charge on `asOf`
+    virtual std::vector<DebtRow> debtAging(const std::string& asOf) = 0;
 
     // --- Κοινόχρηστα: a cost split across a collection of apartments (see models/Joint.h) ---
     virtual std::vector<JointService> getJointCatalog(bool includeInactive = false) = 0;
