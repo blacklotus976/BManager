@@ -64,6 +64,28 @@ td.empty { color: #3d4658; }
 .tip { position: fixed; pointer-events: none; background: #0d1018; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 13px; display: none; z-index: 9; max-width: 340px; }
 .keyline { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
 .keyline span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; background: var(--c); }
+.pgrid { display: grid; gap: 6px 8px; margin: 14px 0 6px; align-items: stretch; overflow-x: auto; padding-bottom: 6px; }
+.pcard { border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; background: var(--panel2); cursor: pointer; position: relative; min-height: 60px; }
+.pcard:hover { border-color: var(--accent); }
+.pcard b { font-size: 16px; } .pcard small { display: block; color: var(--muted); }
+.pcard.outside { border-color: #c25b5b; }
+.pcard .bolt { position: absolute; left: -15px; top: 18px; color: #ffb35c; font-size: 15px; }
+.plus { border: 1px dashed var(--line); border-radius: 9px; background: transparent; color: var(--accent); font-size: 22px; min-height: 60px; }
+.plus:hover { border-color: var(--accent); background: #1d2433; }
+.brk { border: 2px solid var(--c); border-top: none; border-radius: 0 0 8px 8px; height: 26px; font-size: 12px; color: var(--c);
+       display: flex; align-items: flex-end; justify-content: center; padding: 0 4px 2px; white-space: nowrap; overflow: hidden; cursor: default; }
+.roll { margin-top: 6px; }
+.roll .line { margin: 4px 0; }
+.roll .warn { color: #ffb35c; }
+.roll .ok { color: var(--both); }
+.picker { position: absolute; display: none; z-index: 20; width: 560px; max-width: calc(100vw - 32px); background: #161b25; border: 1px solid var(--line);
+          border-radius: 10px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+.picker h4 { margin: 8px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.picker .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.picker .chip { padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel2); cursor: pointer; font-size: 13px; }
+.picker .chip:hover, .picker .chip.on { border-color: var(--accent); background: #233049; }
+.picker .chip small { color: var(--muted); margin-left: 4px; }
+.picker .foot { display: flex; justify-content: space-between; margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -106,22 +128,17 @@ td.empty { color: #3d4658; }
   <h2>Progression</h2>
   <div class="progBox">
     <div class="row">
-      <span class="hint">Click column headers above to add chords. Target scale:</span>
+      <span class="hint">Press <b>+</b> to add any chord, click a chord to change or remove it. Bridge target:</span>
       <select id="target"></select>
       <button id="auto">Make a smooth 6-chord bridge</button>
       <button id="play">▶ Play</button>
       <button id="clear">Clear</button>
     </div>
-    <div class="prog" id="prog"></div>
-    <div class="keyline">
-      <span style="--c:var(--home)">only in home</span>
-      <span style="--c:var(--both)">in both: the ear cannot tell which scale you are in</span>
-      <span style="--c:var(--target)">only in target</span>
-      <span style="--c:#c25b5b">not in target (breaks the translation)</span>
-    </div>
-    <div id="progNote" class="hint" style="margin-top:8px"></div>
+    <div class="pgrid" id="pgrid"></div>
+    <div id="roll" class="roll"></div>
   </div>
 </div>
+<div class="picker" id="picker"></div>
 <div class="tip" id="tip"></div>
 
 <script>
@@ -143,7 +160,7 @@ const mod = (a, m) => ((a % m) + m) % m;
 // pick the tonic spelling with the fewest accidentals for this scale
 function bestSpelling(pcs) {
   let best = null, score = 1e9;
-  for (const cand of [NAMES_FLAT[pcs[0]], NAMES_SHARP[pcs[0]]]) {
+  for (const cand of pcs[0] === 6 ? ["F♯", "G♭"] : [NAMES_FLAT[pcs[0]], NAMES_SHARP[pcs[0]]]) {
     const names = spell(cand, pcs);
     const sc = names.reduce((s, n) => s + (n.length - 1) * (n.includes("𝄫") || n.includes("𝄪") ? 3 : 1), 0);
     if (sc < score) { score = sc; best = names; }
@@ -196,8 +213,8 @@ const rootSel = $("root"), typeSel = $("type");
 NAMES_FLAT.forEach((n, i) => rootSel.add(new Option(i === 6 ? "F♯ / G♭" : n, i)));
 for (const [fk, F] of Object.entries(FAMILIES)) F.modes.forEach((m, k) => typeSel.add(new Option(m, fk + ":" + k)));
 rootSel.value = 0; typeSel.value = "major:0";
-rootSel.onchange = () => { S.root = +rootSel.value; S.prog = []; draw(); };
-typeSel.onchange = () => { const [f, m] = typeSel.value.split(":"); S.fam = f; S.mode = +m; S.prog = []; draw(); };
+rootSel.onchange = () => { S.root = +rootSel.value; draw(); };
+typeSel.onchange = () => { const [f, m] = typeSel.value.split(":"); S.fam = f; S.mode = +m; draw(); };
 
 function seg(el, items, get, set) {
   el.innerHTML = "";
@@ -209,7 +226,7 @@ function seg(el, items, get, set) {
   }
 }
 seg($("nSeg"), [[2,2],[3,3],[4,4],[5,5],[6,6]], () => S.N, v => S.N = v);
-seg($("chordSeg"), [["triads",[3]],["7ths",[4]],["both",[3,4]]], () => S.sizes, v => { S.sizes = v; S.prog = []; });
+seg($("chordSeg"), [["triads",[3]],["7ths",[4]],["both",[3,4]]], () => S.sizes, v => { S.sizes = v; });
 document.querySelectorAll(".fam").forEach(c => c.onchange = draw);
 
 // ================================================================ build
@@ -263,7 +280,7 @@ function draw() {
   $("mx").innerHTML = h + `</tbody>`;
 
   // interactions
-  $("mx").querySelectorAll("th.chordcol").forEach(th => th.onclick = () => { S.bridge = false; S.prog.push(homeChords[+th.dataset.i].id); drawProg(); });
+  $("mx").querySelectorAll("th.chordcol").forEach(th => th.onclick = () => addFromTable(homeChords[+th.dataset.i]));
   $("mx").querySelectorAll("tbody tr[data-r] td.rowhead").forEach(td => td.onclick = () => { S.target = rows[+td.parentElement.dataset.r].sc.key; draw(); });
   $("mx").querySelectorAll("td.cell[data-c]").forEach(td => {
     td.onmousemove = (e) => {
@@ -283,69 +300,188 @@ function otherModesOfHome(home) {
 }
 function tip(e, html) { const t = $("tip"); t.innerHTML = html; t.style.display = "block"; t.style.left = (e.clientX + 14) + "px"; t.style.top = (e.clientY + 14) + "px"; }
 
-// ================================================================ progression
-$("target").onchange = (e) => { S.target = e.target.value; draw(); };
-$("clear").onclick = () => { S.prog = []; drawProg(); };
-function chordById(id) {
-  return view.homeChords.find(c => c.id === id) || view.rows.flatMap(r => r.all).find(c => c.id === id);
+// ================================================================ progression (free chords, any scale)
+const QUALS = { "": [0,4,7], "m": [0,3,7], "°": [0,3,6], "+": [0,4,8], "sus2": [0,2,7], "sus4": [0,5,7],
+                "7": [0,4,7,10], "maj7": [0,4,7,11], "m7": [0,3,7,10], "m(maj7)": [0,3,7,11], "ø7": [0,3,6,10], "°7": [0,3,6,9],
+                "6": [0,4,7,9], "m6": [0,3,7,9], "+maj7": [0,4,8,11] };
+const SHARP_ROOTS = new Set([1, 6, 11, 4, 9, 2]);    // C♯ F♯ B E A D read better with sharps
+function rootName(pc) { return pc === 1 ? "C♯" : NAMES_FLAT[pc] === "G♭" ? "F♯" : NAMES_FLAT[pc]; }
+function mkChord(root, q) {
+  const pcs = QUALS[q].map(i => (root + i) % 12);
+  const names = pcs.map(p => (SHARP_ROOTS.has(root) ? NAMES_SHARP : NAMES_FLAT)[p]);
+  return { root, q, pcs, name: rootName(root) + q, notes: names.join(" "), id: [...pcs].sort((a, b) => a - b).join(",") + "|" + root };
 }
+function fromStacked(c) {    // a chord from the table (stacked thirds) -> free chord
+  const iv = c.pcs.map(p => mod(p - c.pcs[0], 12)).join(",");
+  const q = Object.keys(QUALS).find(k => QUALS[k].join(",") === iv);
+  return q === undefined ? null : mkChord(c.pcs[0], q);
+}
+function fits(sc, ch) { return ch.pcs.every(p => sc.pcs.includes(p)); }
+function romanIn(sc, ch) {
+  const deg = sc.pcs.indexOf(ch.root); if (deg < 0) return "?";
+  const da = mod(sc.pcs[deg] - sc.pcs[0] - MAJOR[deg] + 6, 12) - 6;
+  const pre = da < 0 ? "♭".repeat(-da) : "♯".repeat(da);
+  const minor = QUALS[ch.q][1] === 3 || ch.q.startsWith("°") || ch.q === "ø7";
+  const sym = ch.q === "m" ? "" : ch.q.startsWith("m") && ch.q !== "maj7" ? ch.q.slice(1) : ch.q;
+  return pre + (minor ? ROMAN[deg].toLowerCase() : ROMAN[deg]) + sym;
+}
+const FAM_ORDER = { major: 0, harmMinor: 1, melMinor: 2, harmMajor: 3 };
+function scaleRank(sc) { return FAM_ORDER[sc.fam] * 100 + sc.names.reduce((n, x) => n + x.length - 1, 0); }
+
+S.seq = [];
+let pick = { at: -1, root: null };     // at: index to replace, or seq.length to append
+
+// maximal runs of consecutive chords that fit one scale, grouped when several scales cover the same run
+function analyse(seq) {
+  const scales = allScales().concat([makeScale(S.fam, 0, mod(S.root - FAMILIES[S.fam].steps[S.mode], 12))]);
+  const uniq = new Map(); scales.forEach(sc => { if (!uniq.has(sc.key)) uniq.set(sc.key, sc); });
+  const runs = [];
+  for (const sc of uniq.values()) {
+    let a = -1;
+    for (let i = 0; i <= seq.length; i++) {
+      const ok = i < seq.length && fits(sc, seq[i]);
+      if (ok && a < 0) a = i;
+      if (!ok && a >= 0) { runs.push({ a, b: i - 1, sc }); a = -1; }
+    }
+  }
+  const kept = runs.filter(r => !runs.some(o => o.a <= r.a && o.b >= r.b && (o.b - o.a) > (r.b - r.a)));
+  const groups = new Map();
+  for (const r of kept) { const k = r.a + "-" + r.b; if (!groups.has(k)) groups.set(k, { a: r.a, b: r.b, scales: [] }); groups.get(k).scales.push(r.sc); }
+  const out = [...groups.values()].sort((x, y) => x.a - y.a || y.b - x.b);
+  out.forEach(g => g.scales.sort((x, y) => scaleRank(x) - scaleRank(y)));
+  const abrupt = []; for (let i = 0; i + 1 < seq.length; i++) if (![...uniq.values()].some(sc => fits(sc, seq[i]) && fits(sc, seq[i + 1]))) abrupt.push(i + 1);
+  const outside = seq.map(ch => ![...uniq.values()].some(sc => fits(sc, ch)));
+  return { groups: out, abrupt, outside };
+}
+
+const LANE_COL = ["#e3a64f", "#8f9cf5", "#5fc48a", "#d47ad8", "#4fd1c5", "#f07a7a"];
 function drawProg() {
-  const box = $("prog"), note = $("progNote");
-  const tr = view.rows.find(r => r.sc.key === S.target);
-  const homeIds = new Set(view.homeChords.map(c => c.id));
-  const tMap = tr ? new Map(tr.all.map(c => [c.id, c])) : new Map();
-  if (!S.prog.length) { box.innerHTML = `<span class="hint">Empty: click chords in the table header, or press “Make a smooth 6-chord bridge”.</span>`; note.textContent = ""; return; }
-  let h = "", misses = 0;
-  S.prog.forEach((id, i) => {
-    const inHome = homeIds.has(id), inT = tMap.has(id);
-    const c = chordById(id), hc = view.homeChords.find(x => x.id === id), tc = tMap.get(id);
-    let cls = inHome && inT ? "both" : inHome ? (S.bridge ? "home" : "bad") : "target";
-    if (cls === "bad") misses++;
-    h += `<div class="card ${cls}"><span class="x" data-i="${i}">×</span><b>${c.name}</b><small>${c.notes}</small>` +
-         (hc ? `<small>home: <span class="roman">${hc.roman}</span></small>` : "") +
-         (tc ? `<small>${tr.sc.names[0]}: <span class="roman">${tc.roman}</span></small>` : (tr ? `<small>not in ${tr.sc.label}</small>` : "")) + `</div>`;
+  const g = $("pgrid"), n = S.seq.length, A = analyse(S.seq);
+  g.style.gridTemplateColumns = `repeat(${n}, minmax(118px, 1fr)) 70px`;
+  let h = "";
+  S.seq.forEach((c, i) => {
+    h += `<div class="pcard ${A.outside[i] ? "outside" : ""}" data-i="${i}" style="grid-column:${i + 1};grid-row:1">` +
+         (A.abrupt.includes(i) ? `<span class="bolt" title="Abrupt change: no scale holds both this chord and the one before">⚡</span>` : "") +
+         `<b>${c.name}</b><small>${c.notes}</small><small>${i + 1}</small></div>`;
   });
-  box.innerHTML = h;
-  box.querySelectorAll(".x").forEach(x => x.onclick = () => { S.prog.splice(+x.dataset.i, 1); S.bridge = false; drawProg(); });
-  if (!tr) note.textContent = "";
-  else if (S.bridge) note.textContent = `Starts in ${view.home.label}, walks on chords both scales own, lands in ${tr.sc.label}. The change happens somewhere in the green part and the ear cannot pin it.`;
-  else note.textContent = misses ? `${misses} chord(s) do not exist in ${tr.sc.label}: in that scale the progression would need other chords.`
-                                 : `Every chord also lives in ${tr.sc.label}: the same progression reads there as ${S.prog.map(id => tMap.get(id).roman).join(" – ")}.`;
+  h += `<button class="plus" id="plusBtn" style="grid-column:${n + 1};grid-row:1" title="Add a chord">+</button>`;
+  // brackets in lanes
+  const laneEnd = [];
+  A.groups.forEach((gr, k) => {
+    let lane = laneEnd.findIndex(e => e < gr.a); if (lane < 0) { lane = laneEnd.length; laneEnd.push(-1); } laneEnd[lane] = gr.b;
+    const col = LANE_COL[k % LANE_COL.length];
+    const label = gr.scales[0].label + (gr.scales.length > 1 ? ` +${gr.scales.length - 1}` : "");
+    h += `<div class="brk" data-k="${k}" style="--c:${col};grid-column:${gr.a + 1} / ${gr.b + 2};grid-row:${lane + 2}">${label}</div>`;
+  });
+  g.innerHTML = h;
+  g.querySelectorAll(".pcard").forEach(el => el.onclick = (e) => openPicker(+el.dataset.i, el));
+  $("plusBtn").onclick = (e) => openPicker(S.seq.length, e.currentTarget);
+  g.querySelectorAll(".brk").forEach(el => {
+    const gr = A.groups[+el.dataset.k];
+    el.onmousemove = (e) => tip(e, gr.scales.slice(0, 4).map(sc => `<b>${sc.label}</b>: ` +
+        S.seq.slice(gr.a, gr.b + 1).map(c => `<span class="roman">${romanIn(sc, c)}</span>`).join(" – ")).join("<br>") +
+        (gr.scales.length > 4 ? `<br><span class="hint">and ${gr.scales.length - 4} more</span>` : ""));
+    el.onmouseleave = () => $("tip").style.display = "none";
+  });
+
+  // the rolling window, in words
+  const r = $("roll");
+  if (!n) { r.innerHTML = `<p class="hint">Empty. Press + or click chords in the table header.</p>`; return; }
+  let t = "";
+  A.groups.forEach(gr => {
+    const sc = gr.scales[0], also = gr.scales.slice(1, 3).map(x => x.label).join(", ");
+    t += `<div class="line">Chords <b>${gr.a + 1}${gr.b > gr.a ? "–" + (gr.b + 1) : ""}</b> sit in <b>${sc.label}</b>: ` +
+         S.seq.slice(gr.a, gr.b + 1).map(c => `<span class="roman">${romanIn(sc, c)}</span>`).join(" – ") +
+         (also ? ` <span class="hint">(also ${also}${gr.scales.length > 3 ? "…" : ""})</span>` : "") + `</div>`;
+  });
+  for (let k = 0; k + 1 < A.groups.length; k++) {
+    const x = A.groups[k], y = A.groups[k + 1];
+    if (y.a <= x.b) t += `<div class="line ok">Smooth change: chords ${y.a + 1}–${Math.min(x.b, y.b) + 1} belong to both ${x.scales[0].label} and ${y.scales[0].label}, so the ear cannot tell where the scale changed.</div>`;
+  }
+  A.abrupt.forEach(i => t += `<div class="line warn">⚡ Abrupt change between chord ${i} (${S.seq[i - 1].name}) and chord ${i + 1} (${S.seq[i].name}): no scale holds both. Put a shared chord between them for a smooth move.</div>`);
+  A.outside.forEach((o, i) => { if (o) t += `<div class="line warn">Chord ${i + 1} (${S.seq[i].name}) is outside every scale you compare with.</div>`; });
+  r.innerHTML = t;
 }
+
+function openPicker(at, anchor) {
+  pick = { at, root: null };
+  const P = $("picker"), rect = anchor.getBoundingClientRect();
+  P.style.display = "block";
+  P.style.left = Math.max(8, Math.min(window.scrollX + rect.left, window.scrollX + document.documentElement.clientWidth - 580)) + "px";
+  P.style.top = (window.scrollY + rect.bottom + 6) + "px";
+  renderPicker();
+}
+function renderPicker() {
+  const P = $("picker"), at = pick.at, prev = S.seq[at - 1] || (at === 0 ? null : null);
+  let h = "";
+  // chords of the scales that hold the previous chord: the smooth choices
+  const near = prev ? allScales().filter(sc => fits(sc, prev)).sort((a, b) => scaleRank(a) - scaleRank(b)).slice(0, 4)
+                    : [makeScale(S.fam, S.mode, S.root)];
+  h += `<h4>${prev ? `Smooth after ${prev.name}` : "From your home scale"}</h4>`;
+  for (const sc of near) {
+    h += `<div style="margin:4px 0"><span class="hint">${sc.label}:</span> <span class="chips">`;
+    for (const c0 of chordsOf(sc, S.sizes)) { const c = fromStacked(c0); if (!c) continue;
+      h += `<span class="chip" data-r="${c.root}" data-q="${c.q}">${c0.name}<small>${c0.roman}</small></span>`; }
+    h += `</span></div>`;
+  }
+  h += `<h4>Any chord: root</h4><div class="chips">`;
+  for (let r = 0; r < 12; r++) h += `<span class="chip ${pick.root === r ? "on" : ""}" data-root="${r}">${rootName(r)}</span>`;
+  h += `</div>`;
+  if (pick.root !== null) {
+    h += `<h4>Quality</h4><div class="chips">`;
+    for (const q of Object.keys(QUALS)) h += `<span class="chip" data-r="${pick.root}" data-q="${q}">${rootName(pick.root)}${q}</span>`;
+    h += `</div>`;
+  }
+  h += `<div class="foot">` + (at < S.seq.length ? `<button id="pkDel">Remove this chord</button>` : `<span></span>`) + `<button id="pkClose">Close</button></div>`;
+  P.innerHTML = h;
+  P.querySelectorAll("[data-root]").forEach(el => el.onclick = (e) => { e.stopPropagation(); pick.root = +el.dataset.root; renderPicker(); });
+  P.querySelectorAll("[data-q]").forEach(el => el.onclick = (e) => {
+    e.stopPropagation();
+    const c = mkChord(+el.dataset.r, el.dataset.q);
+    if (pick.at < S.seq.length) S.seq[pick.at] = c; else S.seq.push(c);
+    closePicker(); drawProg();
+  });
+  const del = $("pkDel"); if (del) del.onclick = (e) => { e.stopPropagation(); S.seq.splice(pick.at, 1); closePicker(); drawProg(); };
+  $("pkClose").onclick = (e) => { e.stopPropagation(); closePicker(); };
+}
+function closePicker() { $("picker").style.display = "none"; }
+document.addEventListener("mousedown", (e) => { const P = $("picker"); if (P.style.display === "block" && !P.contains(e.target) && !e.target.closest(".pcard, .plus")) closePicker(); });
+
+$("target").onchange = (e) => { S.target = e.target.value; draw(); };
+$("clear").onclick = () => { S.seq = []; drawProg(); };
 $("auto").onclick = () => {
   const tr = view.rows.find(r => r.sc.key === S.target); if (!tr) return;
-  const tMap = new Map(tr.all.map(c => [c.id, c]));
-  const home = view.homeChords, common = home.filter(c => tMap.has(c.id));
-  const homeOnly = home.filter(c => !tMap.has(c.id));
-  const tOnly = tr.all.filter(c => !home.some(h => h.id === c.id));
-  if (!common.length || !homeOnly.length || !tOnly.length) { $("progNote").textContent = "These two scales need at least one own chord each plus shared ones."; return; }
-  const r = (a) => a[Math.floor(Math.random() * a.length)];
-  // start on the home tonic when it belongs to home only, end on the target tonic when it belongs to target only
-  const first = homeOnly.find(c => c.deg === 0) || r(homeOnly);
-  const last = tOnly.find(c => c.deg === 0) || tOnly.find(c => c.func === "T") || r(tOnly);
+  const tIds = new Set(tr.all.map(c => c.id));
+  const home = view.homeChords, common = home.filter(c => tIds.has(c.id));
+  const homeOnly = home.filter(c => !tIds.has(c.id)), tOnly = tr.all.filter(c => !home.some(h => h.id === c.id));
+  if (!common.length || !homeOnly.length || !tOnly.length) { $("roll").innerHTML = `<p class="warn">These two scales need at least one own chord each plus shared ones.</p>`; return; }
+  const rnd = (a) => a[Math.floor(Math.random() * a.length)];
+  const first = homeOnly.find(c => c.deg === 0) || rnd(homeOnly);
+  const last = tOnly.find(c => c.deg === 0) || tOnly.find(c => c.func === "T") || rnd(tOnly);
   const mid = []; let pool = [...common];
-  while (mid.length < 4) { if (!pool.length) pool = [...common]; const k = Math.floor(Math.random() * pool.length); const c = pool.splice(k, 1)[0];
-                           if (mid.length && mid[mid.length - 1] === c.id && common.length > 1) continue; mid.push(c.id); }
-  // end the shared part on a chord that leads well: prefer one that is a pre-dominant/dominant in the target
-  const lead = common.filter(c => ["S","D"].includes(tMap.get(c.id).func) && c.id !== mid[2]); if (lead.length) mid[3] = r(lead).id;
-  S.prog = [first.id, ...mid, last.id]; S.bridge = true; drawProg();
+  while (mid.length < 4) { if (!pool.length) pool = [...common]; const c = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+                           if (mid.length && mid[mid.length - 1] === c && common.length > 1) continue; mid.push(c); }
+  S.seq = [first, ...mid, last].map(fromStacked).filter(Boolean);
+  drawProg();
 };
+// header clicks in the table add that chord
+function addFromTable(c) { const f = fromStacked(c); if (f) { S.seq.push(f); drawProg(); } }
 
 // ================================================================ playback
 let ac = null;
 $("play").onclick = () => {
-  if (!S.prog.length) return;
+  if (!S.seq.length) return;
   ac = ac || new (window.AudioContext || window.webkitAudioContext)();
   const t0 = ac.currentTime + 0.05, dur = 1.0;
-  S.prog.forEach((id, i) => {
-    const c = chordById(id); let prev = 47;
+  S.seq.forEach((c, i) => {
+    let prev = 0;
     c.pcs.forEach((pc, j) => {
-      let midi = 48 + pc; while (midi <= prev) midi += 12; if (j === 0) { midi = 48 + pc; if (midi > 54) midi -= 12; } prev = midi;
-      const o = ac.createOscillator(), g = ac.createGain();
+      let midi = j === 0 ? 48 + pc - (pc > 6 ? 12 : 0) : 48 + pc; while (j > 0 && midi <= prev) midi += 12; prev = midi;
+      const o = ac.createOscillator(), gn = ac.createGain();
       o.type = "triangle"; o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
-      g.gain.setValueAtTime(0, t0 + i * dur); g.gain.linearRampToValueAtTime(0.11, t0 + i * dur + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.001, t0 + (i + 1) * dur);
-      o.connect(g).connect(ac.destination); o.start(t0 + i * dur); o.stop(t0 + (i + 1) * dur + 0.05);
+      gn.gain.setValueAtTime(0, t0 + i * dur); gn.gain.linearRampToValueAtTime(0.11, t0 + i * dur + 0.02);
+      gn.gain.exponentialRampToValueAtTime(0.001, t0 + (i + 1) * dur);
+      o.connect(gn).connect(ac.destination); o.start(t0 + i * dur); o.stop(t0 + (i + 1) * dur + 0.05);
     });
   });
 };
