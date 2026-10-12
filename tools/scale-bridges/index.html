@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scale Bridges</title>
+<style>
+:root {
+  --bg: #12151c; --panel: #1a1f29; --line: #2a3140; --text: #e6e9ef; --muted: #8b93a5;
+  --accent: #6cb6ff; --good: #5fc48a; --warn: #e3a64f;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+header { padding: 14px 20px 6px; }
+h1 { margin: 0; font-size: 20px; font-weight: 600; }
+header p { margin: 4px 0 0; color: var(--muted); max-width: 900px; }
+.controls { display: flex; flex-wrap: wrap; gap: 14px 22px; padding: 10px 20px; border-bottom: 1px solid var(--line); align-items: center; }
+.controls fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.controls legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
+label { white-space: nowrap; cursor: pointer; }
+input[type=number] { width: 56px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+select, button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font: inherit; }
+button { cursor: pointer; } button:hover { border-color: var(--accent); }
+main { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr); gap: 0; }
+@media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+#chartWrap { padding: 8px; border-right: 1px solid var(--line); }
+svg { width: 100%; height: auto; display: block; }
+#side { padding: 14px 18px; overflow: auto; max-height: calc(100vh - 150px); }
+#side h2 { font-size: 16px; margin: 6px 0 8px; }
+#side h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.hint { color: var(--muted); }
+.chord { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; background: var(--panel); }
+.chord .notes { font-weight: 600; }
+.chord .all { color: var(--good); font-size: 12px; margin-left: 6px; }
+.chord ul { margin: 4px 0 0; padding-left: 18px; }
+.chord li { color: #cfd5e1; }
+.roman { color: var(--accent); font-weight: 600; }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; margin: 2px 4px 2px 0; border: 1px solid var(--line); }
+.prog { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.pc { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 120px; background: var(--panel); }
+.pc.from { border-color: #b4824a; } .pc.both { border-color: var(--good); } .pc.to { border-color: #7a8cf0; }
+.pc small { display: block; color: var(--muted); }
+.legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin: 4px 0 0; flex-wrap: wrap; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; background: var(--c); }
+.leaf { cursor: pointer; }
+.node { cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Scale Bridges</h1>
+  <p>Every scale (all 12 keys, grouped by notes, so modes of the same scale are one node) is clustered by how many chords it shares with the others. Pick <b>N</b>: scales that share at least N chords join in a cluster. Hover a junction to see the shared chords and what each one is called in each scale. Then build a progression that changes scale without the ear noticing.</p>
+</header>
+
+<div class="controls">
+  <fieldset><legend>Shared chords</legend>
+    <label>N <input id="n" type="number" min="1" max="35" value="6"></label>
+    <label title="On: A–B share N and B–C share N, so A, B, C cluster together even if A–C share fewer (single linkage). Off: every pair inside a cluster must share N (complete linkage)."><input id="relax" type="checkbox"> relax</label>
+  </fieldset>
+  <fieldset><legend>Chord sizes (stacked thirds)</legend>
+    <label><input type="checkbox" class="sz" value="2"> 2</label>
+    <label><input type="checkbox" class="sz" value="3" checked> 3 (triads)</label>
+    <label><input type="checkbox" class="sz" value="4" checked> 4 (7ths)</label>
+    <label><input type="checkbox" class="sz" value="5"> 5 (9ths)</label>
+  </fieldset>
+  <fieldset><legend>Scale families</legend>
+    <label><input type="checkbox" class="fam" value="major" checked> Major (diatonic modes)</label>
+    <label><input type="checkbox" class="fam" value="harmMinor" checked> Harmonic minor</label>
+    <label><input type="checkbox" class="fam" value="melMinor" checked> Melodic minor</label>
+    <label><input type="checkbox" class="fam" value="harmMajor"> Harmonic major</label>
+    <label><input type="checkbox" class="fam" value="dblHarm"> Double harmonic</label>
+  </fieldset>
+  <fieldset><legend>Show</legend>
+    <label><input id="onlyClustered" type="checkbox"> only scales in a cluster</label>
+  </fieldset>
+</div>
+
+<main>
+  <div id="chartWrap">
+    <svg id="chart" viewBox="-520 -520 1040 1040" role="img" aria-label="Radial dendrogram of scales"></svg>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div id="side">
+    <div id="info"><p class="hint">Hover a junction (dot) or a scale. Click to pin it; click empty space to unpin.</p></div>
+    <h3>Smooth transition builder</h3>
+    <div>
+      <label>From <select id="fromSel"></select></label>
+      <label>To <select id="toSel"></select></label>
+    </div>
+    <div style="margin-top:6px">
+      <label>Length <input id="plen" type="number" min="3" max="12" value="6"></label>
+      <button id="play">▶ Play</button>
+      <button id="shuffle">↻ Another</button>
+    </div>
+    <div id="progOut"></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- theory
+const LETTERS = ["C","D","E","F","G","A","B"];
+const LETTER_PC = [0,2,4,5,7,9,11];
+const ACC = { "-2":"𝄫", "-1":"♭", "0":"", "1":"♯", "2":"𝄪" };
+const ROMAN = ["I","II","III","IV","V","VI","VII"];
+const MAJOR = [0,2,4,5,7,9,11];
+
+const FAMILIES = {
+  major:     { steps: [0,2,4,5,7,9,11], modes: ["major (Ionian)","Dorian","Phrygian","Lydian","Mixolydian","natural minor (Aeolian)","Locrian"], minorish: false },
+  harmMinor: { steps: [0,2,3,5,7,8,11], modes: ["harmonic minor","Locrian ♮6","Ionian ♯5","Dorian ♯4","Phrygian dominant","Lydian ♯2","Super-Locrian 𝄫7"], minorish: true },
+  melMinor:  { steps: [0,2,3,5,7,9,11], modes: ["melodic minor","Dorian ♭2","Lydian augmented","Lydian dominant","Mixolydian ♭6","Locrian ♮2","Altered"], minorish: true },
+  harmMajor: { steps: [0,2,4,5,7,8,11], modes: ["harmonic major","Dorian ♭5","Phrygian ♭4","Lydian ♭3","Mixolydian ♭2","Lydian augmented ♯2","Locrian 𝄫7"], minorish: false },
+  dblHarm:   { steps: [0,1,4,5,7,8,11], modes: ["double harmonic major","Lydian ♯2 ♯6","Ultraphrygian","Hungarian minor","Oriental","Ionian ♯2 ♯5","Locrian 𝄫3 𝄫7"], minorish: false },
+};
+// tonic spellings: flats for major-type keys, sharps where minor keys usually use them
+const TONIC_MAJ = ["C","D♭","D","E♭","E","F","F♯","G","A♭","A","B♭","B"];
+const TONIC_MIN = ["C","C♯","D","E♭","E","F","F♯","G","G♯","A","B♭","B"];
+
+function parseName(n) {               // "F♯" -> {letter index, acc}
+  const li = LETTERS.indexOf(n[0]);
+  const a = n.slice(1); const acc = a === "♯" ? 1 : a === "♭" ? -1 : 0;
+  return { li, acc };
+}
+const mod = (a, m) => ((a % m) + m) % m;
+
+// Spell a heptatonic scale from a tonic name: consecutive letters, accidentals from the pitch classes.
+function spell(tonicName, pcs) {
+  const { li } = parseName(tonicName);
+  return pcs.map((pc, i) => {
+    const L = (li + i) % 7; let d = mod(pc - LETTER_PC[L] + 6, 12) - 6;
+    return LETTERS[L] + (ACC[String(d)] ?? "?");
+  });
+}
+
+function triadSym(i3, i5) {
+  if (i3 === 4 && i5 === 7) return { s: "", r: "", up: true };
+  if (i3 === 3 && i5 === 7) return { s: "m", r: "", up: false };
+  if (i3 === 3 && i5 === 6) return { s: "°", r: "°", up: false };
+  if (i3 === 4 && i5 === 8) return { s: "+", r: "+", up: true };
+  if (i3 === 2 && i5 === 7) return { s: "sus2", r: "sus2", up: true };
+  if (i3 === 5 && i5 === 7) return { s: "sus4", r: "sus4", up: true };
+  return { s: `(${i3},${i5})`, r: "?", up: i3 >= 4 };
+}
+function seventhSym(i3, i5, i7) {
+  const k = `${i3},${i5},${i7}`;
+  const t = { "4,7,11":["maj7","maj7"], "4,7,10":["7","7"], "3,7,10":["m7","7"], "3,7,11":["m(maj7)","(maj7)"],
+              "3,6,10":["ø7","ø7"], "3,6,9":["°7","°7"], "4,8,11":["+maj7","+maj7"], "4,8,10":["+7","+7"], "3,6,11":["°(maj7)","°(maj7)"],
+              "4,6,10":["7♭5","7♭5"], "4,6,11":["maj7♭5","maj7♭5"] }[k];
+  return t || [`(${k})`, `(${k})`];
+}
+function ninthSym(i9) { return i9 === 2 ? "9" : i9 === 1 ? "♭9" : i9 === 3 ? "♯9" : `(${i9})`; }
+
+// The chord on degree `deg` with `size` stacked thirds, named in the context of one scale (one mode).
+function chordInScale(scale, deg, size) {
+  const idx = []; for (let j = 0; j < size; j++) idx.push((deg + 2 * j) % 7);
+  const pcs = idx.map(i => scale.pcs[i]);
+  const names = idx.map(i => scale.names[i]);
+  const r = pcs[0];
+  const iv = pcs.map(p => mod(p - r, 12));
+  // roman numeral with accidental against the major scale of the tonic
+  const degAcc = mod(scale.pcs[deg] - scale.pcs[0] - MAJOR[deg] + 6, 12) - 6;
+  const pre = degAcc < 0 ? "♭".repeat(-degAcc) : "♯".repeat(degAcc);
+  let name, roman;
+  if (size === 2) {
+    name = `${names[0]}–${names[1]}`;
+    roman = pre + (iv[1] === 4 ? ROMAN[deg] : ROMAN[deg].toLowerCase()) + " (dyad)";
+  } else {
+    const t = triadSym(iv[1], iv[2]);
+    const num = t.up ? ROMAN[deg] : ROMAN[deg].toLowerCase();
+    if (size === 3) { name = names[0] + t.s; roman = pre + num + t.r; }
+    else {
+      const [s7, r7] = seventhSym(iv[1], iv[2], iv[3]);
+      name = names[0] + s7; roman = pre + num + r7;
+      if (size === 5) { const n9 = ninthSym(iv[4]); name += `(${n9})`; roman += `(${n9})`; }
+    }
+  }
+  const key = [...new Set(pcs)].sort((a, b) => a - b).join(",");
+  return { key, name, roman, notes: names.join(" "), pcs, size, deg };
+}
+
+// Build every scale node: one node per distinct note set (all modes of it share the node).
+function buildNodes(families, sizes) {
+  const nodes = [];
+  for (const fk of families) {
+    const F = FAMILIES[fk];
+    for (let t = 0; t < 12; t++) {
+      const tonics = F.minorish ? TONIC_MIN : TONIC_MAJ;
+      const pcs = F.steps.map(s => (s + t) % 12);
+      const names = spell(tonics[t], pcs);
+      const scale = { pcs, names, label: `${tonics[t]} ${F.modes[0]}` };
+      // every mode, with its own tonic, for "also called" and per-mode numerals
+      const modes = F.modes.map((m, k) => ({ name: `${names[k]} ${m}`, pcs: pcs.slice(k).concat(pcs.slice(0, k)), names: names.slice(k).concat(names.slice(0, k)) }));
+      const chords = new Map();
+      for (const size of sizes) for (let d = 0; d < 7; d++) {
+        const c = chordInScale(scale, d, size);
+        if (!chords.has(c.key)) chords.set(c.key, c);
+      }
+      // the minor-type families read better from their minor tonic; major family keeps Ionian
+      nodes.push({ id: `${fk}:${t}`, family: fk, label: scale.label, short: shortLabel(fk, tonics[t]), scale, modes, chords });
+    }
+  }
+  return nodes;
+}
+function shortLabel(fk, tonic) {
+  return { major: tonic, harmMinor: tonic + " hm", melMinor: tonic + " mm", harmMajor: tonic + " hM", dblHarm: tonic + " dh" }[fk];
+}
+function shared(a, b) { let n = 0; for (const k of a.chords.keys()) if (b.chords.has(k)) n++; return n; }
+
+// ---------------------------------------------------------------- clustering (agglomerative)
+// similarity = number of shared chords. relax -> single linkage (max pair), strict -> complete linkage (min pair).
+function cluster(nodes, relax) {
+  const n = nodes.length;
+  const S = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) S[i][j] = S[j][i] = shared(nodes[i], nodes[j]);
+  let clusters = nodes.map((nd, i) => ({ leaf: true, idx: i, members: [i], h: Infinity }));
+  const link = (A, B) => {
+    let v = relax ? -1 : Infinity;
+    for (const a of A.members) for (const b of B.members) v = relax ? Math.max(v, S[a][b]) : Math.min(v, S[a][b]);
+    return v;
+  };
+  while (clusters.length > 1) {
+    let best = -1, bi = 0, bj = 1;
+    for (let i = 0; i < clusters.length; i++) for (let j = i + 1; j < clusters.length; j++) {
+      const v = link(clusters[i], clusters[j]); if (v > best) { best = v; bi = i; bj = j; }
+    }
+    const A = clusters[bi], B = clusters[bj];
+    const C = { leaf: false, children: [A, B], members: A.members.concat(B.members), h: best };
+    clusters.splice(bj, 1); clusters.splice(bi, 1, C);
+  }
+  return { root: clusters[0], S };
+}
+
+// ---------------------------------------------------------------- drawing
+const svg = document.getElementById("chart");
+const NS = "http://www.w3.org/2000/svg";
+const PALETTE = ["#6cb6ff","#5fc48a","#e3a64f","#d47ad8","#f07a7a","#4fd1c5","#c9d65a","#9a8cf0","#f29ec8","#8fd0ff","#ffb86b","#7bd88f"];
+const R_IN = 30, R_OUT = 330;
+let state = { nodes: [], root: null, S: null, smax: 1, N: 4, pinned: null };
+
+function el(tag, attrs, parent) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); (parent || svg).appendChild(e); return e; }
+function polar(a, r) { return [r * Math.cos(a - Math.PI / 2), r * Math.sin(a - Math.PI / 2)]; }
+function radiusOf(h) { return R_IN + (R_OUT - R_IN) * Math.max(0, Math.min(1, h / state.smax)); }
+
+function render() {
+  const sizes = [...document.querySelectorAll(".sz:checked")].map(x => +x.value);
+  const fams = [...document.querySelectorAll(".fam:checked")].map(x => x.value);
+  state.N = Math.max(1, +document.getElementById("n").value || 1);
+  const relax = document.getElementById("relax").checked;
+  const only = document.getElementById("onlyClustered").checked;
+  svg.innerHTML = ""; state.pinned = null;
+  if (!sizes.length || !fams.length) { document.getElementById("info").innerHTML = '<p class="hint">Pick at least one chord size and one family.</p>'; return; }
+
+  let nodes = buildNodes(fams, sizes);
+  let res = cluster(nodes, relax);
+  if (only) {   // drop scales that join nothing at N, then recluster what is left
+    const keep = new Set(); markClusters(res.root, state.N, (c) => { if (c.members.length > 1) c.members.forEach(m => keep.add(m)); });
+    nodes = nodes.filter((_, i) => keep.has(i));
+    res = nodes.length ? cluster(nodes, relax) : { root: null, S: [] };
+  }
+  state.nodes = nodes; state.root = res.root; state.S = res.S;
+  state.smax = 1; for (const row of state.S || []) for (const v of row) state.smax = Math.max(state.smax, v);
+  state.smax += 1;   // leaves sit just outside the tightest pair
+  fillSelects();
+  if (!state.root) { document.getElementById("info").innerHTML = '<p class="hint">No scales share that many chords. Lower N.</p>'; drawProgression(); return; }
+
+  // leaf order and angles
+  const order = []; (function walk(c) { if (c.leaf) order.push(c); else c.children.forEach(walk); })(state.root);
+  const step = 2 * Math.PI / order.length;
+  order.forEach((c, i) => { c.a = (i + 0.5) * step; c.r = R_OUT; });
+  (function pos(c) { if (c.leaf) return; c.children.forEach(pos); c.a = (c.children[0].a + c.children[1].a) / 2; c.r = radiusOf(c.h); })(state.root);
+
+  // colour each maximal subtree that holds together at N
+  let ci = 0; const colourOf = new Map();
+  markClusters(state.root, state.N, (c) => { if (c.members.length > 1) { const col = PALETTE[ci++ % PALETTE.length]; (function paint(x) { colourOf.set(x, col); if (!x.leaf) x.children.forEach(paint); })(c); } });
+
+  // guide rings: similarity levels, cut ring at N
+  for (let h = 0; h <= state.smax; h += Math.max(1, Math.round(state.smax / 7))) {
+    el("circle", { r: radiusOf(h), fill: "none", stroke: "#222a37", "stroke-width": 1 });
+    const [x, y] = polar(0, radiusOf(h)); el("text", { x: x + 3, y: y - 2, fill: "#5d667a", "font-size": 9 }).textContent = h;
+  }
+  el("circle", { r: radiusOf(state.N), fill: "none", stroke: "#e3a64f", "stroke-dasharray": "4 4", "stroke-width": 1.2 });
+  const [cx, cy] = polar(0, radiusOf(state.N)); el("text", { x: cx + 3, y: cy + 11, fill: "#e3a64f", "font-size": 10 }).textContent = `N = ${state.N}`;
+
+  // links: radial segment child -> parent radius, then arc at parent radius
+  const gL = el("g", {});
+  (function links(c) {
+    if (c.leaf) return;
+    const col = colourOf.get(c) || "#4a5468";
+    for (const k of c.children) {
+      const [x1, y1] = polar(k.a, k.r), [x2, y2] = polar(k.a, c.r);
+      el("line", { x1, y1, x2, y2, stroke: colourOf.get(k) || "#4a5468", "stroke-width": colourOf.get(k) ? 1.8 : 1 }, gL);
+    }
+    const a0 = Math.min(c.children[0].a, c.children[1].a), a1 = Math.max(c.children[0].a, c.children[1].a);
+    const [sx, sy] = polar(a0, c.r), [ex, ey] = polar(a1, c.r);
+    el("path", { d: `M${sx},${sy} A${c.r},${c.r} 0 ${a1 - a0 > Math.PI ? 1 : 0} 1 ${ex},${ey}`, fill: "none", stroke: col, "stroke-width": colourOf.get(c) ? 1.8 : 1 }, gL);
+    c.children.forEach(links);
+  })(state.root);
+
+  // junction dots (hover = what these scales share)
+  const gN = el("g", {});
+  (function dots(c) {
+    if (c.leaf) return;
+    const [x, y] = polar(c.a, c.r);
+    const d = el("circle", { cx: x, cy: y, r: c.h >= state.N ? 5 : 3, fill: colourOf.get(c) || "#4a5468", stroke: "#12151c", "stroke-width": 1.5, class: "node" }, gN);
+    d.addEventListener("mouseenter", () => { if (!state.pinned) showCluster(c); });
+    d.addEventListener("click", (e) => { e.stopPropagation(); state.pinned = c; showCluster(c); });
+    c.children.forEach(dots);
+  })(state.root);
+
+  // leaves with labels
+  const gT = el("g", {});
+  for (const c of order) {
+    const nd = state.nodes[c.idx];
+    const [x, y] = polar(c.a, R_OUT);
+    el("circle", { cx: x, cy: y, r: 3.5, fill: colourOf.get(c) || "#5d667a" }, gT);
+    const deg = c.a * 180 / Math.PI - 90, flip = c.a > Math.PI;
+    const [tx, ty] = polar(c.a, R_OUT + 8);
+    const t = el("text", { x: tx, y: ty, fill: colourOf.get(c) ? "#e6e9ef" : "#7b8396", "font-size": 11, "dominant-baseline": "middle",
+                          "text-anchor": flip ? "end" : "start", transform: `rotate(${flip ? deg + 180 : deg} ${tx} ${ty})`, class: "leaf" }, gT);
+    t.textContent = nd.short;
+    t.addEventListener("mouseenter", () => { if (!state.pinned) showLeaf(nd); });
+    t.addEventListener("click", (e) => { e.stopPropagation(); state.pinned = c; showLeaf(nd); });
+  }
+  svg.onclick = () => { state.pinned = null; };
+
+  document.getElementById("legend").innerHTML =
+    `<span style="--c:#e3a64f">dashed ring = N (${relax ? "relaxed: chained overlaps" : "strict: every pair"})</span>` +
+    `<span style="--c:#6cb6ff">coloured = a cluster that holds at N</span>` +
+    `<span style="--c:#5d667a">grey = shares fewer than N with everything</span>` +
+    `<span style="--c:#4a5468">labels: C = major, hm = harmonic minor, mm = melodic minor, hM = harmonic major, dh = double harmonic</span>`;
+  document.getElementById("info").innerHTML = '<p class="hint">Hover a junction (dot) or a scale. Click to pin it; click empty space to unpin.</p>';
+  drawProgression();
+}
+
+function markClusters(c, N, fn) {             // maximal subtrees whose merge height is >= N
+  if (!c) return;
+  if (c.leaf) { fn(c); return; }
+  if (c.h >= N) { fn(c); return; }
+  c.children.forEach(k => markClusters(k, N, fn));
+}
+
+// ---------------------------------------------------------------- side panel
+function esc(s) { return s.replace(/[&<>]/g, ch => ({ "&":"&amp;","<":"&lt;",">":"&gt;" })[ch]); }
+function alsoCalled(nd) { return nd.modes.slice(1).map(m => m.name).join(" · "); }
+
+function showLeaf(nd) {
+  let h = `<h2>${esc(nd.label)}</h2><p class="hint">Same notes: ${esc(alsoCalled(nd))}</p>`;
+  h += `<p>Notes: <b>${esc(nd.scale.names.join(" "))}</b></p><h3>Chords</h3>`;
+  for (const c of nd.chords.values()) h += `<div class="chord"><span class="roman">${esc(c.roman)}</span> — ${esc(c.name)} <span class="hint">(${esc(c.notes)})</span></div>`;
+  document.getElementById("info").innerHTML = h;
+}
+
+function showCluster(c) {
+  const mem = c.members.map(i => state.nodes[i]);
+  // every chord that at least two members share, with how each member names it
+  const byKey = new Map();
+  for (const nd of mem) for (const [k, ch] of nd.chords) {
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push({ nd, ch });
+  }
+  const rows = [...byKey.entries()].filter(([, v]) => v.length >= 2).sort((a, b) => b[1].length - a[1].length);
+  let h = `<h2>${mem.length} scales · join at ${c.h} shared chord${c.h === 1 ? "" : "s"}</h2><div>`;
+  for (const nd of mem) h += `<span class="tag" title="${esc(alsoCalled(nd))}">${esc(nd.label)}</span>`;
+  h += `</div><h3>Shared chords (grouped by notes)</h3>`;
+  if (!rows.length) h += `<p class="hint">No chord is shared by two of these.</p>`;
+  for (const [, v] of rows.slice(0, 60)) {
+    const all = v.length === mem.length;
+    h += `<div class="chord"><span class="notes">${esc(v[0].ch.notes)}</span>${all ? '<span class="all">in all</span>' : `<span class="hint"> · in ${v.length} of ${mem.length}</span>`}<ul>`;
+    for (const { nd, ch } of v) h += `<li>in <b>${esc(nd.label)}</b> it is <span class="roman">${esc(ch.roman)}</span> (${esc(ch.name)}: ${esc(ch.notes)})</li>`;
+    h += `</ul></div>`;
+  }
+  if (rows.length > 60) h += `<p class="hint">…and ${rows.length - 60} more.</p>`;
+  if (mem.length === 2 || mem.length > 1) {
+    h += `<p><button id="useBridge">Use the first two scales in the transition builder</button></p>`;
+  }
+  document.getElementById("info").innerHTML = h;
+  const b = document.getElementById("useBridge");
+  if (b) b.onclick = () => { fromSel.value = mem[0].id; toSel.value = mem[1].id; drawProgression(); };
+}
+
+// ---------------------------------------------------------------- transition builder
+const fromSel = document.getElementById("fromSel"), toSel = document.getElementById("toSel");
+function fillSelects() {
+  const keepF = fromSel.value, keepT = toSel.value;
+  const opts = state.nodes.map(nd => `<option value="${nd.id}">${esc(nd.label)}</option>`).join("");
+  fromSel.innerHTML = opts; toSel.innerHTML = opts;
+  if (state.nodes.some(n => n.id === keepF)) fromSel.value = keepF;
+  if (state.nodes.some(n => n.id === keepT)) toSel.value = keepT;
+  else if (state.nodes.length > 1) {
+    // default: the scale that shares most with "from"
+    const f = state.nodes.find(n => n.id === fromSel.value); let best = null, bv = -1;
+    for (const n of state.nodes) if (n !== f) { const v = shared(f, n); if (v > bv) { bv = v; best = n; } }
+    if (best) toSel.value = best.id;
+  }
+}
+let seed = 0;
+let lastProg = [];
+function drawProgression() {
+  const out = document.getElementById("progOut");
+  const A = state.nodes.find(n => n.id === fromSel.value), B = state.nodes.find(n => n.id === toSel.value);
+  if (!A || !B || A === B) { out.innerHTML = '<p class="hint">Pick two different scales.</p>'; lastProg = []; return; }
+  const L = Math.max(3, Math.min(12, +document.getElementById("plen").value || 6));
+  const common = [...A.chords.keys()].filter(k => B.chords.has(k));
+  const onlyA = [...A.chords.keys()].filter(k => !B.chords.has(k));
+  const onlyB = [...B.chords.keys()].filter(k => !A.chords.has(k));
+  let h = `<p>${common.length} pivot chord${common.length === 1 ? "" : "s"} between <b>${esc(A.label)}</b> and <b>${esc(B.label)}</b>.</p>`;
+  if (!common.length || !onlyA.length || !onlyB.length) {
+    out.innerHTML = h + '<p class="hint">These two need at least one shared chord and one chord of their own each. Try a scale from the same cluster.</p>'; lastProg = []; return;
+  }
+  // first chord: A's tonic if it is not shared, else another A-only chord; last: B's tonic likewise
+  const tonicKey = (nd) => [...nd.chords.values()].find(c => c.deg === 0)?.key;
+  const pick = (arr, k) => arr[(k + seed) % arr.length];
+  const first = onlyA.includes(tonicKey(A)) && seed === 0 ? tonicKey(A) : pick(onlyA, 0);
+  const last = onlyB.includes(tonicKey(B)) && seed === 0 ? tonicKey(B) : pick(onlyB, 1);
+  const middle = []; for (let i = 0; i < L - 2; i++) middle.push(common[(i + seed) % common.length]);
+  for (let i = 1; i < middle.length; i++) if (middle[i] === middle[i - 1] && common.length > 1) middle[i] = common[(common.indexOf(middle[i]) + 1) % common.length];
+  const seq = [first, ...middle, last];
+  lastProg = seq.map(k => (A.chords.get(k) || B.chords.get(k)).pcs);
+  h += `<div class="prog">`;
+  seq.forEach((k, i) => {
+    const a = A.chords.get(k), b = B.chords.get(k);
+    const cls = a && b ? "both" : a ? "from" : "to";
+    const c = a || b;
+    h += `<div class="pc ${cls}"><b>${i + 1}. ${esc(c.name)}</b><small>${esc(c.notes)}</small>` +
+         (a ? `<small>in ${esc(A.short)}: <span class="roman">${esc(a.roman)}</span></small>` : "") +
+         (b ? `<small>in ${esc(B.short)}: <span class="roman">${esc(b.roman)}</span></small>` : "") + `</div>`;
+  });
+  h += `</div><div class="legend"><span style="--c:#b4824a">only ${esc(A.label)}</span><span style="--c:#5fc48a">in both (the ear cannot tell which scale)</span><span style="--c:#7a8cf0">only ${esc(B.label)}</span></div>`;
+  out.innerHTML = h;
+}
+
+// tiny piano-ish playback
+let ctx = null;
+function playProg() {
+  if (!lastProg.length) return;
+  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  const t0 = ctx.currentTime + 0.05, dur = 0.9;
+  lastProg.forEach((pcs, i) => {
+    let prev = 48;
+    pcs.forEach((pc, j) => {
+      let midi = 48 + pc; while (j > 0 && midi <= prev) midi += 12; prev = midi;
+      const f = 440 * Math.pow(2, (midi - 69) / 12);
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "triangle"; o.frequency.value = f;
+      g.gain.setValueAtTime(0, t0 + i * dur); g.gain.linearRampToValueAtTime(0.12, t0 + i * dur + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.001, t0 + (i + 1) * dur);
+      o.connect(g).connect(ctx.destination); o.start(t0 + i * dur); o.stop(t0 + (i + 1) * dur + 0.05);
+    });
+  });
+}
+
+// ---------------------------------------------------------------- wiring
+document.querySelectorAll(".controls input").forEach(x => x.addEventListener("change", render));
+document.getElementById("n").addEventListener("input", render);
+fromSel.onchange = () => { seed = 0; drawProgression(); };
+toSel.onchange = () => { seed = 0; drawProgression(); };
+document.getElementById("plen").addEventListener("input", drawProgression);
+document.getElementById("shuffle").onclick = () => { seed++; drawProgression(); };
+document.getElementById("play").onclick = playProg;
+render();
+</script>
+</body>
+</html>
