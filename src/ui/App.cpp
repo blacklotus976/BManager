@@ -3930,39 +3930,43 @@ static void DrawPaymentsScreen() {
         if (ImGui::Button(g_paymentsTableView ? "Κάρτες" : "Λίστα", ImVec2(toggleW, 0)))
             g_paymentsTableView = !g_paymentsTableView;
     }
-    ImGui::Separator();
-    ImGui::TextDisabled("Φίλτρα:");
-    ImGui::TextDisabled("Από:"); ImGui::SameLine();
-    DatePicker("payfilt_start", g_payStartDate, ImVec2(0, 1));
-    ImGui::SameLine();
-    ImGui::TextDisabled("Έως:"); ImGui::SameLine();
-    DatePicker("payfilt_end", g_payEndDate, ImVec2(0, 1));
-    ImGui::SameLine();
-
-    // Label on the LEFT, value/selector on the RIGHT -- "Χρήστης:  [Όλοι ▾]"
-    // rather than ImGui's default "[Όλοι ▾] Χρήστης". Each combo uses a hidden
-    // ##id so it doesn't re-render a visible label next to the widget.
-    {   // search pickers (paged, accent-insensitive) instead of dropdowns of every client / service
-        int u = g_payUserFilter, sv = g_payServiceFilter;
-        DrawUserFilterPicker("Πελάτης:", g_payUserFilter, 200.0f);
-        ImGui::SameLine();
-        DrawServiceFilterPicker("Υπηρεσία:", g_payServiceFilter, 200.0f);
-        if (u != g_payUserFilter || sv != g_payServiceFilter) g_paymentsPager.Reset();
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Κατάσταση:"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(120);
-    ImGui::Combo("##filt_status", &g_payStatusFilter, kStatusNames, 3);
-    ImGui::SameLine();
-    ImGui::TextDisabled("Τύπος:"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(150);
-    ImGui::Combo("##filt_direction", &g_payDirectionFilter, kDirectionFilterNames, 3);
-    ImGui::SameLine();
-    // money came in for these lines but no (valid) receipt covers it -- the to-do list for issuing receipts
+    // ---- filters: one framed box; each filter is a block that moves to the next line when it doesn't fit ----
     static bool missingReceiptOnly = false;
-    ImGui::Checkbox("Μόνο χωρίς απόδειξη", &missingReceiptOnly);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Εισπράξεις για τις οποίες δεν έχει εκδοθεί απόδειξη (ή η απόδειξή τους ακυρώθηκε).");
-    ImGui::Separator();
+    ImGui::BeginChild("payfilters", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    {
+        const float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+        bool first = true;
+        auto flow = [&](float width) {                      // SameLine only if the next block still fits
+            if (!first) {
+                float x = ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x * 3.0f;
+                if (x + width <= right) ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 3.0f);
+            }
+            first = false;
+        };
+        auto label = [](const char* l) { ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", l); ImGui::SameLine(); };
+        flow(260); ImGui::BeginGroup(); label("Από:");  DatePicker("payfilt_start", g_payStartDate, ImVec2(0, 1)); ImGui::EndGroup();
+        flow(260); ImGui::BeginGroup(); label("Έως:");  DatePicker("payfilt_end", g_payEndDate, ImVec2(0, 1));   ImGui::EndGroup();
+        int u = g_payUserFilter, sv = g_payServiceFilter;
+        flow(290); ImGui::BeginGroup(); DrawUserFilterPicker("Πελάτης:", g_payUserFilter, 210.0f); ImGui::EndGroup();
+        flow(300); ImGui::BeginGroup(); DrawServiceFilterPicker("Υπηρεσία:", g_payServiceFilter, 210.0f); ImGui::EndGroup();
+        if (u != g_payUserFilter || sv != g_payServiceFilter) g_paymentsPager.Reset();
+        flow(230); ImGui::BeginGroup(); label("Κατάσταση:"); ImGui::SetNextItemWidth(130);
+        ImGui::Combo("##filt_status", &g_payStatusFilter, kStatusNames, 3); ImGui::EndGroup();
+        flow(230); ImGui::BeginGroup(); label("Τύπος:"); ImGui::SetNextItemWidth(160);
+        ImGui::Combo("##filt_direction", &g_payDirectionFilter, kDirectionFilterNames, 3); ImGui::EndGroup();
+        flow(200); ImGui::Checkbox("Μόνο χωρίς απόδειξη", &missingReceiptOnly);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Εισπράξεις για τις οποίες δεν έχει εκδοθεί απόδειξη (ή η απόδειξή τους ακυρώθηκε).");
+        bool any = !g_payStartDate.empty() || !g_payEndDate.empty() || g_payUserFilter > 0 || g_payServiceFilter > 0 ||
+                   g_payStatusFilter != 0 || g_payDirectionFilter != 0 || missingReceiptOnly;
+        flow(170);
+        ImGui::BeginDisabled(!any);
+        if (ImGui::Button("Καθαρισμός φίλτρων")) {
+            g_payStartDate.clear(); g_payEndDate.clear(); g_payUserFilter = -1; g_payServiceFilter = -1;
+            g_payStatusFilter = 0; g_payDirectionFilter = 0; missingReceiptOnly = false;
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::EndChild();
 
     // --- Detect filter changes -> reset pager ---
     static std::string lastStart, lastEnd;
