@@ -2943,11 +2943,11 @@ static const ListColDef kJointCols[JC_COUNT] = {
     { "Περιγραφή",           ImGuiTableColumnFlags_WidthFixed, 280.0f, true },
     { "Κατανομή",            ImGuiTableColumnFlags_WidthFixed, 150.0f, true },
     { "Σύνολο",              ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
-    { "Εισπράχθηκαν",        ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
-    { "Υπόλοιπο",            ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
+    { "Εισπράχθηκαν",        ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 110.0f, true },
+    { "Υπόλοιπο",            ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 100.0f, true },
     { "Ποσοστό Ολοκλήρωσης", ImGuiTableColumnFlags_WidthFixed, 170.0f, true },
-    { "Χρεώθηκαν",           ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
-    { "Εξαιρέθηκαν",         ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
+    { "Χρεώθηκαν",           ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 100.0f, true },
+    { "Εξαιρέθηκαν",         ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 110.0f, true },
     { "",                    ImGuiTableColumnFlags_WidthFixed,  80.0f, false },
 };
 static double JointPct(const JointOp& o) { return o.total > 0.005 ? std::min(100.0, o.paid / o.total * 100.0) : 100.0; }
@@ -2974,8 +2974,9 @@ static void DrawJointOpsTable(int buildingId, const char* id) {
         return p;
     });
     ImGui::SameLine();
-    ImGui::Text("%d χρεώσεις · σύνολο %s · εισπράχθηκαν %s · υπόλοιπο %s · ολοκλήρωση %.1f%%", pg.count, Eur(pg.total).c_str(),
-                Eur(pg.paid).c_str(), Eur(MoneySub(pg.total, pg.paid)).c_str(), pg.total > 0.005 ? pg.paid / pg.total * 100.0 : 100.0);
+    ImGui::TextDisabled("%d χρεώσεις · μένουν να εισπραχθούν %s", pg.count, Eur(MoneySub(pg.total, pg.paid)).c_str());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Σύνολο %s · εισπράχθηκαν %s · ολοκλήρωση %.1f%%\nΔεξί κλικ στις επικεφαλίδες: εμφάνιση περισσότερων στηλών.",
+        Eur(pg.total).c_str(), Eur(pg.paid).c_str(), pg.total > 0.005 ? pg.paid / pg.total * 100.0 : 100.0);
     g.pager.total = pg.count;
     if (pg.count == 0) { ImGui::TextDisabled(S.q[0] ? "Καμία χρέωση με αυτή την αναζήτηση." : "Δεν έχουν γίνει κοινόχρηστες χρεώσεις ακόμα."); return; }
     const bool all = buildingId <= 0;
@@ -3187,9 +3188,9 @@ static void DrawMasterServicesScreen() {
             { "Πελάτης",        ImGuiTableColumnFlags_WidthFixed, 210.0f, true },
             { "Υπηρεσίες",      ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
             { "Κάλυψη πακέτου", ImGuiTableColumnFlags_WidthFixed, 150.0f, false },
-            { "Ποιες",          ImGuiTableColumnFlags_WidthFixed, 380.0f, false },
-            { "Χρεώθηκαν",      ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
-            { "Πληρώθηκαν",     ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
+            { "Ποιες",          ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 380.0f, false },
+            { "Χρεώθηκαν",      ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 110.0f, true },
+            { "Πληρώθηκαν",     ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 110.0f, true },
             { "Υπόλοιπο",       ImGuiTableColumnFlags_WidthFixed, 100.0f, true } };
         static GridState bg; static int show = 0; static char bq[96] = ""; static int lastPkg = -1;
         if (bg.order.empty()) { for (int i = 0; i < BC_COUNT; i++) bg.order.push_back(i); bg.sort.keys = { { BC_COVER, false } }; }
@@ -3212,7 +3213,7 @@ static void DrawMasterServicesScreen() {
         ImGui::SameLine(); ImGui::TextDisabled("%d πελάτες", bp.count);
         float bh = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
         if (ImGui::BeginTable("pkgbuyersgrid", BC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                              ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, std::max(160.0f, bh)))) {
+                              ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable, ImVec2(0, std::max(160.0f, bh)))) {
             ImGui::TableSetupScrollFreeze(1, 1);
             ListSetupColumns(bg.order, kBuyerCols);
             ListHeaderRow(bg.order, kBuyerCols, bg.sort, bg.pager);
@@ -7516,9 +7517,9 @@ static void DrawApartmentsScreen() {
         const bool open = !q.empty() ? true : g_aptOpenB.count(b.id) > 0;
         ImGui::PushID(b.id);
         char head[480];
-        std::snprintf(head, sizeof(head), "%s  %s\n      %s · Τ.Κ. %s · ΑΦΜ %s\n      %d διαμερίσματα · %d κινήσεις · %.0f €",
+        std::snprintf(head, sizeof(head), "%s  %s\n      %s · Τ.Κ. %s · ΑΦΜ %s\n      %d διαμερίσματα",
                       open ? "▼" : "►", b.address.c_str(), b.area.c_str(), b.postal_code.c_str(), b.afm.empty() ? "—" : b.afm.c_str(),
-                      (int)be.apts.size(), be.moves, be.total);
+                      (int)be.apts.size());
         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.16f, 0.24f, 0.33f, 0.80f));
         if (ImGui::Selectable(head, true, 0, ImVec2(0, 58))) { if (g_aptOpenB.count(b.id)) g_aptOpenB.erase(b.id); else g_aptOpenB.insert(b.id); }
         ImGui::PopStyleColor();
@@ -7527,8 +7528,8 @@ static void DrawApartmentsScreen() {
             for (auto* e : aptShow) {
                 ImGui::PushID(e->a.id);
                 char line[360];
-                std::snprintf(line, sizeof(line), "%s\n   %s  ·  %d κινήσεις  ·  %.0f €", e->a.label.c_str(),
-                              e->current.empty() ? "κενό" : e->current.c_str(), e->moves, e->in + e->out);
+                std::snprintf(line, sizeof(line), "%s\n   %s", e->a.label.c_str(),
+                              e->current.empty() ? "κανένας κάτοικος αυτή τη στιγμή" : e->current.c_str());
                 if (ImGui::Selectable(line, e->a.id == g_aptSelId, 0, ImVec2(0, 42))) g_aptSelId = e->a.id;
                 ImGui::PopID();
             }
@@ -7571,7 +7572,7 @@ static void DrawApartmentsScreen() {
 
         if (ImGui::CollapsingHeader("Κοινόχρηστα διαμερίσματος (μερίδια, κάθε ένοικος με το δικό του)"))
             DrawJointSharesList(-1, sel->a.id, "aptjoint");
-        if (ImGui::CollapsingHeader("Σύνολα και πορεία", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Σύνολα και πορεία")) {
             const char* pn[] = { "Λεπτό", "Ημέρα", "Εβδομάδα", "Μήνας", "Έτος" };
             ImGui::TextDisabled("Ανάλυση ανά");
             ImGui::SameLine();
