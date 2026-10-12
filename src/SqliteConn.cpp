@@ -2708,6 +2708,8 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
             case 6: part = "amount_due" + d; break;
             case 7: part = "amount_paid" + d; break;
             case 8: part = "notes" + d; break;
+            case 9: part = "(SELECT MAX(r.number) FROM allocations a JOIN payments m ON m.id = a.payment_id "
+                           "JOIN receipts r ON r.id = m.receipt_id WHERE a.charge_id = p.id AND r.status = 'issued')" + d; break;
             default: break;
         }
         if (!part.empty()) order += std::string(order.empty() ? "" : ", ") + part;

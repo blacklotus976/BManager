@@ -151,6 +151,8 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
         {"ΠΕΤΡΟΥ ΔΗΜΗΤΡΑ",            "6922334455", "Π-377",  3, "Β2"},
         // Moved out (no apartment now): lived at ΠΑΤΗΣΙΩΝ 205 Β2 until June; ΜΑΚΡΗΣ moved in there in July.
         {"ΣΑΡΡΗΣ ΑΝΤΩΝΙΟΣ",           "6987001122", "Π-099", -1, ""},
+        // Third tenant of ΤΣΙΜΙΣΚΗ 81 4ος (after ΒΛΑΧΟΥ Jan-Feb and ΚΩΝΣΤΑΝΤΙΝΙΔΟΥ Mar-May; empty in June).
+        {"ΚΟΥΤΣΟΥΚΟΣ ΣΤΑΥΡΟΣ",        "6945001234", "Π-450",  2, "4ος"},
     };
 
     for (auto& su : seedUsers) {
@@ -197,6 +199,7 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
             if (name == "ΜΙΧΑΗΛΙΔΟΥ ΑΝΝΑ")         { h.push_back(stay(uid[i], aptOf(1, "Β2"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
             // ΚΗΦΙΣΙΑΣ Β1 until June (then ΜΙΧΑΗΛΙΔΟΥ moved in there), ΠΑΤΗΣΙΩΝ Β2 from July (after ΣΑΡΡΗΣ left)
             if (name == "ΜΑΚΡΗΣ ΕΛΕΥΘΕΡΙΟΣ")        { h.push_back(stay(uid[i], aptOf(1, "Β1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
+            if (name == "ΚΟΥΤΣΟΥΚΟΣ ΣΤΑΥΡΟΣ")       { from = "2026-07-01"; }   // moved into 4ος in July
             if (name == "ΔΗΜΗΤΡΙΟΥ ΕΥΑΓΓΕΛΙΑ")     { h.push_back(stay(uid[i], aptOf(3, "Γ1"),  "2026-01-01", "2026-06-30")); from = "2026-07-01"; }
             h.push_back(stay(uid[i], nowApt, from, ""));
             db->setResidencyHistory(uid[i], h);
@@ -429,13 +432,19 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
 
         // (apartment, resident) pairs of a building on a date; apartments with nobody then get an excluded row
         struct Row { int apt; int user; std::string label; };
+        // strictly who had a recorded stay covering the date (no "before the first stay" fallback here)
+        std::map<int, std::vector<Residency>> stays;
+        for (int u : uid) stays[u] = db->getUserResidencies(u);
+        auto livedOn = [&](int user, int apt, const std::string& date) {
+            for (auto& r : stays[user]) if (r.apartment_id == apt && r.from_date <= date && (r.to_date.empty() || date <= r.to_date)) return true;
+            return false;
+        };
         auto residentsOn = [&](int b, const std::string& date) {
-            int y = std::atoi(date.substr(0, 4).c_str()), m = std::atoi(date.substr(5, 2).c_str()), d = std::atoi(date.substr(8, 2).c_str());
             std::vector<Row> rows;
             for (auto& [label, apt] : apartmentId[b]) {
                 bool any = false;
                 for (size_t i = 0; i < uid.size(); i++)
-                    if (db->getApartmentOnDate(uid[i], y, m, d) == apt) { rows.push_back({apt, uid[i], label}); any = true; }
+                    if (livedOn(uid[i], apt, date)) { rows.push_back({apt, uid[i], label}); any = true; }
                 if (!any) rows.push_back({apt, -1, label});
             }
             return rows;
@@ -617,6 +626,56 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
             p.notes = "Βλάβη καυστήρα διαμερίσματος – βίντεο και φωτογραφία στα συνημμένα";
             int cid = db->addPaymentsWithReceipt({p}, "", nullptr);
             if (cid > 0) chargeIdOf["boiler"] = cid;
+        }
+    }
+
+
+    // ---- ΤΣΙΜΙΣΚΗ 81 4ος: its third tenant's own charges, and installment plans ----------------------------------
+    {
+        auto U = [&](const char* name) { for (size_t i = 0; i < seedUsers.size(); i++) if (name == std::string(seedUsers[i].name)) return uid[i]; return -1; };
+        auto svc = [&](const char* label) { auto it = idByLabel.find(label); return it == idByLabel.end() ? -1 : it->second; };
+        int kou = U("ΚΟΥΤΣΟΥΚΟΣ ΣΤΑΥΡΟΣ");
+        auto line = [&](int user, int service, const char* date, double due, double paid, const char* note) {
+            Payment p; p.user_id = user; p.service_id = service; std::sscanf(date, "%d-%d-%d", &p.year, &p.month, &p.day);
+            p.amount_due = due; p.amount_paid = paid; p.status = "paid"; p.direction = "in"; p.notes = note;
+            return p;
+        };
+        if (kou > 0) {
+            Receipt r; r.user_id = kou; r.issue_date = "2026-07-05"; r.method = "cash"; r.paper_ref = "1601";
+            db->addPaymentsWithReceipt({line(kou, svc("ΔΙΑΧΕΙΡΙΣΗ – ΜΗΝΙΑΙΑ ΑΜΟΙΒΗ"), "2026-07-05", 40.00, 40.00, "Ιούλιος")}, "", &r);
+            db->addPaymentsWithReceipt({line(kou, svc("ΑΠΕΝΤΟΜΩΣΗ"), "2026-08-10", 30.00, 10.00, "Προκαταβολή 10 €, τα υπόλοιπα με τα κοινόχρηστα")}, "", nullptr);
+            db->addPaymentsWithReceipt({line(kou, svc("ΔΙΑΧΕΙΡΙΣΗ – ΜΗΝΙΑΙΑ ΑΜΟΙΒΗ"), "2026-09-05", 40.00, 0.00, "Σεπτέμβριος – ανεξόφλητο")}, "", nullptr);
+        }
+        // installment plan still running: boiler service in 3 monthly installments, 1st paid, one receipt at the end
+        auto plan = [&](int user, int service, double total, int n, const char* start, bool firstPaid, const char* label) {
+            std::vector<Payment> lines;
+            long long t = ToCents(total), each = t / n;
+            int y = 0, m = 0, d = 0; std::sscanf(start, "%d-%d-%d", &y, &m, &d);
+            for (int k = 0; k < n; k++) {
+                int mm = m - 1 + k, yy = y + mm / 12; mm = mm % 12 + 1;
+                char date[16]; std::snprintf(date, sizeof(date), "%04d-%02d-%02d", yy, mm, d);
+                Payment p = line(user, service, date, FromCents(k == 0 ? t - each * (n - 1) : each), 0.0, "");
+                bool paid = firstPaid && k == 0;
+                p.amount_paid = paid ? p.amount_due : 0.0; p.status = paid ? "paid" : "future"; p.resolution_date = paid ? "" : date;
+                p.notes = "Δόση " + std::to_string(k + 1) + "/" + std::to_string(n) + " · " + label;
+                lines.push_back(p);
+            }
+            Receipt r; r.user_id = user; r.method = "cash";
+            db->addInstallmentPlan(lines, label, n, "month", "end", firstPaid ? &r : nullptr);
+            return lines;
+        };
+        if (kou > 0) plan(kou, svc("ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΠΕΤΡΕΛΑΙΟΥ"), 50.00, 3, "2026-09-01", true, "ΚΑΥΣΤΗΡΑΣ – ΣΥΝΤΗΡΗΣΗ ΠΕΤΡΕΛΑΙΟΥ");
+        // a finished plan: all 3 installments paid -> the app issued ONE receipt for the whole 120.00 €
+        int pap = U("ΠΑΠΑΔΟΠΟΥΛΟΣ ΓΕΩΡΓΙΟΣ");
+        if (pap > 0) {
+            plan(pap, svc("ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ ΛΟΓΑΡΙΑΣΜΩΝ"), 120.00, 3, "2026-05-15", true, "ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ ΛΟΓΑΡΙΑΣΜΩΝ");
+            for (auto& c : db->getOpenCharges(pap)) {
+                if (c.notes.find("Δόση 2/3 · ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ") == std::string::npos &&
+                    c.notes.find("Δόση 3/3 · ΔΙΑΧΕΙΡΙΣΗ – ΠΛΗΡΩΜΗ") == std::string::npos) continue;
+                MoneyPayment m; m.user_id = pap; m.amount = c.amount_due; m.method = "ebanking";
+                char d[16]; std::snprintf(d, sizeof(d), "%04d-%02d-%02d", c.year, c.month, c.day); m.pay_date = d;
+                db->recordPayment(m, {{-1, c.id, c.amount_due}}, nullptr);
+            }
         }
     }
 
