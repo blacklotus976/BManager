@@ -355,7 +355,7 @@ public:
     // sortCol: 0 name, 1 services count, 2 total price
     virtual std::vector<PackageRow> pagePackages(const std::string& text, int sortCol, bool asc, int offset, int limit) = 0;
     virtual int countPackages(const std::string& text) = 0;
-    virtual std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit) = 0;
+    virtual std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit, int sortCol = 0, bool asc = true) = 0;   // sort: 0 label, 1 kind, 2 notes
     virtual int countJointCatalog(const std::string& text) = 0;
     // Joint charges, newest first by default. sortCol: 0 date, 1 building, 2 label, 3 kind, 4 total, 5 paid, 6 remaining,
     // 7 completion %, 8 charged, 9 excluded. text: label / building address. totals (optional): sum of total / paid.

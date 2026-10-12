@@ -4541,11 +4541,13 @@ int SqliteConn::countPackages(const std::string& text) {
 }
 
 static const char* kJcWhere = " WHERE (?1 = '' OR instr(fold(s.label || ' ' || COALESCE(s.extra_notes,'')), fold(?1)) > 0) ";
-std::vector<JointService> SqliteConn::pageJointCatalog(const std::string& text, int offset, int limit) {
+std::vector<JointService> SqliteConn::pageJointCatalog(const std::string& text, int offset, int limit, int sortCol, bool asc) {
+    const char* col = sortCol == 1 ? "j.kind" : sortCol == 2 ? "fold(s.extra_notes)" : "fold(s.label)";
+    const std::string dir = asc ? " ASC" : " DESC";
     std::vector<JointService> out; sqlite3_stmt* st = nullptr;
     sqlite3_prepare_v2(db, (std::string("SELECT j.id, s.id, s.label, s.extra_notes, s.created_at, j.kind, j.active, s.suggested_price "
                             "FROM joint_services j JOIN services s ON s.id = j.service_id") + kJcWhere +
-                            "ORDER BY fold(s.label), j.id LIMIT ?2 OFFSET ?3").c_str(), -1, &st, nullptr);
+                            "ORDER BY " + col + dir + ", j.id LIMIT ?2 OFFSET ?3").c_str(), -1, &st, nullptr);
     BindText(st, 1, text); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
     while (sqlite3_step(st) == SQLITE_ROW) {
         JointService j; j.id = sqlite3_column_int(st, 0); j.service.id = sqlite3_column_int(st, 1); j.service.label = ColText(st, 2);

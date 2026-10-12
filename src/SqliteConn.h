@@ -79,7 +79,7 @@ public:
     int countBuildings(const std::string& text) override;
     std::vector<PackageRow> pagePackages(const std::string& text, int sortCol, bool asc, int offset, int limit) override;
     int countPackages(const std::string& text) override;
-    std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit) override;
+    std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit, int sortCol = 0, bool asc = true) override;
     int countJointCatalog(const std::string& text) override;
     std::vector<JointOp> pageJointOps(int buildingId, const std::string& text, int sortCol, bool asc, int offset, int limit) override;
     int countJointOps(int buildingId, const std::string& text, double* total = nullptr, double* paid = nullptr) override;
