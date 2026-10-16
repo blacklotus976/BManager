@@ -23,4 +23,5 @@ struct Receipt {
     std::string void_reason;
     std::string voided_at;
     std::string created_at;
+    std::string kind = "personal"; // read-only: "joint" when it pays parts of joint charges, else "personal" (the client's own services)
 };

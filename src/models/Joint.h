@@ -53,10 +53,14 @@ struct JointShare {
     // read-only, filled by getJointSharesFor: the charge this share belongs to
     std::string op_label, op_date, building_address;
     double op_total = 0.0;
+    double op_cost_owed = 0.0;     // what we still owe on the cost of the whole operation (our side of it)
 };
 
 // A line of what is being split (a package splits each component; a service or joint service is one line).
 struct JointLine {
     int service_id = -1;
     double total = 0.0;
+    int partner = -2;             // who we pay this line's cost to (-2 = the charge's partner, -1 = #-1)
+    double costPaid = -1.0;       // how much of this line's cost is already paid (-1 = decided by the charge)
+    double cost = -1.0;           // what THIS service costs us (>= 0 for every line = the costs are per service, not spread)
 };

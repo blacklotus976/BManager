@@ -82,14 +82,52 @@ static std::string ReadConfiguredDbPath() {
 // Stores whatever is passed as-is if it's already absolute (an explicit choice
 // to point somewhere fixed); otherwise strips this exe's own folder prefix so
 // what lands in config.ini stays relative and portable across machines.
-void WriteConfiguredDbPath(const std::string& path) {
-    std::string toStore = path;
+// A config.ini value as stored (relative paths stay relative).
+static std::string ReadConfigValue(const std::string& key) {
+    std::ifstream f(ConfigPath());
+    std::string line; const std::string prefix = key + "=";
+    while (std::getline(f, line))
+        if (line.compare(0, prefix.size(), prefix) == 0) {
+            std::string v = line.substr(prefix.size());
+            while (!v.empty() && (v.back() == '\r' || v.back() == '\n' || v.back() == ' ')) v.pop_back();
+            return v;
+        }
+    return "";
+}
+static std::string RelativeToExe(const std::string& path) {
     std::string here = DirNextToExe();
-    if (!here.empty() && path.compare(0, here.size(), here) == 0) {
-        toStore = path.substr(here.size());
-    }
+    return (!here.empty() && path.compare(0, here.size(), here) == 0) ? path.substr(here.size()) : path;
+}
+static void WriteConfig(const std::string& dbPath, const std::string& mainDb) {
     std::ofstream f(ConfigPath(), std::ios::trunc);
-    if (f.is_open()) f << "db_path=" << toStore << "\n";
+    if (!f.is_open()) return;
+    f << "db_path=" << dbPath << "\n";
+    if (!mainDb.empty()) f << "main_db=" << mainDb << "\n";      // the full database to come back to from empty.db
+}
+static bool IsEmptyDb(const std::string& path) {
+    return path.size() >= 8 && path.compare(path.size() - 8, 8, "empty.db") == 0;
+}
+
+void WriteConfiguredDbPath(const std::string& path) {
+    WriteConfig(RelativeToExe(path), ReadConfigValue("main_db"));
+}
+
+bool SwitchDatabaseAndRelaunch(const std::string& currentDbPath) {
+    std::string target, mainDb = ReadConfigValue("main_db");
+    if (IsEmptyDb(currentDbPath)) target = mainDb.empty() ? "data.db" : mainDb;
+    else { mainDb = RelativeToExe(currentDbPath); target = "empty.db"; }
+    WriteConfig(target, mainDb);
+#ifdef _WIN32
+    char exe[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (n == 0 || n == MAX_PATH) return false;
+    STARTUPINFOA si{}; si.cb = sizeof(si); PROCESS_INFORMATION pi{};
+    std::string cmd = std::string("\"") + exe + "\"", dir = DirNextToExe();
+    if (!CreateProcessA(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.empty() ? nullptr : dir.c_str(), &si, &pi)) return false;
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return true;
+#else
+    return false;
+#endif
 }
 
 #ifdef _WIN32
@@ -109,11 +147,14 @@ int main() {
     }
     // Demo data only for a database file that did not exist yet; an existing
     // (even empty) file is the user's own and must stay as it is.
+    // empty.db (the second database: same schema, nothing in it) is shipped next to the data and created here when missing.
+    { std::string e = DirNextToExe() + "empty.db"; std::ifstream pr(e, std::ios::binary);
+      if (!pr.good()) { try { SqliteConn blank(e); } catch (...) {} } }
     bool dbExisted = false;
     { std::ifstream probe(dbPath, std::ios::binary); dbExisted = probe.good(); }
     try {
         auto conn = std::make_unique<SqliteConn>(dbPath);
-        if (!dbExisted) seedDemoDataIfEmpty(conn.get(), DirNextToExe() + "demo_media");
+        if (!dbExisted && !IsEmptyDb(dbPath)) seedDemoDataIfEmpty(conn.get(), DirNextToExe() + "demo_media");
         conn->autoBackup();   // one copy per day in <db folder>/backups, newest 14 kept
         return RunApp(conn.get(), dbPath);
     } catch (const std::exception& e) {

@@ -61,7 +61,8 @@ int main() {
         // history can't be erased by deleting things
         CHECK(!db.removeApartment(a1)); CHECK(!db.takeLastError().empty());
         CHECK(!db.removeBuilding(bid)); db.takeLastError();
-        CHECK(!db.removeUser(u1));      db.takeLastError();
+        { User tmp; tmp.full_name = "ΠΡΟΣΩΡΙΝΟΣ"; db.addUser(tmp); int tid = 0; for (auto& x : db.searchUsers("ΠΡΟΣΩΡ", 0, 5)) tid = x.id;
+          CHECK(tid > 0 && db.removeUser(tid) && !db.userDeletedAt(tid).empty() && db.getUserById(tid).full_name == "ΠΡΟΣΩΡΙΝΟΣ"); }   // deleting keeps the record, ends the stay
         CHECK(db.getPaymentById(pOld).apartment_id == a1);
         CHECK(db.getResidencies(a1).size() == 2);            // rollback kept the residencies too
         int a3 = db.addApartment(bid, "Γ3");

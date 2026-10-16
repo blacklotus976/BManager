@@ -98,10 +98,34 @@ static void SeedAddPayment(DataConn* db, Payment p) {
     else std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:00", p.year, p.month, p.day, 8 + (s * 7) % 10, (s * 13) % 60);
     p.created_at = buf;
     db->addPayment(p);
+    // what the service cost us, paid out the same day (demo: every service has a cost)
+    double cost = db->getServiceCost(p.service_id);
+    if (p.direction != "out" && p.status != "future" && cost > 0.005) {
+        Payment c = p; c.direction = "out"; c.amount_due = cost; c.amount_paid = cost; c.balance = 0.0; c.status = "paid";
+        c.notes = "Κόστος"; c.offer_id = -1; c.list_price = 0.0; c.resolution_date.clear();
+        c.partner_id = 1 + p.service_id % 3;     // demo: the cost was paid to one of the (first three) partners
+        db->addPayment(c);
+    }
 }
 
 void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
     if (db->getRowCount("users") > 0) return; // already has data
+
+    // ---- Συνεργάτες: the people who do jobs for us ----
+    {
+        struct P { const char* name; const char* trade; const char* phone; const char* email; const char* notes; bool active; };
+        const P partners[] = {
+            { "Νίκος Παπαγεωργίου", "Υδραυλικός", "6944 123 456", "", "Διαθέσιμος και Σαββατοκύριακο", true },
+            { "Ηλεκτρολογικά Μιχαηλίδης", "Ηλεκτρολόγος", "210 555 0188", "info@michailidis-el.example", "", true },
+            { "Μαρία Σταθοπούλου", "Καθαρίστρια κλιμακοστασίων", "6977 654 321", "", "Πατησίων & Κηφισιάς", true },
+            { "Καυστήρες ΑΕ", "Τεχνικός θέρμανσης", "210 555 0142", "service@kaustires.example", "Ετήσια συντήρηση καυστήρων", false },
+        };
+        for (auto& x : partners) {
+            Partner pr; pr.name = x.name; pr.trade = x.trade; pr.phone = x.phone; pr.email = x.email; pr.notes = x.notes; pr.active = x.active;
+            db->savePartner(pr);
+        }
+    }
+
 
     // ---- Buildings and their apartments -------------------------------------------
     struct SeedBuilding { const char* address; const char* area; const char* postal; const char* afm;
@@ -225,6 +249,7 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
             int owner = (n * 5 + 2) % 16;   // spread over all 16 clients (5 is coprime with 16)
             n++;
             Service s; s.label = c.label; s.extra_notes = c.notes; s.suggested_price = c.amount;
+            s.cost_price = std::round(c.amount * (0.45 + 0.05 * (n % 5)) * 100.0) / 100.0;   // demo: 45-65% of the price
             int sid = db->addServiceGetId(-1, s);   // independent catalog service; clients are tied through payments
             if (sid >= 0) { simple.push_back({owner, sid, c.label, c.amount}); idByLabel[c.label] = sid; }
         }
@@ -398,6 +423,11 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
                 char ts[32]; std::snprintf(ts, sizeof(ts), "%04d-%02d-%02d 11:%02d:00", ym.y, ym.m, day, 10 + bseq);
                 p.created_at = ts;
                 lines.push_back(p); payTotal++;
+                double cost = db->getServiceCost(it->second);
+                if (cost > 0.005) {
+                    Payment c = p; c.direction = "out"; c.amount_due = cost; c.amount_paid = cost; c.status = "paid"; c.notes = "Κόστος"; c.created_at.clear(); c.partner_id = 1 + it->second % 3;
+                    lines.push_back(c);
+                }
             }
             char d[16]; std::snprintf(d, sizeof(d), "%04d-%02d-%02d", ym.y, ym.m, day);
             Receipt r; r.user_id = uid[bb.client]; r.issue_date = d; r.method = bb.method; r.paper_ref = bb.paper;
@@ -423,11 +453,11 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
             for (auto& j : db->getJointCatalog(true)) if (j.id == jid) svcId = j.service.id;
             return std::make_pair(jid, svcId);
         };
-        auto oil   = cat("ΘΕΡΜΑΝΣΗ – ΠΕΤΡΕΛΑΙΟ ΚΟΙΝΟΧΡΗΣΤΟ", "Προμήθεια πετρελαίου για την κεντρική θέρμανση, κατανομή με χιλιοστά θέρμανσης.", "heating_oil");
-        auto clean = cat("ΚΑΘΑΡΙΟΤΗΤΑ ΚΛΙΜΑΚΟΣ", "Μηνιαίος καθαρισμός κλιμακοστασίου, ισόποσα σε όλα τα διαμερίσματα.", "equal");
+        auto oil   = cat("ΘΕΡΜΑΝΣΗ – ΠΕΤΡΕΛΑΙΟ ΚΟΙΝΟΧΡΗΣΤΟ", "Προμήθεια πετρελαίου για την κεντρική θέρμανση.", "heating_oil");
+        auto clean = cat("ΚΑΘΑΡΙΟΤΗΤΑ ΚΛΙΜΑΚΟΣ", "Μηνιαίος καθαρισμός κλιμακοστασίου.", "equal");
         auto power = cat("ΡΕΥΜΑ ΚΟΙΝΟΧΡΗΣΤΩΝ ΧΩΡΩΝ", "Λογαριασμός ΔΕΗ για φωτισμό κλιμακοστασίου και ανελκυστήρα.", "equal");
-        auto lift  = cat("ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ", "Μηνιαία συντήρηση ανελκυστήρα, κατανομή με χιλιοστά.", "millesimal");
-        auto insur = cat("ΑΣΦΑΛΕΙΑ ΚΤΙΡΙΟΥ", "Ετήσιο ασφαλιστήριο κτιρίου (πυρός & αστικής ευθύνης), με χιλιοστά.", "millesimal");
+        auto lift  = cat("ΣΥΝΤΗΡΗΣΗ ΑΝΕΛΚΥΣΤΗΡΑ", "Μηνιαία συντήρηση ανελκυστήρα.", "millesimal");
+        auto insur = cat("ΑΣΦΑΛΕΙΑ ΚΤΙΡΙΟΥ", "Ετήσιο ασφαλιστήριο κτιρίου (πυρός & αστικής ευθύνης).", "millesimal");
         (void)power;
 
         // (apartment, resident) pairs of a building on a date; apartments with nobody then get an excluded row
@@ -486,7 +516,10 @@ void seedDemoDataIfEmpty(DataConn* db, const std::string& mediaDir) {
             JointOp op; op.building_id = buildingIds[o.b]; op.source_type = o.source; op.source_id = o.sourceId; op.kind = o.kind;
             op.label = o.label; op.total = o.total; op.op_date = o.date;
             op.params_json = "{" + o.params + (o.weights.empty() ? "" : std::string(o.params.empty() ? "" : ",") + "\"weights\":{" + wjson + "}") + "}";
-            return db->chargeJoint(op, lines, shares);
+            // demo: it cost us 80% of what we charged; the partner depends on the job (insurance has none: that is the #-1 line)
+            auto has = [&](const char* s) { return std::string(o.label).find(s) != std::string::npos; };
+            int partner = has("ΠΕΤΡΕΛΑΙΟ") ? 4 : has("ΚΑΘΑΡΙΟΤΗΤΑ") ? 3 : has("ΑΠΟΦΡΑΞΗ") ? 1 : has("ΑΝΕΛΚΥΣΤΗΡΑ") || has("ΠΥΡΟΣΒΕΣΤΗΡΕΣ") ? 2 : -1;
+            return db->chargeJoint(op, lines, shares, std::round(o.total * 0.8 * 100.0) / 100.0, partner);
         };
         auto one = [](int svc, double total) { return std::vector<JointLine>{{svc, total}}; };
 

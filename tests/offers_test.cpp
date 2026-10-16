@@ -39,7 +39,9 @@ int main() {
         // claimed on a charge: saved discounted, with list price and discount next to it
         Payment p; p.user_id = 1; p.service_id = svc; p.year = 2026; p.month = 10; p.day = 10; p.amount_due = 35.00; p.amount_paid = 35.00;
         p.status = "paid"; p.offer_id = o2; p.list_price = 40.00;
-        CHECK(c.addPaymentsWithReceipt({p}, "", nullptr) > 0);
+        int usedLine = c.addPaymentsWithReceipt({p}, "", nullptr);
+        CHECK(usedLine > 0);
+        { Payment rd = c.getPaymentById(usedLine); CHECK(rd.used_offer_id == o2 && rd.used_offer_name == mine.name && ToCents(rd.used_discount) == 500 && ToCents(rd.used_list_price) == 4000); }
         auto offers = c.getOffers();
         for (auto& o : offers) if (o.id == o2) CHECK(o.uses == 1 && ToCents(o.given) == 500);
 

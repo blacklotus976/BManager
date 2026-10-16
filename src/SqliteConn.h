@@ -17,6 +17,7 @@ private:
     std::string dbPath_;
     int apartmentAt(int userId, int y, int m, int d);
     double priceOf(int serviceId);
+    double costOf(int serviceId);
     std::string toJson(const std::vector<std::string>& cols, const std::vector<std::string>& vals);
     std::vector<std::string> getColumnNames(const std::string& table);
     int insertPayment(const Payment& p, int batchId);
@@ -56,6 +57,7 @@ public:
     bool addUser(const User& user) override;
     bool editUser(int id, const User& user) override;
     bool removeUser(int id) override;
+    std::string userDeletedAt(int id) override;
     User getUserById(int id) override;
 
     std::vector<Building> getBuildings() override;
@@ -77,13 +79,15 @@ public:
     std::vector<Offer> getOffers() override;
     std::vector<Building> pageBuildings(const std::string& text, int offset, int limit) override;
     int countBuildings(const std::string& text) override;
-    std::vector<PackageRow> pagePackages(const std::string& text, int sortCol, bool asc, int offset, int limit) override;
+    std::vector<PackageRow> pagePackages(const std::string& text, const SortSpec& sort, int offset, int limit) override;
     int countPackages(const std::string& text) override;
-    std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit, int sortCol = 0, bool asc = true) override;
+    std::vector<JointService> pageJointCatalog(const std::string& text, int offset, int limit, const SortSpec& sort = {}) override;
     int countJointCatalog(const std::string& text) override;
-    std::vector<JointOp> pageJointOps(int buildingId, const std::string& text, int sortCol, bool asc, int offset, int limit) override;
-    int countJointOps(int buildingId, const std::string& text, double* total = nullptr, double* paid = nullptr) override;
-    std::vector<PackageBuyer> pagePackageBuyers(int pkgId, const std::string& text, int show, int sortCol, bool asc, int offset, int limit) override;
+    std::vector<JointOp> pageJointOps(int buildingId, const std::string& text, const SortSpec& sort, int offset, int limit, bool onlyOpen = false,
+                                      const std::vector<int>& serviceIds = {}, const std::string& fromDate = "", const std::string& toDate = "") override;
+    int countJointOps(int buildingId, const std::string& text, double* total = nullptr, double* paid = nullptr, bool onlyOpen = false,
+                      const std::vector<int>& serviceIds = {}, const std::string& fromDate = "", const std::string& toDate = "") override;
+    std::vector<PackageBuyer> pagePackageBuyers(int pkgId, const std::string& text, int show, const SortSpec& sort, int offset, int limit) override;
     int countPackageBuyers(int pkgId, const std::string& text, int show) override;
     std::vector<User> getBuildingResidents(int buildingId) override;
     bool renameMasterService(int id, const std::string& label) override;
@@ -99,7 +103,38 @@ public:
     std::vector<JointService> getJointCatalog(bool includeInactive = false) override;
     int addJointService(const Service& s, const std::string& kind) override;
     bool editJointService(int id, const Service& s, const std::string& kind, bool active) override;
-    int chargeJoint(const JointOp& op, const std::vector<JointLine>& lines, const std::vector<JointShare>& shares) override;
+    int chargeJoint(const JointOp& op, const std::vector<JointLine>& lines, const std::vector<JointShare>& shares,
+                    double costTotal = 0.0, int costPartnerId = -1, double costPaid = -1.0, const Receipt* receipt = nullptr) override;
+    std::vector<PartnerJob> partnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, int kind = 0, bool owedOnly = false) override;
+    int countPartnerJobs(int partnerId, const std::string& fromDate = "", const std::string& toDate = "", int kind = 0, bool owedOnly = false) override;
+    std::vector<PartnerStat> partnerStats(const std::string& fromDate, const std::string& toDate) override;
+    double getJointOpCost(int opId) override;
+    double getServiceCost(int serviceId) override;
+    bool setServiceCost(int serviceId, double cost) override;
+    HomeFigures homeFigures(int scope, const std::string& fromDate, const std::string& toDate) override;
+    CashNow cashNow() override;
+    std::vector<ClientOwing> pageClientOwings(const std::string& text, const SortSpec& sort, int offset, int limit, bool joint = false) override;
+    int countClientOwings(const std::string& text, double* total = nullptr, bool joint = false) override;
+    std::vector<QualityRow> clientQuality(int userId = 0, const std::string& fromDate = "", const std::string& toDate = "") override;
+    std::vector<ClientChargeRow> pageClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, const std::vector<int>& serviceIds = {}) override;
+    int countClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const std::vector<int>& serviceIds = {}) override;
+    std::vector<EntityClientRow> entityClients(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit) override;
+    int countEntityClients(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate) override;
+    std::vector<PartnerStat> entityPartners(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate) override;
+    HomeFigures entityFigures(const std::vector<int>& serviceIds, bool joint, const std::string& fromDate, const std::string& toDate) override;
+    ChargeEconomics chargeEconomics(int chargeId) override;
+    std::vector<JointShare> pageShares(int userId, int apartmentId, const std::string& fromDate, const std::string& toDate, bool onlyOpen, const SortSpec& sort, int offset, int limit) override;
+    int countShares(int userId, int apartmentId, const std::string& fromDate, const std::string& toDate, bool onlyOpen) override;
+    std::vector<Partner> pagePartners(const std::string& text, bool activeOnly, const SortSpec& sort, int offset, int limit) override;
+    int countPartners(const std::string& text, bool activeOnly) override;
+    int savePartner(const Partner& p) override;
+    bool removePartner(int id) override;
+    std::vector<PartnerRow> pagePartnerRows(const std::string& text, const SortSpec& sort, int offset, int limit) override;
+    int countPartnerRows(const std::string& text) override;
+    std::vector<DeletionRow> pageDeletions(const std::string& text, const SortSpec& sort, int offset, int limit) override;
+    int countDeletions(const std::string& text) override;
+    bool restoreDeletion(int id) override;
+    Partner getPartner(int id) override;
     std::vector<JointOp> getJointOps(int buildingId, int offset, int limit) override;
     int countJointOps(int buildingId) override;
     JointOp getJointOpById(int id) override;
@@ -138,6 +173,7 @@ public:
     void setAuditReason(const std::string& reason) override { auditReason_ = reason; }
     AuditCheck verifyAuditLog() override;
     bool editPayment(int id, const Payment& payment) override;
+    bool payOutCharge(int chargeId, double amount, const std::string& payDate) override;
     bool removePayment(int id) override;
     Payment getPaymentById(int id) override;
     std::vector<Payment> getPaymentsForService(int serviceId) override;
@@ -197,7 +233,7 @@ public:
                        bool missingReceiptOnly = false) override;
 
     int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) override;
-    int addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel, const Receipt* receipt) override;
+    int addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel, const Receipt* receipt, bool receiptPerLine = false) override;
     int nextReceiptNumber(const std::string& series) override;
     int recordPayment(const MoneyPayment& money, const std::vector<Allocation>& allocations, const Receipt* receipt) override;
     std::vector<MoneyPayment> getMoneyForUser(int userId) override;

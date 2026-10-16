@@ -12,7 +12,7 @@ int main() {
     namespace fs = std::filesystem;
     fs::path dir = fs::temp_directory_path() / "bmanager_attachments_test";
     fs::remove_all(dir); fs::create_directories(dir / "incoming");
-    { std::ofstream(dir / "incoming" / "απόδειξη.jpg", std::ios::binary) << std::string(5000, 'x'); }
+    { std::ofstream(dir / "incoming" / fs::u8path("απόδειξη.jpg"), std::ios::binary) << std::string(5000, 'x'); }
     { std::ofstream(dir / "incoming" / "copy.jpg", std::ios::binary) << std::string(5000, 'x'); }       // same bytes
     { std::ofstream(dir / "incoming" / "video.mp4", std::ios::binary) << std::string(100, 'v'); }
     std::string db = (dir / "data.db").string();
@@ -26,7 +26,7 @@ int main() {
         int rid = c.getReceiptIdForPayment(line);
         CHECK(rid > 0);
 
-        int a1 = c.addAttachment("receipt", rid, (dir / "incoming" / "απόδειξη.jpg").u8string(), "σκαναρισμένη");
+        int a1 = c.addAttachment("receipt", rid, (dir / "incoming" / fs::u8path("απόδειξη.jpg")).u8string(), "σκαναρισμένη");
         int a2 = c.addAttachment("client", 1, (dir / "incoming" / "copy.jpg").u8string(), "");
         int a3 = c.addAttachment("charge", line, (dir / "incoming" / "video.mp4").u8string(), "");
         CHECK(a1 > 0 && a2 > 0 && a3 > 0);
@@ -38,7 +38,7 @@ int main() {
         CHECK(ra[0].stored_path == c.getAttachments("client", 1)[0].stored_path);
         CHECK(fs::exists(fs::u8path(c.attachmentFullPath(ra[0]))));
         // the original can disappear; the attachment stays
-        fs::remove(dir / "incoming" / "απόδειξη.jpg");
+        fs::remove(dir / "incoming" / fs::u8path("απόδειξη.jpg"));
         CHECK(fs::exists(fs::u8path(c.attachmentFullPath(ra[0]))));
 
         // receipt evidence can't be removed; others only with a reason; never deleted

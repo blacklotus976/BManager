@@ -46,6 +46,9 @@ struct Payment {
     int joint_op_id = -1;
     // Write-only, used when the charge is created: the offer claimed for it and the price before the discount
     // (saved in offer_uses, not on the charge).
+    // Read-only: the offer this charge was made with (offer_uses), so past payments show "this offer was applied".
+    int used_offer_id = -1; std::string used_offer_name; double used_list_price = 0.0, used_discount = 0.0;
+    int partner_id = -1;           // a paid-out (cost) line: the business partner it was paid to (-1 = nobody in particular)
     int offer_id = -1;
     double list_price = 0.0;
 };
