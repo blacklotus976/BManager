@@ -17,6 +17,7 @@ struct MoneyPayment {
     int batch_id = -1;
     std::string created_at;      // local time
     double allocated = 0.0;      // derived: how much of it settles charges; amount - allocated = client credit
+    std::string who, what;       // read-only (Ταμείο): client or partner, and what it paid for
 };
 
 // How much of a payment goes to one charge.

@@ -225,6 +225,17 @@ public:
     virtual std::vector<int> getReceiptPaymentIds(int receiptId) = 0;
     virtual int getReceiptIdForPayment(int paymentId) = 0;                 // -1 = none
 
+    // --- Ταμείο: every movement of money, in and out ---
+    struct MoneyQuery {
+        std::string fromDate, toDate;     // pay date, inclusive
+        std::string direction;            // "", in, out
+        std::string method;               // "" = any
+        std::string text;                 // client / partner name, reference, notes
+        int receipt = 0;                  // 0 any, 1 with an issued receipt, 2 incoming money without one
+    };
+    virtual std::vector<MoneyPayment> pageMoney(const MoneyQuery& q, int offset, int limit) = 0;     // newest first
+    virtual long long countMoney(const MoneyQuery& q, double* in = nullptr, double* out = nullptr) = 0;
+
     // --- Payment queries & totals in SQL (screens never load every payment into memory) ---
     struct PaymentFilter {
         std::string fromDate, toDate;        // inclusive ISO dates, "" = open
@@ -233,6 +244,9 @@ public:
         int status = 0;                      // 0 all, 1 resolved (not 'future'), 2 future
         int owed = 0;                        // 0 any, 1 settled (resolved, balance <= 0), 2 still owed (resolved, balance > 0)
         bool missingReceipt = false;         // money came in for it but no issued receipt covers that money
+        int partnerId = -1;                  // cost bills paid to this partner
+        SortSpec sort;                       // findPayments only, empty = its PayOrder. columns: 0 date, 1 client, 2 service,
+                                             // 3 amount, 4 paid, 5 still owed, 6 status (several keys allowed)
         double minDue = 0.0, maxDue = 0.0;   // amount_due bounds, 0 = none
         int joint = 0;                       // 0 any, 1 only shares of joint charges (κοινόχρηστα), 2 only the client's own charges
         int jointOpId = -1;                  // only the lines of this joint charge

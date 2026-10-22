@@ -257,6 +257,8 @@ public:
     std::vector<Receipt> getReceiptsForUser(int userId) override;
     std::vector<int> getReceiptPaymentIds(int receiptId) override;
     int getReceiptIdForPayment(int paymentId) override;
+    std::vector<MoneyPayment> pageMoney(const MoneyQuery& q, int offset, int limit) override;
+    long long countMoney(const MoneyQuery& q, double* in = nullptr, double* out = nullptr) override;
 
     std::vector<Payment> findPayments(const PaymentFilter& f, PayOrder order, int offset, int limit) override;
     long long countPaymentsWhere(const PaymentFilter& f) override;

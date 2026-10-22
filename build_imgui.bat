@@ -62,7 +62,7 @@ IF %ERRORLEVEL% NEQ 0 ( echo [ERROR] CMake config failed. If the toolset is the 
 
 echo.
 echo --- 3. Building Release (app + tests) ---
-"%CMAKE%" --build %BUILD_DIR% --config Release --target PropertyManager money_test receipts_test history_test audit_test attachments_test joint_test plan_test stress_test offers_test packages_test cost_test math_test -- /m:2
+"%CMAKE%" --build %BUILD_DIR% --config Release --target PropertyManager money_test receipts_test history_test audit_test attachments_test joint_test plan_test stress_test offers_test packages_test cost_test math_test cash_test -- /m:2
 IF %ERRORLEVEL% NEQ 0 ( echo [ERROR] Build failed. & exit /b 1 )
 
 echo.

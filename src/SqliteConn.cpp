@@ -3361,6 +3361,7 @@ PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
     if (f.owed == 1) w.where += " AND p.balance <= 0.005";
     if (f.owed == 2) w.where += " AND p.balance > 0.005";
     if (f.missingReceipt) w.where += kMissingReceiptSql;
+    if (f.partnerId >= 0) w.num(" AND p.id IN (SELECT charge_id FROM partner_costs WHERE partner_id = ?)", f.partnerId);
     if (f.minDue > 0) w.num(" AND p.amount_due >= ?", f.minDue);
     if (f.maxDue > 0) w.num(" AND p.amount_due <= ?", f.maxDue);
     if (f.joint == 1) w.where += " AND p.batch_id IN (SELECT batch_id FROM joint_ops)";
@@ -3418,6 +3419,22 @@ std::vector<Payment> SqliteConn::findPayments(const PaymentFilter& f, PayOrder o
     const char* ord = order == PayOrder::DateAsc ? " ORDER BY p.pay_date, p.id"
                     : order == PayOrder::ResolutionDesc ? " ORDER BY p.resolution_date DESC, p.id DESC"
                     : " ORDER BY p.pay_date DESC, p.id DESC";
+    std::string custom;
+    for (auto& k : f.sort) {
+        std::string d = k.second ? " ASC" : " DESC", part;
+        switch (k.first) {
+            case 0: part = "p.pay_date" + d; break;
+            case 1: part = "(SELECT full_name FROM users WHERE users.id = p.user_id)" + d; break;
+            case 2: part = "(SELECT label FROM services WHERE services.id = p.service_id)" + d; break;
+            case 3: part = "p.amount_due" + d; break;
+            case 4: part = "p.amount_paid" + d; break;
+            case 5: part = "(p.amount_due - p.amount_paid)" + d; break;
+            case 6: part = "(CASE WHEN p.status = 'future' THEN 3 WHEN p.amount_paid >= p.amount_due THEN 2 WHEN p.amount_paid > 0 THEN 1 ELSE 0 END)" + d; break;
+            default: break;
+        }
+        if (!part.empty()) custom += (custom.empty() ? " ORDER BY " : ", ") + part;
+    }
+    if (!custom.empty()) { custom += ", p.id DESC"; ord = custom.c_str(); }
     std::string sql = std::string("SELECT ") + kPaymentCols + " FROM charges p" + w.joins + w.where + ord + " LIMIT ? OFFSET ?";
     std::vector<Payment> out;
     sqlite3_stmt* st = nullptr;
@@ -5591,4 +5608,82 @@ JointService SqliteConn::getJointServiceById(int id) {
         j.active = sqlite3_column_int(st, 6) != 0; j.service.suggested_price = RoundMoney(sqlite3_column_double(st, 7));
     }
     sqlite3_finalize(st); return j;
+}
+
+// --- ΤΑΜΕΙΟ: money in and out --------------------------------------------------------------------------
+namespace {
+// A WHERE clause and its binds, kept side by side so they never get out of step.
+struct SqlBinds {
+    std::string where = " WHERE 1=1";
+    std::vector<std::pair<bool, std::string>> b;      // (is text, value)
+    void text(const std::string& c, const std::string& v) { where += c; b.push_back({true, v}); }
+    void num(const std::string& c, int v) { where += c; b.push_back({false, std::to_string(v)}); }
+    void bind(sqlite3_stmt* st) const {
+        for (size_t i = 0; i < b.size(); i++) {
+            if (b[i].first) sqlite3_bind_text(st, (int)i + 1, b[i].second.c_str(), -1, SQLITE_TRANSIENT);
+            else sqlite3_bind_int(st, (int)i + 1, std::atoi(b[i].second.c_str()));
+        }
+    }
+};
+// who: the client for money in; for money out the partner it paid (through its bills), else the client it was for
+const char* kMoneyWho =
+    "COALESCE(CASE WHEN m.direction = 'out' THEN (SELECT pr.name FROM allocations a JOIN partner_costs pc ON pc.charge_id = a.charge_id "
+    "JOIN partners pr ON pr.id = pc.partner_id WHERE a.payment_id = m.id LIMIT 1) END, u.full_name, '')";
+SqlBinds MoneyWhere(const DataConn::MoneyQuery& q) {
+    SqlBinds w;
+    if (!q.fromDate.empty()) w.text(" AND m.pay_date >= ?", q.fromDate);
+    if (!q.toDate.empty()) w.text(" AND m.pay_date <= ?", q.toDate);
+    if (q.direction == "in" || q.direction == "out") w.text(" AND m.direction = ?", q.direction);
+    if (!q.method.empty()) w.text(" AND m.method = ?", q.method);
+    if (q.receipt == 1) w.where += " AND m.receipt_id IN (SELECT id FROM receipts WHERE status = 'issued')";
+    if (q.receipt == 2) w.where += " AND m.direction = 'in' AND (m.receipt_id IS NULL OR m.receipt_id NOT IN (SELECT id FROM receipts WHERE status = 'issued'))";
+    if (!q.text.empty()) {
+        w.where += std::string(" AND (instr(fold(") + kMoneyWho + "), fold(?)) > 0 OR instr(fold(COALESCE(m.reference,'')), fold(?)) > 0"
+                   " OR instr(fold(COALESCE(m.notes,'')), fold(?)) > 0)";
+        w.b.push_back({true, q.text}); w.b.push_back({true, q.text}); w.b.push_back({true, q.text});
+    }
+    return w;
+}
+}
+
+
+std::vector<MoneyPayment> SqliteConn::pageMoney(const MoneyQuery& q, int offset, int limit) {
+    std::vector<MoneyPayment> out; sqlite3_stmt* st = nullptr;
+    SqlBinds w = MoneyWhere(q);
+    std::string sql = std::string("SELECT ") + kMoneyCols +
+        "COALESCE((SELECT SUM(CAST(ROUND(a.amount*100) AS INTEGER)) FROM allocations a WHERE a.payment_id = m.id), 0) / 100.0, " + kMoneyWho + ", "
+        "COALESCE((SELECT group_concat(lbl, ', ') FROM (SELECT DISTINCT s.label AS lbl FROM allocations a JOIN charges c ON c.id = a.charge_id "
+        "JOIN services s ON s.id = c.service_id WHERE a.payment_id = m.id LIMIT 4)), '') "
+        "FROM payments m LEFT JOIN users u ON u.id = m.user_id" + w.where + " ORDER BY m.pay_date DESC, m.id DESC LIMIT ? OFFSET ?";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    w.bind(st);
+    sqlite3_bind_int(st, (int)w.b.size() + 1, limit); sqlite3_bind_int(st, (int)w.b.size() + 2, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        MoneyPayment m;
+        m.id = sqlite3_column_int(st, 0); m.user_id = sqlite3_column_int(st, 1); m.pay_date = ColText(st, 2);
+        m.amount = RoundMoney(sqlite3_column_double(st, 3)); m.direction = ColText(st, 4); m.method = ColText(st, 5); m.reference = ColText(st, 6);
+        m.notes = ColText(st, 7); m.receipt_id = sqlite3_column_int(st, 8); m.batch_id = sqlite3_column_int(st, 9); m.created_at = ColText(st, 10);
+        m.allocated = RoundMoney(sqlite3_column_double(st, 11)); m.who = ColText(st, 12); m.what = ColText(st, 13);
+        out.push_back(m);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+long long SqliteConn::countMoney(const MoneyQuery& q, double* in, double* out) {
+    long long n = 0; sqlite3_stmt* st = nullptr;
+    SqlBinds w = MoneyWhere(q);
+    std::string sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN m.direction = 'in' THEN CAST(ROUND(m.amount*100) AS INTEGER) END), 0), "
+                      "COALESCE(SUM(CASE WHEN m.direction = 'out' THEN CAST(ROUND(m.amount*100) AS INTEGER) END), 0) "
+                      "FROM payments m LEFT JOIN users u ON u.id = m.user_id" + w.where;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
+        w.bind(st);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int64(st, 0);
+            if (in) *in = FromCents(sqlite3_column_int64(st, 1));
+            if (out) *out = FromCents(sqlite3_column_int64(st, 2));
+        }
+    }
+    sqlite3_finalize(st);
+    return n;
 }
