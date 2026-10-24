@@ -394,6 +394,135 @@ public:
     virtual int countPackageBuyers(int pkgId, const std::string& text, int show) = 0;
     // The clients living now in a building's apartments (for charging a building).
     virtual std::vector<User> getBuildingResidents(int buildingId) = 0;
+    // Διαχείριση: the buildings we manage as their διαχειριστής (active ones, by address). Only these get κοινόχρηστα.
+    virtual std::vector<int> getManagedBuildings() = 0;
+    virtual bool isBuildingManaged(int buildingId) = 0;
+    virtual bool setBuildingManaged(int buildingId, bool on) = 0;     // ending keeps the history; starting again re-opens it
+
+    // --- Ταμείο πολυκατοικίας: the building's own money (ledger, only added to) ---
+    // kind: contribution (εισφορά ενοίκου), collection (ένοικος πλήρωσε μερίδιο κοινοχρήστου), expense (έξοδο κτιρίου),
+    // our_bill (πληρωμή λογαριασμού μας από το ταμείο), opening (αρχικό υπόλοιπο), correction (διόρθωση / αναίρεση).
+    // Moves of money on κοινόχρηστα are written by the database itself; the calls below add the rest.
+    struct FundMove {
+        int id = -1, building_id = -1;
+        std::string date, direction, kind, description, payee, created_at;
+        std::string note;           // our comment: what we did and why
+        double amount = 0;
+        int user_id = -1, apartment_id = -1, partner_id = -1, payment_id = -1, charge_id = -1, joint_op_id = -1;
+        // read-only
+        std::string who;            // resident / partner / payee
+        std::string apartment;      // the apartment's label
+        int receipt_id = -1;        // the receipt of the payment, if any
+        double balance = 0;         // the fund right after this move
+    };
+    // --- Ένοικοι (residents): a stay of a person in an apartment of a building we manage. Never a client. ---
+    struct Resident {
+        int id = -1, user_id = -1, apartment_id = -1;
+        std::string full_name, phone, email, start_date, end_date, note, created_at;
+        // read-only
+        int building_id = -1; std::string apartment, building;
+        int legacy_user_id = -1;       // his old client record carrying κοινόχρηστα from before residents were separate
+        double exit_owed = 0;          // what he still owed the day he left
+        bool active() const { return end_date.empty(); }
+    };
+    // a building's residents (current ones, or everyone who ever lived there), by apartment then start
+    virtual std::vector<Resident> getResidents(int buildingId, bool includeEnded) = 0;
+    virtual std::vector<Resident> getResidentStays(int userId) = 0;          // every stay of one accounting record, newest first
+    virtual Resident getResidentById(int id) = 0;
+    // the resident behind any record that carries his money (his own, or his old client record): his accounting user, -1 = none
+    virtual int residentUserFor(int anyUserId) = 0;
+    // A new stay. reuseOf > 0: the same person again (his previous stay's record keeps his history). Returns the stay id.
+    virtual int addResident(const Resident& r, int reuseOf = -1) = 0;
+    virtual bool endResident(int id, const std::string& endDate) = 0;        // moved out / stopped
+    virtual bool editResident(int id, const std::string& name, const std::string& phone, const std::string& email, const std::string& note) = 0;
+    // what one resident put into / took from his building's fund, newest first
+    virtual std::vector<FundMove> residentFundMoves(int userId) = 0;
+
+    // --- Διαχείριση lists: one page at a time, sorted in the database (several keys allowed) ---
+    // The fund as ACTIONS (a funding, an expense, our fee, an opening balance...), each with what it moved and the fund after it.
+    struct FundActionRow {
+        int opId = -1, moveId = -1;
+        std::string date, opKind, moveKind, label, note;
+        double in = 0, out = 0, balance = 0;      // in / out of the fund, the fund after it
+        double charged = 0, collected = 0;        // what residents were charged for it and paid so far
+    };
+    // sort: 0 date, 1 kind, 2 reason, 3 comment, 4 fund before, 5 amount, 6 fund after, 7 completion
+    virtual std::vector<FundActionRow> pageFundActions(int buildingId, const SortSpec& sort, int offset, int limit) = 0;
+    virtual int countFundActions(int buildingId) = 0;
+    // Shares of one action (opId > 0) or of some people (userIds), each with paid (paidc) and the action's total.
+    // sort: 0 date, 1 reason, 2 resident, 3 apartment, 4 action total, 5 share, 6 paid, 7 owed
+    virtual std::vector<JointShare> pageShareRows(int opId, const std::vector<int>& userIds, const SortSpec& sort, int offset, int limit) = 0;
+    virtual int countShareRows(int opId, const std::vector<int>& userIds) = 0;
+    // their sums, split: the fund's (fundings, expenses) and our management fees
+    struct ShareTotals { double fundCharged = 0, fundPaid = 0, feeCharged = 0, feePaid = 0; };
+    virtual ShareTotals shareTotals(int opId, const std::vector<int>& userIds) = 0;
+    // Apartments with their CURRENT residents (empty ones too), or the PREVIOUS residents of the building.
+    // sort: 0 apartment, 1 name, 2 phone, 3 email, 4 from, 5 until, 6 owes now
+    struct AptResidentRow { int apartment_id = -1; std::string apartment; Resident r; double owed = 0; };
+    virtual std::vector<AptResidentRow> pageAptResidents(int buildingId, bool previous, const std::string& text, const SortSpec& sort, int offset, int limit) = 0;
+    virtual int countAptResidents(int buildingId, bool previous, const std::string& text) = 0;
+    // Our management fees (every building). sort: 0 date, 1 building, 2 reason, 3 charged, 4 collected, 5 left
+    virtual std::vector<JointOp> pageFees(const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit) = 0;
+    virtual int countFees(const std::string& fromDate, const std::string& toDate, double* charged = nullptr, double* collected = nullptr) = 0;
+    // The buildings we manage with their client details and their fund.
+    // sort: 0 code, 1 address, 2 ΑΦΜ, 3 phone, 4 email, 5 special code, 6 apartments, 7 fund, 8 residents owe
+    struct ManagedRow { int building_id = -1, user_id = -1; std::string address, afm, phone, email, special_code; int apartments = 0; double fund = 0, owed = 0; };
+    virtual std::vector<ManagedRow> pageManagedBuildings(const std::string& text, const SortSpec& sort, int offset, int limit) = 0;
+    virtual int countManagedBuildings(const std::string& text) = 0;
+
+    // ---- one month of a building ('YYYY-MM'), exact to the day: the fund's month and each resident's month ----
+    // The fund: what it had and what residents owed it at the month's start and end (owed: charged before the day minus
+    // paid before it), and the month's items: each expense with its cost (and its split, if any), each funding, each of
+    // our fees (ours: never in the fund), with what was charged and what had been paid of it by the month's end.
+    struct MonthItem {                                               // kind: expense | funding | fee | correction
+        int opId = -1, moveId = -1; std::string date, kind, label;
+        double cost = 0;                                             // expense: what it cost the fund; correction: signed amount
+        double shared = 0;                                           // expense: how much of it was shared among residents (information)
+        double charged = 0, paid = 0, paidIn = 0;                    // charged to residents; paid of it by the month's end / within the month
+    };
+    struct MonthFund {
+        double fundStart = 0, owedStart = 0, fundEnd = 0, owedEnd = 0;   // the fund, and what residents owed it
+        double feeOwedStart = 0, feeOwedEnd = 0;                         // what residents owed us (fees)
+        double otherIn = 0, otherOut = 0;                                // opening balance / corrections in the month
+        double priorPaidIn = 0, feePriorPaidIn = 0;                      // paid in the month for what earlier months charged (fund / our fees)
+        std::vector<MonthItem> items;                                    // expenses, then fundings, then fees
+    };
+    virtual MonthFund monthFund(int buildingId, const std::string& ym) = 0;
+    // The residents: every action of the month as a column; per resident and apartment his share of each and what he had
+    // paid of it by the month's end; what he still owed from earlier months at the month's end; what he paid in the month.
+    struct MonthOp { int id = -1; std::string date, kind, label; double total = 0; };
+    struct MonthPerson {
+        int person = -1, apartment_id = -1;                        // person = his accounting record (resident user)
+        std::string name, apartment, start, end;                   // his stay in that apartment
+        double prevFund = 0, prevFee = 0, paidInMonth = 0;
+        double prevOld = 0;            // of prevFund: old expenses charged on to the residents before expenses stopped being charged
+    };
+    struct MonthCell { int person = -1, apartment_id = -1, op = -1; double charged = 0, paid = 0; };
+    struct MonthResidents { std::vector<MonthOp> ops; std::vector<MonthPerson> people; std::vector<MonthCell> cells; };
+    virtual MonthResidents monthResidents(int buildingId, const std::string& ym) = 0;
+
+    virtual double getFundBalance(int buildingId) = 0;
+    struct FundTotals { double in = 0, out = 0, contributions = 0, collections = 0, expenses = 0, ourBills = 0; };
+    virtual FundTotals getFundTotals(int buildingId) = 0;
+    // newest first, with the balance after each; expensesOnly: only what went out for the building (expenses, our bills)
+    virtual std::vector<FundMove> pageFundMoves(int buildingId, int offset, int limit, bool expensesOnly = false) = 0;
+    virtual int countFundMoves(int buildingId, bool expensesOnly = false) = 0;
+    virtual FundMove getFundMove(int id) = 0;              // with the balance after it
+    // Money out of the fund that is not a κοινόχρηστο's cost (ΔΕΗ, a repair...): to a partner and/or a named payee.
+    // description = the reason (short), note = our comment. jointOpId: the κοινόχρηστο that charges this expense on to
+    // the residents (their shares come back into the fund as they pay), -1 = paid from the fund only.
+    virtual int fundExpense(int buildingId, double amount, const std::string& date, const std::string& description, int partnerId, const std::string& payee,
+                            const std::string& note = "", int jointOpId = -1) = 0;
+    // An expense with its split among the residents: for information only (whose part it was), nobody comes to owe.
+    // Shares (apartment, user, amount) must add up to the amount; none = not split. Together or not at all.
+    virtual int fundExpenseShared(int buildingId, double amount, const std::string& date, const std::string& description,
+                                  const std::string& note, const std::vector<JointShare>& shares) = 0;
+    virtual std::vector<JointShare> getExpenseShares(int moveId) = 0;
+    // Opening balance or a correction: a signed amount (+ in, - out), reason required.
+    virtual int fundAdjust(int buildingId, double signedAmount, const std::string& date, const std::string& description, bool opening) = 0;
+    // Pays (all or part of) one of OUR bills to the building's client from the building's fund: money in for us on that
+    // bill (payment, no receipt to a resident) and the same amount out of the fund, together or not at all.
+    virtual int fundPayOurBill(int buildingId, int chargeId, double amount, const std::string& date) = 0;
     virtual std::string getPackageLabel(int pkgId) = 0;                 // "" if none
     virtual JointService getJointServiceById(int id) = 0;               // id -1 if none
 
@@ -490,6 +619,8 @@ public:
         double charged = 0, collected = 0;      // income: charged / already received
         double owed = 0;                        // income still owed (balance of those charges)
         double cost = 0, costPaid = 0;          // cost lines (paid-out charges): cost / already paid
+        // of the above: what is still open on scheduled bills (status 'future', not due yet). Owed NOW = owed - scheduledIn
+        double scheduledIn = 0, scheduledOut = 0;
         double profit() const { return charged - cost; }          // before anything is collected
         double cashProfit() const { return collected - costPaid; }
     };
@@ -518,6 +649,11 @@ public:
         double paidAmtClient = 0, daysClient = 0;     // fully paid own charges: amount, amount-weighted sum of days
         double paidAmtJoint = 0, daysJoint = 0;       // same for joint shares
         double openClient = 0, openJoint = 0;         // still owed
+        double overdueClient = 0, overdueJoint = 0;   // of that, charged more than 30 days ago (late)
+        // the payment score, plain: of every euro that should have been paid by now (paid, or open for more than 30 days),
+        // how many were paid within 30 days of the charge. score = 100 * onTime / due
+        double onTimeClient = 0, dueClient = 0, onTimeJoint = 0, dueJoint = 0;
+        static double OnTime(double onTime, double due) { return due > 0.005 ? 100.0 * onTime / due : -1.0; }
         double incomeJoint = 0;                       // what they were charged as their parts of joint charges
         // Payment speed index, 0-100, per block: every payment made on a charge counts with its OWN amount and delay
         // (weight 2^(-days/30): paid at once = 1, after a month = 1/2...), and what is still unpaid counts as if it were
@@ -528,6 +664,16 @@ public:
     };
     // userId 0 = every client; dates (charge dates, inclusive, "" = open) limit what is rated
     virtual std::vector<QualityRow> clientQuality(int userId = 0, const std::string& fromDate = "", const std::string& toDate = "") = 0;
+    // The residents of the buildings we manage, rated like clients: per resident and building, what he was charged for
+    // the fund (fundings, old charged expenses) and in our fees, what is still open, and the same payment speed index.
+    // A share charged to his old client record counts as his.
+    struct ResidentQualityRow {
+        int building_id = -1, user_id = -1; std::string name, building, apartment; bool active = false;
+        double fundCharged = 0, fundOpen = 0, feeCharged = 0, feeOpen = 0, idxNum = 0, idxDen = 0;
+        double fundOverdue = 0, feeOverdue = 0;       // open and charged more than 30 days ago (late)
+        double onTime = 0, due = 0;                   // the payment score, as for clients: 100 * onTime / due
+    };
+    virtual std::vector<ResidentQualityRow> residentQuality(const std::string& fromDate = "", const std::string& toDate = "") = 0;
 
     // --- Συνεργάτες (people who do jobs) ---
     // sort columns: 0 name, 1 trade, 2 phone, 3 email, 4 active
@@ -568,9 +714,10 @@ public:
     //                  the multi-select Greek-letter name filter (empty = none).
     virtual std::vector<User> pageUsers(const std::string& query, int scope,
                                          const std::vector<std::string>& letters,
-                                         int offset, int limit, const SortSpec& sort = {}) = 0;
+                                         int offset, int limit, const SortSpec& sort = {}, int kinds = 7) = 0;
+    // kinds: which clients, as bits: 1 people, 2 buildings, 4 businesses (7 = all)
     virtual int countUsers(const std::string& query, int scope,
-                            const std::vector<std::string>& letters) = 0;
+                            const std::vector<std::string>& letters, int kinds = 7) = 0;
 
     // Services: only single-owner services (joint ones live on their own tab).
     // query does a label/notes substring match.

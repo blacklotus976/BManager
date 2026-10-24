@@ -170,3 +170,17 @@ add_test(NAME math COMMAND math_test)
 add_executable(cash_test EXCLUDE_FROM_ALL tests/cash_test.cpp src/SqliteConn.cpp)
 target_link_libraries(cash_test PRIVATE sqlite3_vendored)
 add_test(NAME cash COMMAND cash_test)
+add_executable(clients_test EXCLUDE_FROM_ALL tests/clients_test.cpp src/SqliteConn.cpp)
+target_link_libraries(clients_test PRIVATE sqlite3_vendored)
+add_test(NAME clients COMMAND clients_test)
+add_executable(fund_test EXCLUDE_FROM_ALL tests/fund_test.cpp src/SqliteConn.cpp)
+target_link_libraries(fund_test PRIVATE sqlite3_vendored)
+add_test(NAME fund COMMAND fund_test)
+
+# demo data for building management (not a test): seed_demo <database> [first YYYY-MM] [last YYYY-MM] [last day]
+add_executable(seed_demo EXCLUDE_FROM_ALL tools/seed_demo.cpp src/SqliteConn.cpp)
+target_link_libraries(seed_demo PRIVATE sqlite3_vendored)
+
+add_executable(residents_test EXCLUDE_FROM_ALL tests/residents_test.cpp src/SqliteConn.cpp)
+target_link_libraries(residents_test PRIVATE sqlite3_vendored)
+add_test(NAME residents COMMAND residents_test)

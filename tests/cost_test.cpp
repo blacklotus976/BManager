@@ -17,6 +17,8 @@ int main() {
         int a1 = c.addApartment(bid, "Α1"), a2 = c.addApartment(bid, "Α2");
         User u1; u1.full_name = "ΑΛΕΞΙΟΥ"; u1.apartment_id = a1; c.addUser(u1);
         User u2; u2.full_name = "ΒΑΣΙΛΕΙΟΥ"; u2.apartment_id = a2; c.addUser(u2);
+        // the building has its own client row now, so look the people up instead of assuming ids 1 and 2
+        const int U1 = c.searchUsers("ΑΛΕΞΙΟΥ", 0, 10)[0].id, U2 = c.searchUsers("ΒΑΣΙΛΕΙΟΥ", 0, 10)[0].id;
 
         Service s; s.label = "ΑΠΕΝΤΟΜΩΣΗ"; s.suggested_price = 40; s.cost_price = 15;
         int svc = c.addServiceGetId(-1, s);
@@ -25,7 +27,7 @@ int main() {
         CHECK(c.setServiceCost(svc, 12.5) && ToCents(c.getServiceCost(svc)) == 1250);
 
         // a client service charged with its cost: the charge (owed) + the cost line (paid out at once)
-        Payment ch; ch.user_id = 1; ch.service_id = svc; ch.year = 2026; ch.month = 10; ch.day = 5; ch.amount_due = 40; ch.amount_paid = 0; ch.status = "pending"; ch.direction = "in";
+        Payment ch; ch.user_id = U1; ch.service_id = svc; ch.year = 2026; ch.month = 10; ch.day = 5; ch.amount_due = 40; ch.amount_paid = 0; ch.status = "pending"; ch.direction = "in";
         Payment co = ch; co.amount_due = 12.5; co.amount_paid = 12.5; co.status = "paid"; co.direction = "out";
         int firstCharge = c.addPaymentsWithReceipt({ch, co}, "απεντόμωση", nullptr);
         CHECK(firstCharge > 0);
@@ -33,8 +35,8 @@ int main() {
 
         // a joint charge with a cost of 60 against 100
         JointOp op; op.building_id = bid; op.source_type = "service"; op.source_id = svc; op.label = "Καθαρισμός"; op.total = 100; op.op_date = "2026-10-11";
-        JointShare s1; s1.apartment_id = a1; s1.user_id = 1; s1.amount = 70;
-        JointShare s2; s2.apartment_id = a2; s2.user_id = 2; s2.amount = 30;
+        JointShare s1; s1.apartment_id = a1; s1.user_id = U1; s1.amount = 70;
+        JointShare s2; s2.apartment_id = a2; s2.user_id = U2; s2.amount = 30;
         // deleting a client: gone from the lists, his stay ends, the books keep him, the date is recorded
         { User tmp; tmp.full_name = "ΠΡΟΣ ΔΙΑΓΡΑΦΗ"; tmp.apartment_id = a2; c.addUser(tmp);
           int before = c.countUsers("", 0, {}); int tid = before + 1;
@@ -76,15 +78,15 @@ int main() {
 
         auto q = c.clientQuality();
         CHECK(q.size() == 2);
-        for (auto& r : q) if (r.user_id == 1) CHECK(ToCents(r.income) == 4000 && ToCents(r.cost) == 1250 && r.chargesJoint == 1 && ToCents(r.openJoint) == 7000);
+        for (auto& r : q) if (r.user_id == U1) CHECK(ToCents(r.income) == 4000 && ToCents(r.cost) == 1250 && r.chargesJoint == 1 && ToCents(r.openJoint) == 7000);
 
         // the speed index: 100 = paid at once, lower when late or unpaid; per client and per date range
-        { auto q1 = c.clientQuality(1, "", ""); CHECK(q1.size() == 1);
+        { auto q1 = c.clientQuality(U1, "", ""); CHECK(q1.size() == 1);
           double ic = DataConn::QualityRow::Index(q1[0].idxNumClient, q1[0].idxDenClient); CHECK(ic >= 0.0 && ic < 100.0);
-          CHECK(c.clientQuality(1, "2027-01-01", "").empty()); }
+          CHECK(c.clientQuality(U1, "2027-01-01", "").empty()); }
         // one client's own services with what we paid for them, and the money side of a charge
-        { auto cc = c.pageClientCharges(1, "", "", {{0, false}}, 0, 10);
-          CHECK(cc.size() == 1 && c.countClientCharges(1, "", "") == 1 && ToCents(cc[0].due) == 4000 && ToCents(cc[0].cost) == 1250 && ToCents(cc[0].costPaid) == 1250);
+        { auto cc = c.pageClientCharges(U1, "", "", {{0, false}}, 0, 10);
+          CHECK(cc.size() == 1 && c.countClientCharges(U1, "", "") == 1 && ToCents(cc[0].due) == 4000 && ToCents(cc[0].cost) == 1250 && ToCents(cc[0].costPaid) == 1250);
           auto e1 = c.chargeEconomics(firstCharge); CHECK(e1.costs.size() == 1 && ToCents(e1.costDue()) == 1250 && ToCents(e1.incomeDue) == 4000);
           auto e2 = c.chargeEconomics(firstCharge + 1); CHECK(e2.incomeChargeId == firstCharge && ToCents(e2.incomeDue) == 4000 && e2.costs.size() == 1);
           auto ids = c.getJointOpCharges(opId); CHECK(!ids.empty());
@@ -104,7 +106,7 @@ int main() {
 
         // a receipt covers money received, never our own payments
         Payment pay = ch; pay.amount_paid = 40; pay.status = "paid";
-        Receipt r; r.method = "cash"; r.issue_date = "2026-10-12"; r.user_id = 1; r.total = 40;
+        Receipt r; r.method = "cash"; r.issue_date = "2026-10-12"; r.user_id = U1; r.total = 40;
         CHECK(c.addPaymentsWithReceipt({pay, co}, "x", &r) > 0);
 
         Partner p; p.name = "Γιάννης Υδραυλικός"; p.trade = "υδραυλικός"; p.phone = "6900000000";

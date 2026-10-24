@@ -44,9 +44,9 @@ int main() {
         SAME(openC + fut1.dueAll, own.owed);    SAME(openJ + fut2.dueAll, jnt.owed);
         SAME(cost + fut3.dueAll, own.cost);
 
-        // clients owing (list) = the same open own charges
+        // clients owing (list) = the same open own charges that are due (scheduled ones are not owed yet)
         double owingTotal = 0; c.countClientOwings("", &owingTotal);
-        SAME(owingTotal, own.owed);
+        SAME(owingTotal, own.owed - own.scheduledIn);
 
         // partners: what the cost lines say
         double pc = 0, pp = 0, po = 0; for (auto& s : c.partnerStats("", "")) { pc += s.cost; pp += s.paid; po += s.owedNow; }

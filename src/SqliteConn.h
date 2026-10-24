@@ -90,6 +90,43 @@ public:
     std::vector<PackageBuyer> pagePackageBuyers(int pkgId, const std::string& text, int show, const SortSpec& sort, int offset, int limit) override;
     int countPackageBuyers(int pkgId, const std::string& text, int show) override;
     std::vector<User> getBuildingResidents(int buildingId) override;
+    std::vector<int> getManagedBuildings() override;
+    bool isBuildingManaged(int buildingId) override;
+    bool setBuildingManaged(int buildingId, bool on) override;
+    std::vector<Resident> getResidents(int buildingId, bool includeEnded) override;
+    std::vector<Resident> getResidentStays(int userId) override;
+    Resident getResidentById(int id) override;
+    int residentUserFor(int anyUserId) override;
+    int addResident(const Resident& r, int reuseOf = -1) override;
+    bool endResident(int id, const std::string& endDate) override;
+    bool editResident(int id, const std::string& name, const std::string& phone, const std::string& email, const std::string& note) override;
+    std::vector<FundMove> residentFundMoves(int userId) override;
+    std::vector<FundActionRow> pageFundActions(int buildingId, const SortSpec& sort, int offset, int limit) override;
+    int countFundActions(int buildingId) override;
+    std::vector<JointShare> pageShareRows(int opId, const std::vector<int>& userIds, const SortSpec& sort, int offset, int limit) override;
+    int countShareRows(int opId, const std::vector<int>& userIds) override;
+    ShareTotals shareTotals(int opId, const std::vector<int>& userIds) override;
+    std::vector<AptResidentRow> pageAptResidents(int buildingId, bool previous, const std::string& text, const SortSpec& sort, int offset, int limit) override;
+    int countAptResidents(int buildingId, bool previous, const std::string& text) override;
+    std::vector<JointOp> pageFees(const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit) override;
+    int countFees(const std::string& fromDate, const std::string& toDate, double* charged = nullptr, double* collected = nullptr) override;
+    std::vector<ManagedRow> pageManagedBuildings(const std::string& text, const SortSpec& sort, int offset, int limit) override;
+    int countManagedBuildings(const std::string& text) override;
+    MonthFund monthFund(int buildingId, const std::string& ym) override;
+    std::vector<ResidentQualityRow> residentQuality(const std::string& fromDate, const std::string& toDate) override;
+    int fundExpenseShared(int buildingId, double amount, const std::string& date, const std::string& description,
+                          const std::string& note, const std::vector<JointShare>& shares) override;
+    std::vector<JointShare> getExpenseShares(int moveId) override;
+    MonthResidents monthResidents(int buildingId, const std::string& ym) override;
+    double getFundBalance(int buildingId) override;
+    FundTotals getFundTotals(int buildingId) override;
+    std::vector<FundMove> pageFundMoves(int buildingId, int offset, int limit, bool expensesOnly = false) override;
+    int countFundMoves(int buildingId, bool expensesOnly = false) override;
+    FundMove getFundMove(int id) override;
+    int fundExpense(int buildingId, double amount, const std::string& date, const std::string& description, int partnerId, const std::string& payee,
+                    const std::string& note = "", int jointOpId = -1) override;
+    int fundAdjust(int buildingId, double signedAmount, const std::string& date, const std::string& description, bool opening) override;
+    int fundPayOurBill(int buildingId, int chargeId, double amount, const std::string& date) override;
     bool renameMasterService(int id, const std::string& label) override;
     std::string getPackageLabel(int pkgId) override;
     JointService getJointServiceById(int id) override;
@@ -216,9 +253,9 @@ public:
 
     std::vector<User> pageUsers(const std::string& query, int scope,
                                  const std::vector<std::string>& letters,
-                                 int offset, int limit, const SortSpec& sort = {}) override;
+                                 int offset, int limit, const SortSpec& sort = {}, int kinds = 7) override;
     int countUsers(const std::string& query, int scope,
-                    const std::vector<std::string>& letters) override;
+                    const std::vector<std::string>& letters, int kinds = 7) override;
     std::vector<Service> pageServices(const std::string& query, int offset, int limit,
                                        const SortSpec& sort = {}) override;
     int countServices(const std::string& query) override;
