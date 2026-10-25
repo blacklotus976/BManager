@@ -263,11 +263,11 @@ public:
                                        int userId, int serviceId,
                                        const std::string& status, const std::string& direction,
                                        int offset, int limit, const SortSpec& sort = {},
-                                       bool missingReceiptOnly = false) override;
+                                       bool missingReceiptOnly = false, int joint = 0) override;
     int countPayments(const std::string& startDate, const std::string& endDate,
                        int userId, int serviceId,
                        const std::string& status, const std::string& direction,
-                       bool missingReceiptOnly = false) override;
+                       bool missingReceiptOnly = false, int joint = 0) override;
 
     int issueReceipt(const Receipt& r, const std::vector<int>& paymentIds) override;
     int addPaymentsWithReceipt(const std::vector<Payment>& payments, const std::string& batchLabel, const Receipt* receipt, bool receiptPerLine = false) override;

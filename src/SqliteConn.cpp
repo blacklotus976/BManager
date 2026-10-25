@@ -3245,9 +3245,12 @@ static std::string BuildPaymentPageWhere(const std::string& startDate, const std
                                           int userId, int serviceId,
                                           const std::string& status, const std::string& direction,
                                           std::vector<std::string>& textBinds,
-                                          std::vector<int>& intBinds, bool missingReceipt = false) {
+                                          std::vector<int>& intBinds, bool missingReceipt = false, int joint = 0) {
     std::string where = " WHERE 1=1";
     if (missingReceipt) where += kMissingReceiptSql;
+    if (joint == 1) where += " AND batch_id IN (SELECT batch_id FROM joint_ops)";
+    if (joint == 2) where += " AND (batch_id IS NULL OR (batch_id NOT IN (SELECT batch_id FROM joint_ops) AND batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL)))";
+    if (joint == 3) where += " AND (batch_id IN (SELECT batch_id FROM joint_ops) OR batch_id IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL))";
     if (!startDate.empty()) {
         where += " AND pay_date >= ?";
         textBinds.push_back(startDate);
@@ -3273,11 +3276,11 @@ static std::string BuildPaymentPageWhere(const std::string& startDate, const std
 std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, const std::string& endDate,
                                                int userId, int serviceId,
                                                const std::string& status, const std::string& direction,
-                                               int offset, int limit, const SortSpec& sort, bool missingReceiptOnly) {
+                                               int offset, int limit, const SortSpec& sort, bool missingReceiptOnly, int joint) {
     std::vector<std::string> textBinds;
     std::vector<int> intBinds;
     std::string where = BuildPaymentPageWhere(startDate, endDate, userId, serviceId, status, direction,
-                                               textBinds, intBinds, missingReceiptOnly);
+                                               textBinds, intBinds, missingReceiptOnly, joint);
     // Payments table columns: 0 id, 1 date, 2 client, 3 service, 4 type, 5 status,
     // 6 due, 7 paid, 8 notes. Client/service sort by NAME (sub-select), not by id.
     std::string order;
@@ -3318,11 +3321,11 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
 
 int SqliteConn::countPayments(const std::string& startDate, const std::string& endDate,
                                int userId, int serviceId,
-                               const std::string& status, const std::string& direction, bool missingReceiptOnly) {
+                               const std::string& status, const std::string& direction, bool missingReceiptOnly, int joint) {
     std::vector<std::string> textBinds;
     std::vector<int> intBinds;
     std::string where = BuildPaymentPageWhere(startDate, endDate, userId, serviceId, status, direction,
-                                               textBinds, intBinds, missingReceiptOnly);
+                                               textBinds, intBinds, missingReceiptOnly, joint);
     std::string sql = "SELECT COUNT(*) FROM charges p" + where;
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
@@ -3341,10 +3344,12 @@ static const char* kReceiptCols =
     "COALESCE(rf_code,''), COALESCE(paper_ref,''), COALESCE(bank_ref,''), COALESCE(notes,''), status, "
     "COALESCE(void_reason,''), COALESCE(datetime(voided_at,'localtime'),''), COALESCE(datetime(created_at,'localtime'),'')";
 
-// "joint" when the receipt pays charges of a joint operation (the residents' shares), else "personal"
+// "joint" when the receipt pays charges of a joint operation (the residents' shares), else "personal".
+// The check walks the PAYMENT's batch (km.batch_id) — that is what the Payments view filters on.
+// A receipt with no joint-batch payment AND a building user is still "personal" at this level (the
+// building-as-client case); the sub-tab filters use a broader rule so it lands in Διαχείριση.
 static std::string ReceiptKindSql(const std::string& idExpr) {
-    return "CASE WHEN EXISTS (SELECT 1 FROM allocations ka JOIN payments km ON km.id = ka.payment_id JOIN charges kc ON kc.id = ka.charge_id "
-           "WHERE km.receipt_id = " + idExpr + " AND kc.batch_id IN (SELECT batch_id FROM joint_ops)) THEN 'joint' ELSE 'personal' END";
+    return "CASE WHEN EXISTS (SELECT 1 FROM payments km WHERE km.receipt_id = " + idExpr + " AND km.batch_id IN (SELECT batch_id FROM joint_ops)) THEN 'joint' ELSE 'personal' END";
 }
 
 static Receipt ReadReceipt(sqlite3_stmt* st) {
@@ -3727,7 +3732,8 @@ PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
     if (f.minDue > 0) w.num(" AND p.amount_due >= ?", f.minDue);
     if (f.maxDue > 0) w.num(" AND p.amount_due <= ?", f.maxDue);
     if (f.joint == 1) w.where += " AND p.batch_id IN (SELECT batch_id FROM joint_ops)";
-    if (f.joint == 2) w.where += " AND (p.batch_id IS NULL OR p.batch_id NOT IN (SELECT batch_id FROM joint_ops))";
+    if (f.joint == 2) w.where += " AND (p.batch_id IS NULL OR (p.batch_id NOT IN (SELECT batch_id FROM joint_ops) AND p.batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL)))";
+    if (f.joint == 3) w.where += " AND (p.batch_id IN (SELECT batch_id FROM joint_ops) OR p.batch_id IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL))";
     if (f.jointOpId >= 0) w.num(" AND p.batch_id = (SELECT batch_id FROM joint_ops WHERE id = ?)", f.jointOpId);
     if (f.requireUser) w.where += " AND p.user_id IS NOT NULL";
     bool needNames = !f.text.empty() || !f.clientText.empty() || !f.serviceText.empty() || !f.buildingText.empty();
@@ -4452,6 +4458,18 @@ static std::string ReceiptWhere(const DataConn::ReceiptQuery& q, std::vector<std
              "OR instr(fold(COALESCE((SELECT full_name FROM users u WHERE u.id = r.user_id),'')), fold(?)) > 0)";
         binds.push_back(q.text); binds.push_back(q.text);
     }
+    if (q.kind == "managed") {
+        // Διαχείριση: the building paid (as a client) for an expense, OR a resident paid
+        // a joint charge. Both are represented by "money that belongs to a building's account".
+        w += " AND (r.user_id IN (SELECT id FROM users WHERE kind = 'building')"
+             " OR EXISTS (SELECT 1 FROM payments km WHERE km.receipt_id = r.id AND km.batch_id IN (SELECT batch_id FROM joint_ops)))";
+    }
+    if (q.kind == "clients") {
+        // Πελάτες: money received from a person/business client for their OWN purchase.
+        // Excluded: buildings and any receipt that has a joint-batch payment.
+        w += " AND r.user_id NOT IN (SELECT id FROM users WHERE kind = 'building')"
+             " AND NOT EXISTS (SELECT 1 FROM payments km WHERE km.receipt_id = r.id AND km.batch_id IN (SELECT batch_id FROM joint_ops))";
+    }
     const std::string covers = "SELECT 1 FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id WHERE m.receipt_id = r.id";
     std::string conds;
     for (auto& c : q.conds) {
@@ -4475,9 +4493,28 @@ namespace { std::string OrderBy(const SortSpec& sort, const std::vector<std::str
 
 std::vector<Receipt> SqliteConn::searchReceipts(const ReceiptQuery& q, int offset, int limit) {
     std::vector<std::string> binds;
+    std::vector<std::string> sortCols;
+    sortCols.push_back("r.series, r.number");
+    sortCols.push_back("r.issue_date");
+    if (q.kind == "managed") {
+        // Managed layout: 0=number, 1=date, 2=building, 3=recipient, 4=method, 5=references, 6=total, 7=status
+        sortCols.push_back("(SELECT COALESCE(b.address,'') FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id JOIN joint_ops o ON o.batch_id = c.batch_id JOIN buildings b ON b.id = o.building_id WHERE m.receipt_id = r.id LIMIT 1)");
+        sortCols.push_back("(SELECT fold(u.full_name) FROM users u WHERE u.id = r.user_id)");
+        sortCols.push_back("r.method");
+        sortCols.push_back("COALESCE(r.paper_ref, r.bank_ref, '')");
+        sortCols.push_back("r.total");
+        sortCols.push_back("r.status");
+    } else {
+        // Client / personal layout: 0=number, 1=date, 2=client, 3=method, 4=references, 5=total, 6=status, 7=Για
+        sortCols.push_back("(SELECT fold(u.full_name) FROM users u WHERE u.id = r.user_id)");
+        sortCols.push_back("r.method");
+        sortCols.push_back("COALESCE(r.paper_ref, r.bank_ref, '')");
+        sortCols.push_back("r.total");
+        sortCols.push_back("r.status");
+        sortCols.push_back(ReceiptKindSql("r.id"));
+    }
     std::string sql = std::string("SELECT ") + kReceiptCols + ", " + ReceiptKindSql("r.id") + " FROM receipts r" + ReceiptWhere(q, binds) +
-                      OrderBy(q.sort, {"r.series, r.number", "r.issue_date", "(SELECT fold(u.full_name) FROM users u WHERE u.id = r.user_id)", "r.method",
-                                           "COALESCE(r.paper_ref, r.bank_ref, '')", "r.total", "r.status", ReceiptKindSql("r.id")}, "r.issue_date DESC, r.id DESC") + " LIMIT ? OFFSET ?";
+                      OrderBy(q.sort, sortCols, "r.issue_date DESC, r.id DESC") + " LIMIT ? OFFSET ?";
     std::vector<Receipt> out;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }

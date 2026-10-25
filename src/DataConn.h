@@ -191,6 +191,7 @@ public:
         int status = 0;                   // 0 all, 1 issued, 2 void
         std::string number;               // substring of "A-123" / paper / bank reference / RF
         std::string text;                 // free text: number fields above OR the client's name (accent-insensitive)
+        std::string kind;                 // "" all, "joint" only, "personal" only
         SortSpec sort;                    // 0 number, 1 date, 2 client, 3 method, 4 references, 5 total, 6 status, 7 kind (personal / joint); empty = newest first
     };
     virtual std::vector<Receipt> searchReceipts(const ReceiptQuery& q, int offset, int limit) = 0;   // newest first
@@ -734,10 +735,10 @@ public:
                                                int userId, int serviceId,
                                                const std::string& status, const std::string& direction,
                                                int offset, int limit, const SortSpec& sort = {},
-                                               bool missingReceiptOnly = false) = 0;
+                                               bool missingReceiptOnly = false, int joint = 0) = 0;
     virtual int countPayments(const std::string& startDate, const std::string& endDate,
                                int userId, int serviceId,
                                const std::string& status, const std::string& direction,
-                               bool missingReceiptOnly = false) = 0;
+                               bool missingReceiptOnly = false, int joint = 0) = 0;
 
 };

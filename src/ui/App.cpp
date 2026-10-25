@@ -4328,7 +4328,7 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
     ImGui::EndTable();
 }
 
-static void DrawPaymentsScreen() {
+static void DrawPaymentsScreen(int jointFilter = 0) {
     ImGui::TextDisabled("Προβολή πληρωμών. Για νέα χρέωση: Υπηρεσίες → Χρέωση, ή Πακέτα → Χρέωση πακέτου.");
     ImGui::SameLine();
     if (ImGui::Button("Ανανέωση")) { g_paymentsPager.Reset(); }
@@ -4412,12 +4412,12 @@ static void DrawPaymentsScreen() {
                   g_payServiceFilter, statusStr.c_str(), dirStr.c_str(), g_paymentsPager.offset, g_paymentsPager.pageSize,
                   (int)missingReceiptOnly, sortKey.c_str());
     static Cached<std::pair<std::vector<Payment>, int>> pageCache;
-    const auto& pc = pageCache.get(pk, [&] {
+    const auto& pc = pageCache.get(std::string(pk) + "|" + std::to_string(jointFilter), [&] {
         return std::make_pair(
             g_app.conn->pagePayments(g_payStartDate, g_payEndDate, g_payUserFilter, g_payServiceFilter, statusStr, dirStr,
-                                     g_paymentsPager.offset, g_paymentsPager.pageSize, g_paymentsSort.keys, missingReceiptOnly),
+                                     g_paymentsPager.offset, g_paymentsPager.pageSize, g_paymentsSort.keys, missingReceiptOnly, jointFilter),
             g_app.conn->countPayments(g_payStartDate, g_payEndDate, g_payUserFilter, g_payServiceFilter, statusStr, dirStr,
-                                      missingReceiptOnly));
+                                      missingReceiptOnly, jointFilter));
     });
     const std::vector<Payment>& page = pc.first;
     g_paymentsPager.total = pc.second;
@@ -8408,7 +8408,7 @@ static TextBuf g_rcNumber;
 static int g_rcOffset = 0;
 static const int kRcPage = 50;
 
-static void DrawReceiptsScreen() {
+static void DrawReceiptsScreen(const char* kindFilter = "") {
     ImGui::TextDisabled("Οι αποδείξεις δεν αλλάζουν και δεν διαγράφονται. Ένα λάθος διορθώνεται με ακύρωση (με αιτιολογία) και νέα απόδειξη.");
     // ---------------- filters ----------------
     ImGui::BeginChild("rcfilters", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
@@ -8446,6 +8446,8 @@ static void DrawReceiptsScreen() {
     // ---------------- query (cached) ----------------
     DataConn::ReceiptQuery q;
     q.matchAll = true; q.fromDate = g_rcFrom; q.toDate = g_rcTo; q.status = g_rcStatus; q.number = g_rcNumber.str();
+    q.kind = kindFilter;
+    const bool managedView = (strcmp(kindFilter, "managed") == 0);
     auto cond = [&](DataConn::ReceiptCond::Field f, int id, const std::string& text = "") {
         DataConn::ReceiptCond rc; rc.field = f; rc.id = id; rc.text = text; q.conds.push_back(rc);
     };
@@ -8457,7 +8459,7 @@ static void DrawReceiptsScreen() {
     static GridState rcGrid;
     if (rcGrid.order.empty()) rcGrid.order = { 0, 1, 2, 7, 3, 4, 5, 6, 8 };
     q.sort = rcGrid.sort.keys;
-    std::string key = SortKeyStr(q.sort) + "#" + g_rcFrom + "|" + g_rcTo + "|" + std::to_string(g_rcStatus) + "|" + q.number + "|" +
+    std::string key = std::string(kindFilter) + "#" + SortKeyStr(q.sort) + "#" + g_rcFrom + "|" + g_rcTo + "|" + std::to_string(g_rcStatus) + "|" + q.number + "|" +
                       std::to_string(g_rcClient) + "|" + std::to_string(g_rcService) + "|" + std::to_string(g_rcPackage) + "|" +
                       std::to_string(g_rcBuilding) + "|" + std::to_string(g_rcMethod);
     static std::string lastKey;
@@ -8479,17 +8481,88 @@ static void DrawReceiptsScreen() {
     ImGui::SameLine();
     if (ImGui::SmallButton("►") && g_rcOffset + kRcPage < pg.count) g_rcOffset += kRcPage;
 
+    
+    
+    
+        // In the managed view, resolve each receipt's building and recipient once per page.
+    // - "Building" comes from the receipt's first joint-op charge, OR from the payor if the
+    //   payor is a building-as-client.
+    // - "Recipient" is the resident's name + apartment (found through residents.user_id or
+    //   residents.legacy_user_id — same resolution used elsewhere), or "(το κτίριο)" if the
+    //   payor is a building itself.
+    // This is what makes Διαχείριση unambiguous: you always see which building, and which
+    // resident (or that the building paid for itself).
+    struct RecInfo { std::string building, recipient; };
+    std::map<int, RecInfo> recInfo;
+    if (managedView) {
+        static Cached<std::map<int, RecInfo>> recInfoCache;
+        std::string infoKey;
+        for (auto& r : pg.rows) infoKey += std::to_string(r.id) + ",";
+        recInfo = recInfoCache.get(infoKey, [&] {
+            std::map<int, RecInfo> m;
+            for (auto& r : pg.rows) {
+                RecInfo x;
+                for (auto& l : g_app.conn->getReceiptLines(r.id)) {
+                    const Payment& ch = l.charge;
+                    if (x.building.empty()) {
+                        if (ch.joint_op_id > 0) {
+                            JointOp op = g_app.conn->getJointOpById(ch.joint_op_id);
+                            if (!op.building_address.empty()) x.building = op.building_address;
+                        }
+                        if (x.building.empty() && ch.user_id > 0) {
+                            User u = g_app.conn->getUserById(ch.user_id);
+                            if (u.kind == "building" && u.client_building_id > 0)
+                                x.building = g_app.conn->getBuildingById(u.client_building_id).address;
+                        }
+                    }
+                    if (x.recipient.empty() && ch.user_id > 0) {
+                        User u = g_app.conn->getUserById(ch.user_id);
+                        if (u.kind == "building") x.recipient = "(το κτίριο)";
+                        else {
+                            int resUser = g_app.conn->residentUserFor(ch.user_id);
+                            if (resUser > 0) {
+                                auto stays = g_app.conn->getResidentStays(resUser);
+                                if (!stays.empty())
+                                    x.recipient = stays.front().full_name + (stays.front().apartment.empty() ? "" : " · " + stays.front().apartment);
+                            }
+                            if (x.recipient.empty()) x.recipient = u.full_name;
+                        }
+                    }
+                    if (!x.building.empty() && !x.recipient.empty()) break;
+                }
+                m[r.id] = x;
+            }
+            return m;
+        });
+    }
+
+    static const ListColDef rcColsManaged[9] = {
+        { "Αριθμός",       ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
+        { "Ημ/νία",        ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
+        { "Πολυκατοικία",  ImGuiTableColumnFlags_WidthStretch, 1.8f,   true },
+        { "Αποδέκτης (ένοικος ή κτίριο)", ImGuiTableColumnFlags_WidthStretch, 2.0f, true },
+        { "Τρόπος",        ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
+        { "Αναφορές",      ImGuiTableColumnFlags_WidthStretch, 1.4f,   true },
+        { "Σύνολο",        ImGuiTableColumnFlags_WidthFixed,   100.0f, true },
+        { "Κατάσταση",     ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
+        { "",              ImGuiTableColumnFlags_WidthFixed,    80.0f, false } };
+    static const ListColDef rcColsClients[9] = {
+        { "Αριθμός",   ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
+        { "Ημ/νία",    ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
+        { "Πελάτης",   ImGuiTableColumnFlags_WidthStretch, 1.8f,   true },
+        { "Τρόπος",    ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
+        { "Αναφορές",  ImGuiTableColumnFlags_WidthFixed,   200.0f, true },
+        { "Σύνολο",    ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
+        { "Κατάσταση", ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
+        { "Για",       ImGuiTableColumnFlags_WidthFixed,   160.0f, true },
+        { "",          ImGuiTableColumnFlags_WidthFixed,    90.0f, false } };
+    const ListColDef* rcCols = managedView ? rcColsManaged : rcColsClients;
     if (ImGui::BeginTable("rctable", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        static const ListColDef rcCols[9] = {
-            { "Αριθμός", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },   { "Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },
-            { "Πελάτης", ImGuiTableColumnFlags_WidthFixed, 230.0f, true },   { "Τρόπος", ImGuiTableColumnFlags_WidthFixed, 150.0f, true },
-            { "Αναφορές", ImGuiTableColumnFlags_WidthFixed, 200.0f, true },  { "Σύνολο", ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
-            { "Κατάσταση", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },
-            { "Για", ImGuiTableColumnFlags_WidthFixed, 160.0f, true }, { "", ImGuiTableColumnFlags_WidthFixed, 90.0f, false } };
         ListSetupColumns(rcGrid.order, rcCols);
+        if (!managedView) ImGui::TableSetColumnEnabled(ListPos(rcGrid.order, 7), kindFilter[0] == 0);   // "Για" only when unfiltered
         ListHeaderRow(rcGrid.order, rcCols, rcGrid.sort, rcGrid.pager);
-        if (rcGrid.pager.offset != 0) { rcGrid.pager.Reset(); g_rcOffset = 0; }       // a new sort starts at the first page
+        if (rcGrid.pager.offset != 0) { rcGrid.pager.Reset(); g_rcOffset = 0; }
         auto P = [&](int c) { return ListPos(rcGrid.order, c); };
         for (auto& r : pg.rows) {
             bool isVoid = r.status == "void";
@@ -8498,18 +8571,34 @@ static void DrawReceiptsScreen() {
             ImGui::TableSetColumnIndex(P(0));
             if (ImGui::Selectable(ReceiptNo(r).c_str(), g_receiptViewId == r.id, ImGuiSelectableFlags_SpanAllColumns)) OpenReceiptView(r.id);
             ImGui::TableSetColumnIndex(P(1)); ImGui::TextUnformatted(DateGr(r.issue_date).c_str());
-            ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(r.user_id > 0 ? g_app.userName(r.user_id).c_str() : "—");
-            ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(ReceiptMethodName(r.method).c_str());
-            ImGui::TableSetColumnIndex(P(4));
-            std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref;
-            if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
-            ImGui::TextUnformatted(refs.c_str());
-            ImGui::TableSetColumnIndex(P(5)); ImGui::Text("%s", Eur(r.total).c_str());
-            ImGui::TableSetColumnIndex(P(6));
-            if (isVoid) ImGui::TextColored(kColOut, "ΑΚΥΡΩΜΕΝΗ");
-            else ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.50f, 1), "σε ισχύ");
-            ImGui::TableSetColumnIndex(P(7)); ImGui::TextUnformatted(r.kind == "joint" ? "Κοινόχρηστα" : "Προσωπική χρήση");
-            ImGui::TableSetColumnIndex(P(8)); if (ImGui::SmallButton("Προβολή")) OpenReceiptView(r.id);
+            if (managedView) {
+                const auto& x = recInfo[r.id];
+                ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(x.building.empty() ? "—" : x.building.c_str());
+                ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(x.recipient.empty() ? "—" : x.recipient.c_str());
+                ImGui::TableSetColumnIndex(P(4)); ImGui::TextUnformatted(ReceiptMethodName(r.method).c_str());
+                ImGui::TableSetColumnIndex(P(5));
+                std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref;
+                if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
+                ImGui::TextUnformatted(refs.c_str());
+                ImGui::TableSetColumnIndex(P(6)); ImGui::Text("%s", Eur(r.total).c_str());
+                ImGui::TableSetColumnIndex(P(7));
+                if (isVoid) ImGui::TextColored(kColOut, "ΑΚΥΡΩΜΕΝΗ");
+                else ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.50f, 1), "σε ισχύ");
+                ImGui::TableSetColumnIndex(P(8)); if (ImGui::SmallButton("Προβολή")) OpenReceiptView(r.id);
+            } else {
+                ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(r.user_id > 0 ? g_app.userName(r.user_id).c_str() : "—");
+                ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(ReceiptMethodName(r.method).c_str());
+                ImGui::TableSetColumnIndex(P(4));
+                std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref;
+                if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
+                ImGui::TextUnformatted(refs.c_str());
+                ImGui::TableSetColumnIndex(P(5)); ImGui::Text("%s", Eur(r.total).c_str());
+                ImGui::TableSetColumnIndex(P(6));
+                if (isVoid) ImGui::TextColored(kColOut, "ΑΚΥΡΩΜΕΝΗ");
+                else ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.50f, 1), "σε ισχύ");
+                if (ImGui::TableSetColumnIndex(P(7))) ImGui::TextUnformatted(r.kind == "joint" ? "Κοινόχρηστα" : "Προσωπική χρήση");
+                ImGui::TableSetColumnIndex(P(8)); if (ImGui::SmallButton("Προβολή")) OpenReceiptView(r.id);
+            }
             if (isVoid) ImGui::PopStyleColor();
             ImGui::PopID();
         }
@@ -10526,11 +10615,17 @@ static void DrawBillsPartners() {
     DrawPager(m.g.pager, "biloutpg");
 }
 
+static void DrawBillsManaged() {
+    ImGui::TextDisabled("Κοινόχρηστα που έχουμε χρεώσει στις πολυκατοικίες που διαχειριζόμαστε. «Άνοιγμα» δείχνει την κατανομή στους ενοίκους, τις πληρωμές και τα έξοδα κάθε ενέργειας.");
+    DrawJointOpsTable(-1, "bills_managed");
+}
+
 static void DrawBillsScreen() {
     ImGui::SetWindowFontScale(1.2f); ImGui::TextUnformatted("Χρεώσεις"); ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine(); ImGui::TextDisabled("  χρεώσαμε → οφείλεται → εισπράττουμε (όλο ή μέρος, κάθε φορά με απόδειξη) → εξοφλείται");
     if (ImGui::BeginTabBar("billtabs")) {
         if (ImGui::BeginTabItem("Πελάτες")) { DrawBillsClients(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Διαχείριση")) { DrawBillsManaged(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Συνεργάτες (κόστη μας)")) { DrawBillsPartners(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
@@ -12775,8 +12870,12 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                     if (ImGui::BeginTabItem("Πληρωμές")) {
                         g_ledgerTab = 1;
                         if (ImGui::BeginTabBar("paymain")) {
-                            if (ImGui::BeginTabItem("Πελάτες (όλες οι πληρωμές)")) {
-                                DrawPaymentsScreen();
+                            if (ImGui::BeginTabItem("Πελάτες")) {
+                                DrawPaymentsScreen(2);
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Διαχείριση")) {
+                                DrawPaymentsScreen(3);
                                 ImGui::EndTabItem();
                             }
                             if (ImGui::BeginTabItem("Συνεργάτες (κόστη μας)")) {
@@ -12790,17 +12889,23 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                     if (ImGui::BeginTabItem("Αποδείξεις")) {
                         g_ledgerTab = 2;
                         if (ImGui::BeginTabBar("rcmain")) {
-                            if (ImGui::BeginTabItem("Αποδείξεις είσπραξης")) {
+                            if (ImGui::BeginTabItem("Πελάτες")) {
                                 if (ImGui::Button("+ Νέα είσπραξη")) OpenRecordPayment(-1);
                                 ImGui::SameLine();
-                                DrawReceiptsScreen();
+                                DrawReceiptsScreen("clients");
                                 ImGui::EndTabItem();
                             }
-                            if (ImGui::BeginTabItem("Πληρωμές μας (συνεργάτες · #-1)")) {
+                            if (ImGui::BeginTabItem("Διαχείριση")) {
+                                if (ImGui::Button("+ Νέα είσπραξη")) OpenRecordPayment(-1);
+                                ImGui::SameLine();
+                                DrawReceiptsScreen("managed");
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Συνεργάτες (πληρωμές μας)")) {
                                 static std::string pf, pt; static ListModel<DataConn::PartnerJob> pm;
                                 ImGui::TextDisabled("Ό,τι πληρώσαμε εμείς: σε συνεργάτες, ή χωρίς καταχωρημένο συνεργάτη (#-1). «Άνοιγμα» δείχνει τη χρέωση και τις πληρωμές της.");
                                 if (DrawDateRange("rcpaydates", pf, pt)) pm.g.pager.Reset();
-                                DrawPartnerJobsModel("rcpay", 0, 0, pf, pt, pm, true, std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.4f));
+                                DrawPartnerJobsModel("rcpay", 0, 1, pf, pt, pm, true, std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.4f));
                                 ImGui::EndTabItem();
                             }
                             ImGui::EndTabBar();
