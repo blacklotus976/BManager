@@ -9538,8 +9538,8 @@ static void DrawPartnerJobsModel(const char* id, int partnerId, int kind, const 
 
 static void DrawPartnerProfile() {
     if (g_partnerProfileId == 0) return;
-    static int lastId = -1; static std::string from, to; static ListModel<DataConn::PartnerJob> mClients, mJoint; static std::string deleteMsg;
-    if (lastId != g_partnerProfileId) { lastId = g_partnerProfileId; from.clear(); to.clear(); mClients = ListModel<DataConn::PartnerJob>{}; mJoint = ListModel<DataConn::PartnerJob>{}; deleteMsg.clear(); }
+    static int lastId = -1; static std::string from, to; static ListModel<DataConn::PartnerJob> mClients; static std::string deleteMsg;
+    if (lastId != g_partnerProfileId) { lastId = g_partnerProfileId; from.clear(); to.clear(); mClients = ListModel<DataConn::PartnerJob>{}; deleteMsg.clear(); }
     struct Prof { Partner p; bool found = false; DataConn::PartnerStat st; std::string lastJob; };
     static Cached<Prof> cache;
     std::string key = std::to_string(g_partnerProfileId) + "|" + from + "|" + to + "|" + "stats";
@@ -9562,7 +9562,7 @@ static void DrawPartnerProfile() {
         if (!pf.p.afm.empty()) ImGui::TextDisabled("ΑΦΜ %s", pf.p.afm.c_str());
         if (!pf.p.notes.empty()) ImGui::TextWrapped("%s", pf.p.notes.c_str());
         ImGui::Spacing();
-        if (DrawDateRange("pprange", from, to)) { mClients.g.pager.Reset(); mJoint.g.pager.Reset(); }
+        if (DrawDateRange("pprange", from, to)) { mClients.g.pager.Reset(); }
         ImGui::Spacing();
         if (ImGui::BeginTable("pptiles", 5, ImGuiTableFlags_SizingStretchSame)) {
             ImGui::TableNextRow();
@@ -9578,12 +9578,9 @@ static void DrawPartnerProfile() {
                 StatTile(tiles[i].l, tiles[i].v, tiles[i].c, tiles[i].s.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 96)); ImGui::PopID(); }
             ImGui::EndTable();
         }
-        SectionTitle("Δουλειές σε υπηρεσίες πελατών");
-        ImGui::TextDisabled("«Άνοιγμα» ανοίγει τη χρέωση του πελάτη. Περάστε το ποντίκι πάνω από μια γραμμή για να δείτε τις πληρωμές της.");
-        DrawPartnerJobsModel("pjc", g_partnerProfileId, 1, from, to, mClients, false, 230.0f);
-        SectionTitle("Δουλειές σε κοινόχρηστα");
-        ImGui::TextDisabled("«Άνοιγμα» ανοίγει το κοινόχρηστο με τους ενοίκους και τις πληρωμές του.");
-        DrawPartnerJobsModel("pjj", g_partnerProfileId, 2, from, to, mJoint, false, 230.0f);
+        SectionTitle("Δουλειές");
+        ImGui::TextDisabled("Όλες οι δουλειές του συνεργάτη. «Άνοιγμα» ανοίγει τη χρέωση. Περάστε το ποντίκι πάνω από μια γραμμή για να δείτε τις πληρωμές της.");
+        DrawPartnerJobsModel("pjall", g_partnerProfileId, 1, from, to, mClients, false, 470.0f);
 
         // the very end: edit and delete this partner
         if (pf.p.id > 0) {
@@ -9655,20 +9652,10 @@ static void DrawPartnersScreen() {
     ImGui::EndChild();
 
     SectionTitle("Πρόσφατες ενέργειες");
-    static ListModel<DataConn::PartnerJob> dummyReset;
+    ImGui::TextDisabled("Ό,τι έχουμε πληρώσει σε συνεργάτες. Μία γραμμή ανά κόστος · «Άνοιγμα»: η αντίστοιχη χρέωση · κύλιση για τις πληρωμές της.");
     if (DrawDateRange("recrange", rfrom, rto)) { rg.pager.Reset(); }
-    static ListModel<DataConn::PartnerJob> mrClients, mrJoint;
-    if (ImGui::BeginTabBar("recenttabs")) {
-        if (ImGui::BeginTabItem("Σε υπηρεσίες πελατών")) {
-            DrawPartnerJobsModel("recentc", 0, 1, rfrom, rto, mrClients, true, std::max(100.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.8f));
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Σε κοινόχρηστα")) {
-            DrawPartnerJobsModel("recentj", 0, 2, rfrom, rto, mrJoint, true, std::max(100.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.8f));
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
+    static ListModel<DataConn::PartnerJob> mrClients;
+    DrawPartnerJobsModel("recentc", 0, 1, rfrom, rto, mrClients, true, std::max(100.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.8f));
 
     DrawPartnerProfile();
     DrawPartnerDialogs();
@@ -9683,8 +9670,8 @@ static void DrawOwedWindow() {
     if (!ImGui::Begin("Οφειλόμενα: όσα οφείλουμε", &g_showOwed)) { ImGui::End(); return; }
     m.Init(PJ_COUNT, {{PJ_DATE, true}}, 20);
     const auto& pg = m.Load("owed",
-        [&](const SortSpec& s, int off, int lim) { return g_app.conn->partnerJobs(0, "", "", PartnerJobSort(s), off, lim, 0, true); },
-        [&] { return g_app.conn->countPartnerJobs(0, "", "", 0, true); });
+        [&](const SortSpec& s, int off, int lim) { return g_app.conn->partnerJobs(0, "", "", PartnerJobSort(s), off, lim, 1, true); },
+        [&] { return g_app.conn->countPartnerJobs(0, "", "", 1, true); });
     double total = g_app.conn->cashNow().owedOut;
     ImGui::TextColored(kColWeOwe, "Σύνολο οφειλόμενων: %s", Eur(total).c_str()); ImGui::SameLine(); ImGui::TextDisabled("· %d γραμμές", pg.count);
     ImGui::TextDisabled("Κάθε γραμμή είναι κόστος που δεν έχουμε πληρώσει (ή πληρώσαμε μερικώς). «Πληρωμή» πληρώνει όλο ή μέρος· «Άνοιγμα» δείχνει τη χρέωση.");
@@ -9799,8 +9786,8 @@ static void DrawHomeWeOwe(float height) {
     struct Pg { std::vector<DataConn::PartnerJob> rows; int count = 0; };
     static Cached<Pg> pc;
     const Pg& pg = pc.get(std::to_string(pager.offset) + "|" + std::to_string(pager.pageSize), [&] {
-        Pg p; p.count = g_app.conn->countPartnerJobs(0, "", "", 0, true);
-        p.rows = g_app.conn->partnerJobs(0, "", "", {{6, false}}, pager.offset, pager.pageSize, 0, true); return p; });
+        Pg p; p.count = g_app.conn->countPartnerJobs(0, "", "", 1, true);
+        p.rows = g_app.conn->partnerJobs(0, "", "", {{6, false}}, pager.offset, pager.pageSize, 1, true); return p; });
     pager.total = pg.count;
     if (pg.count == 0) { ImGui::TextColored(kColIn, "Δεν χρωστάμε τίποτα σε κανέναν."); return; }
     ImGui::BeginChild("##weowe", ImVec2(0, height), ImGuiChildFlags_None);
@@ -10236,11 +10223,29 @@ static void DrawHomeScreen() {
     static Cached<Fees> fc;
     const Fees& fe = fc.get(from + "|" + to, [&] { return feesOf(from, to); });
     
+    // OWINGS ARE ALWAYS "NOW", NEVER PERIOD-FILTERED.
+    // A bill charged 6 months ago that is still unpaid is still owed today; the period
+    // filter must not hide it. Only money that actually moved (paid in / paid out)
+    // belongs to the period — that is the "profit/cost of the period" side, already
+    // covered by the first two tiles. Open debts survive every period.
+    struct Owings { double owedToUs = 0, weOwe = 0; };
+    static Cached<Owings> owingsCache;
+    const Owings& ow = owingsCache.get("", [&] {
+        Owings o;
+        DataConn::PaymentFilter f;
+        f.status = 1;         // resolved charges only (exclude scheduled / future)
+        f.owed = 2;           // still owed (balance > 0.005)
+        f.requireUser = true; // exclude joint-cost lines (user_id=NULL); only client and building-as-client costs
+        auto t = g_app.conn->paymentTotals(f);
+        o.owedToUs = t.owedIn;
+        o.weOwe = t.owedOut;
+        return o;
+    });
+    
     const double gotPaidP = hd.cash.moneyIn;
     const double paidOutP = hd.cash.moneyOut;
-    // All figures strictly for the selected period:
-    const double owedToUs = FromCents(ToCents(hd.cl.owed) + ToCents(hd.bd.owed) + ToCents(fe.charged) - ToCents(fe.collected));
-    const double weOwe = FromCents(ToCents(MoneySub(hd.cl.cost, hd.cl.costPaid)) + ToCents(MoneySub(hd.bd.cost, hd.bd.costPaid)));
+    const double owedToUs = ow.owedToUs;
+    const double weOwe = ow.weOwe;
     HomeSection("Τα οικονομικά μας", periodTitle.c_str());
     if (ImGui::BeginTable("homemoney", 4, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
@@ -10249,13 +10254,11 @@ static void DrawHomeScreen() {
         ImGui::TableNextColumn(); HomeTile("Πληρώσαμε (περίοδος)", Eur(paidOutP), kColOut, "σε συνεργάτες για τις δουλειές μας",
                                            "Ό,τι πληρώσαμε σε συνεργάτες για δουλειές της περιόδου.");
         
-        double periodCharged = FromCents(ToCents(hd.cl.charged) + ToCents(hd.bd.charged) + ToCents(fe.charged));
-        ImGui::TableNextColumn(); if (HomeTile("Μας χρωστάνε (περίοδος)", Eur(owedToUs), kColOwed, "χρεώσαμε " + Eur(periodCharged) + " - εισπράξαμε " + Eur(gotPaidP),
-                                               "Ό,τι χρεώσαμε στη περίοδο και δεν έχει εισπραχθεί ακόμα.")) g_page = PAGE_SCORING;
+        ImGui::TableNextColumn(); if (HomeTile("Μας χρωστάνε (όλα τα ανοιχτά)", Eur(owedToUs), kColOwed, "όλες οι ημερομηνίες · ανοιχτές οφειλές",
+                                               "Όλα τα ανοιχτά τιμολόγια που δεν έχουν εξοφληθεί ακόμα — ανεξάρτητα από την περίοδο. Όταν πληρωθούν, εμφανίζονται στα έσοδα της περιόδου πληρωμής.")) g_page = PAGE_SCORING;
                                                
-        double periodCost = FromCents(ToCents(hd.cl.cost) + ToCents(hd.bd.cost));
-        ImGui::TableNextColumn(); if (HomeTile("Χρωστάμε (περίοδος)", Eur(weOwe), kColWeOwe, "κόστος " + Eur(periodCost) + " - πληρώσαμε " + Eur(paidOutP),
-                                               "Ό,τι οφείλουμε σε συνεργάτες για δουλειές της περιόδου. Κλικ: η λίστα.")) g_showOwed = true;
+        ImGui::TableNextColumn(); if (HomeTile("Χρωστάμε (όλα τα ανοιχτά)", Eur(weOwe), kColWeOwe, "όλες οι ημερομηνίες · ανοιχτές οφειλές",
+                                               "Όλα τα ανοιχτά κόστη προς συνεργάτες — ανεξάρτητα από την περίοδο. Κλικ: η λίστα.")) g_showOwed = true;
         ImGui::EndTable();
     }
     {
@@ -10273,10 +10276,10 @@ static void DrawHomeScreen() {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ό,τι έχει μπει μείον ό,τι έχει βγει για την επιλεγμένη περίοδο.");
             ImGui::TableNextColumn();
             StatTile("Αν πληρώσουμε όσα χρωστάμε", Eur(fundPayAll), fundPayAll >= 0 ? kColIn : kColOut, ("ταμείο - " + Eur(weOwe)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 96));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου - όσα χρωστάμε για τη περίοδο.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου - όλα τα ανοιχτά που χρωστάμε σήμερα (όλες οι ημερομηνίες).");
             ImGui::TableNextColumn();
             StatTile("Αν μας πληρώσουν όσα μας χρωστάνε", Eur(fundCollectAll), fundCollectAll >= 0 ? kColIn : kColOut, ("ταμείο + " + Eur(owedToUs)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 96));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου + όσα μας χρωστάνε για τη περίοδο.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου + όλα τα ανοιχτά που μας χρωστάνε σήμερα (όλες οι ημερομηνίες).");
             ImGui::TableNextColumn();
             StatTile("Αν τακτοποιηθούν όλα", Eur(fundEverything), fundEverything >= 0 ? kColIn : kColOut, "ταμείο + οφειλές - οφειλόμενα", ImVec2(ImGui::GetContentRegionAvail().x, 96));
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου + μας χρωστάνε - χρωστάμε: όλα εξοφλημένα.");
@@ -10492,8 +10495,8 @@ static void DrawBillsPartners() {
     const auto& pg = m.Load(key,
         [&](const SortSpec& s, int off, int lim) {
             return g_app.conn->partnerJobs(partner, from, to, MapSort(s, {{BP_DATE, 0}, {BP_PARTNER, 1}, {BP_WHAT, 2}, {BP_FOR, 3}, {BP_COST, 4}, {BP_PAID, 5}, {BP_OWE, 6}}),
-                                           off, lim, 0, owedOnly); },
-        [&] { return g_app.conn->countPartnerJobs(partner, from, to, 0, owedOnly); });
+                                           off, lim, 1, owedOnly); },
+        [&] { return g_app.conn->countPartnerJobs(partner, from, to, 1, owedOnly); });
     ImGui::Text("%d κόστη", pg.count); ImGui::SameLine();
     ImGui::TextColored(kColWeOwe, "· χρωστάμε συνολικά %s", Eur(g_app.conn->cashNow().owedOut).c_str());
     ImGui::SameLine(); ImGui::TextDisabled("  (κλικ στον τίτλο στήλης: ταξινόμηση · σύρσιμο: μετακίνηση)");
@@ -12586,12 +12589,19 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
     const char* glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);   // let the OS scale the window frame on HiDPI
 
     GLFWwindow* window = glfwCreateWindow(1400, 900, "PropertyManager", nullptr, nullptr);
     g_glfwWindow = window;
     if (!window) return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+
+    // Read the real DPI scale from the primary monitor (Windows: 1.0 = 100%, 1.25 = 125%, 1.5 = 150%, 2.0 = 200%).
+    // The same scale is used for the font AND the style paddings so the whole UI grows together.
+    float dpiX = 1.0f, dpiY = 1.0f;
+    glfwGetMonitorContentScale(glfwGetPrimaryMonitor(), &dpiX, &dpiY);
+    const float dpiScale = std::max(1.0f, std::max(dpiX, dpiY));
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -12713,12 +12723,17 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     };
     ImFont* greekFont = nullptr;
+    const float baseFontPx = 18.0f * dpiScale;   // 18 at 100%, 22.5 at 125%, 27 at 150%, 36 at 200%
     for (const char* f : kFontCandidates) {
         if (!std::ifstream(f).good()) continue;
-        greekFont = io.Fonts->AddFontFromFileTTF(f, 18.0f, &fontCfg, greekRanges);
+        greekFont = io.Fonts->AddFontFromFileTTF(f, baseFontPx, &fontCfg, greekRanges);
         if (greekFont) break;
     }
     if (greekFont) io.FontDefault = greekFont;
+
+    // Scale every padding, border, rounding, scrollbar and item-spacing by the same factor
+    // so the whole UI grows proportionally, not just the text.
+    ImGui::GetStyle().ScaleAllSizes(dpiScale);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     glfwSetDropCallback(window, OnFilesDropped);      // drag & drop files onto «Συνημμένα» panels
@@ -12759,7 +12774,17 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                     }
                     if (ImGui::BeginTabItem("Πληρωμές")) {
                         g_ledgerTab = 1;
-                        DrawPaymentsScreen();
+                        if (ImGui::BeginTabBar("paymain")) {
+                            if (ImGui::BeginTabItem("Πελάτες (όλες οι πληρωμές)")) {
+                                DrawPaymentsScreen();
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Συνεργάτες (κόστη μας)")) {
+                                DrawBillsPartners();
+                                ImGui::EndTabItem();
+                            }
+                            ImGui::EndTabBar();
+                        }
                         ImGui::EndTabItem();
                     }
                     if (ImGui::BeginTabItem("Αποδείξεις")) {

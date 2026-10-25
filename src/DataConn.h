@@ -250,6 +250,7 @@ public:
         double minDue = 0.0, maxDue = 0.0;   // amount_due bounds, 0 = none
         int joint = 0;                       // 0 any, 1 only shares of joint charges (κοινόχρηστα), 2 only the client's own charges
         int jointOpId = -1;                  // only the lines of this joint charge
+        bool requireUser = false;            // only charges with a client (excludes joint-cost lines with user_id=NULL)
         // Accent/case-insensitive substring filters (same matching as the search screen). `text` matches any of
         // client, service, notes, status, date, client's building address.
         std::string text, clientText, serviceText, notesText, buildingText;
