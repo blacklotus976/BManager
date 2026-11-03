@@ -1,4 +1,4 @@
-﻿#include <tuple>
+#include <tuple>
 #include "SqliteConn.h"
 #include "ErrorLog.h"
 #include "Platform.h"
@@ -5318,7 +5318,7 @@ DataConn::ChargeEconomics SqliteConn::chargeEconomics(int chargeId) {
     }
     if (idList.empty()) return e;
     // the same SELECT as the partner jobs, limited to those lines
-    std::string sql = PartnerJobSelect() + " WHERE c.direction = 'out' AND c.user_id IS NOT NULL AND c.id IN (" + idList + ") ORDER BY c.id";
+    std::string sql = PartnerJobSelect() + " WHERE c.direction = 'out' AND c.id IN (" + idList + ") ORDER BY c.id";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
         while (sqlite3_step(st) == SQLITE_ROW) e.costs.push_back(ReadPartnerJob(st));
         sqlite3_finalize(st);
@@ -5395,7 +5395,7 @@ int SqliteConn::countPartnerJobs(int partnerId, const std::string& fromDate, con
     sqlite3_prepare_v2(db, (std::string("SELECT COUNT(*) FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id "
                            "LEFT JOIN (SELECT CAST(json_extract(o.params_json,'$.cost_batch') AS INTEGER) AS cb, o.id AS opid FROM joint_ops o WHERE json_extract(o.params_json,'$.cost_batch') IS NOT NULL) jo ON jo.cb = c.batch_id "
                            "WHERE c.direction = 'out' AND ")
-                           + (kind == 2 ? "" : "c.user_id IS NOT NULL AND ")
+                           + std::string("")
                            + "(?1 = 0 OR COALESCE(pc.partner_id, -1) = ?1) "
                            "AND (?2 = '' OR c.pay_date >= ?2) AND (?3 = '' OR c.pay_date <= ?3) AND (?4 = 0 OR (?4 = 1 AND jo.opid IS NULL) OR (?4 = 2 AND jo.opid IS NOT NULL))" + (owedOnly ? " AND c.balance > 0.005" : "")).c_str(), -1, &st, nullptr);
     sqlite3_bind_int(st, 4, kind);
@@ -5413,7 +5413,7 @@ std::vector<DataConn::PartnerStat> SqliteConn::partnerStats(const std::string& f
         "TOTAL(CASE WHEN c.id IS NOT NULL" + rng + " THEN " + C("c.amount_due") + " END), "
         "TOTAL(CASE WHEN c.id IS NOT NULL" + rng + " THEN " + C("c.amount_paid") + " END), "
         "TOTAL(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " END), MAX(c.pay_date) "
-        "FROM partners p LEFT JOIN partner_costs pc ON pc.partner_id = p.id LEFT JOIN charges c ON c.id = pc.charge_id AND c.user_id IS NOT NULL "
+        "FROM partners p LEFT JOIN partner_costs pc ON pc.partner_id = p.id LEFT JOIN charges c ON c.id = pc.charge_id "
         "WHERE " + NotHiddenSql("partner", "p.id") + " GROUP BY p.id ORDER BY p.active DESC, fold(p.name)";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5526,11 +5526,11 @@ std::vector<DataConn::PartnerRow> SqliteConn::pagePartnerRows(const std::string&
     std::string sql = std::string("SELECT * FROM ("
         "SELECT p.id AS pid, p.name AS pname, COALESCE(p.trade,'') AS ptrade, COALESCE(p.phone,'') AS pphone, COALESCE(p.email,'') AS pemail, COALESCE(p.afm,'') AS pafm, "
         "       COALESCE(p.notes,'') AS pnotes, p.active AS pactive, COUNT(c.id) AS jobs, ") + owed + " AS owedc, COALESCE(MAX(c.pay_date),'') AS lastj "
-        "FROM partners p LEFT JOIN partner_costs pc ON pc.partner_id = p.id LEFT JOIN charges c ON c.id = pc.charge_id AND c.user_id IS NOT NULL "
+        "FROM partners p LEFT JOIN partner_costs pc ON pc.partner_id = p.id LEFT JOIN charges c ON c.id = pc.charge_id "
         "WHERE " + NotHiddenSql("partner", "p.id") + " GROUP BY p.id "
         "UNION ALL "
         "SELECT -1, '#-1 Χωρίς συνεργάτη', 'πληρωμές χωρίς καταχωρημένο συνεργάτη', '', '', '', '', 1, COUNT(*), " + owed + ", COALESCE(MAX(c.pay_date),'') "
-        "FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id WHERE c.direction = 'out' AND c.user_id IS NOT NULL AND pc.charge_id IS NULL HAVING COUNT(*) > 0"
+        "FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id WHERE c.direction = 'out' AND pc.charge_id IS NULL HAVING COUNT(*) > 0"
         ") WHERE (?1 = '' OR instr(fold(pname || ' ' || ptrade || ' ' || pphone || ' ' || pemail || ' ' || pnotes), fold(?1)) > 0) " +
         OrderBy(sort, {"fold(pname)", "fold(ptrade)", "pphone", "fold(pemail)", "jobs", "owedc", "lastj"}, "fold(pname), pid") + " LIMIT ?2 OFFSET ?3";
     sqlite3_stmt* st = nullptr;

@@ -4531,7 +4531,7 @@ static void DrawPayOwnerPickPopup() {
 // overflows when the containing window gets narrow -- the tile stays legible
 // at every size, React-flex-style.
 static void StatTile(const char* label, const std::string& value, ImVec4 accent, const char* sub, ImVec2 size) {
-    BeginCard(label, size);
+    BeginCard(label, size, true);          // a tile never scrolls inside
     float availW = ImGui::GetContentRegionAvail().x;
 
     // Label: shrink font if it would overflow.
@@ -4555,7 +4555,7 @@ static void StatTile(const char* label, const std::string& value, ImVec4 accent,
         ImGui::PopStyleColor();
     }
 
-    if (sub && sub[0]) ImGui::TextDisabled("%s", sub);
+    if (sub && sub[0]) { ImGui::PushTextWrapPos(0.0f); ImGui::TextDisabled("%s", sub); ImGui::PopTextWrapPos(); }      // long notes wrap instead of being cut
     EndCard();
 }
 
@@ -8456,7 +8456,7 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
     if (g_rcPackage > 0)  cond(DataConn::ReceiptCond::Field::Package, g_rcPackage);
     if (g_rcBuilding > 0) cond(DataConn::ReceiptCond::Field::Building, g_rcBuilding);
     if (g_rcMethod >= 0)  cond(DataConn::ReceiptCond::Field::Method, -1, kReceiptMethodCodes[g_rcMethod]);
-    static GridState rcGrid;
+    static GridState rcGrid;l
     if (rcGrid.order.empty()) rcGrid.order = { 0, 1, 2, 7, 3, 4, 5, 6, 8 };
     q.sort = rcGrid.sort.keys;
     std::string key = std::string(kindFilter) + "#" + SortKeyStr(q.sort) + "#" + g_rcFrom + "|" + g_rcTo + "|" + std::to_string(g_rcStatus) + "|" + q.number + "|" +
@@ -10668,7 +10668,7 @@ static void DrawFundTiles(const BuildingFund& f) {
     double owe = MoneySub(f.charged, f.collected), toPay = MoneySub(f.cost, f.costPaid), held = MoneySub(f.collected, f.costPaid);
     if (ImGui::BeginTable("fundtiles", 3, ImGuiTableFlags_SizingStretchSame)) {
         auto tile = [](const char* l, double v, ImVec4 c, const std::string& sub, const char* tip) {
-            ImGui::TableNextColumn(); StatTile(l, Eur(v), c, sub.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 86));
+            ImGui::TableNextColumn(); StatTile(l, Eur(v), c, sub.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 128));
             if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
         };
         ImGui::TableNextRow();
@@ -11895,6 +11895,7 @@ static void DrawMonthlyTab(int bid) {
 
     // ---- every resident: a group of columns per expense and funding; expenses: whose part (no debt), fundings: debt
     SectionTitle("Ανά ένοικο");
+    ImGui::TextDisabled("Ο πίνακας είναι πλάγιος: ένα γκρουπ στηλών ανά ενέργεια. Σύρετε τη μπάρα κάτω από τον πίνακα ή κρατήστε Shift και γυρίστε τον τροχό.");
     if (R.people.empty()) { ImGui::TextDisabled("Κανένας ένοικος και καμία χρέωση αυτόν τον μήνα."); return; }
     std::map<std::tuple<int, int, int>, const DataConn::MonthCell*> cell;
     for (auto& c : R.cells) cell[{c.person, c.apartment_id, c.op}] = &c;
@@ -12608,12 +12609,13 @@ static void DrawManagedList() {
     enum { MB_CODE, MB_ADDR, MB_AFM, MB_PHONE, MB_EMAIL, MB_SPECIAL, MB_APTS, MB_FUND, MB_OWED, MB_ACT, MB_COUNT };
     static const ListColDef cols[MB_COUNT] = {
         { "ΚΩΔ", ImGuiTableColumnFlags_WidthFixed, 60.0f, true },             { "ΔΙΕΥΘΥΝΣΗ", ImGuiTableColumnFlags_WidthFixed, 220.0f, true },
-        { "ΑΦΜ", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },             { "ΤΗΛ ΔΙΑΧΕΙΡΙΣΤΗ", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },
+        { "ΑΦΜ", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },             { "ΤΗΛΕΦΩΝΟ", ImGuiTableColumnFlags_WidthFixed, 120.0f, true },
         { "EMAIL", ImGuiTableColumnFlags_WidthFixed, 180.0f, true },           { "ΕΙΔ.ΚΩΔ", ImGuiTableColumnFlags_WidthFixed, 90.0f, true },
         { "ΔΙΑΜΕΡ.", ImGuiTableColumnFlags_WidthFixed, 75.0f, true },          { "ΤΑΜΕΙΟ", ImGuiTableColumnFlags_WidthFixed, 105.0f, true },
-        { "ΧΡΩΣΤΑΝΕ ΕΝΟΙΚΟΙ", ImGuiTableColumnFlags_WidthFixed, 135.0f, true }, { "", ImGuiTableColumnFlags_WidthFixed, 80.0f, false } };
+        { "ΟΦΕΙΛΟΜΕΝΑ", ImGuiTableColumnFlags_WidthFixed, 125.0f, true }, { "", ImGuiTableColumnFlags_WidthFixed, 80.0f, false } };
     static ListModel<DataConn::ManagedRow> mdl;
     mdl.Init(MB_COUNT, {{MB_ADDR, true}}, 20);
+    { static bool ordered = false; if (!ordered && mdl.g.order.size() == MB_COUNT) { mdl.g.order = { MB_ADDR, MB_FUND, MB_OWED, MB_APTS, MB_AFM, MB_PHONE, MB_EMAIL, MB_SPECIAL, MB_CODE, MB_ACT }; ordered = true; } }   // the money first
     if (ch) mdl.g.pager.Reset();
     const std::string text = q;
     const auto& pg = mdl.Load(text,
@@ -12623,9 +12625,12 @@ static void DrawManagedList() {
     if (pg.count == 0) ImGui::TextDisabled(managed.empty() ? "Καμία ακόμα. «+ Πολυκατοικία σε διαχείριση» για να προσθέσετε." : "Κανένα αποτέλεσμα.");
     else {
         float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
-        if (ImGui::BeginTable("mglist", MB_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+        if (ImGui::BeginTable("mglist", MB_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable, ImVec2(0, h))) {
             ImGui::TableSetupScrollFreeze(1, 1);
             ListSetupColumns(mdl.g.order, cols);
+            { bool anyPhone = false, anyEmail = false, anySpecial = false;      // columns nobody filled in take no room
+              for (auto& r : pg.rows) { anyPhone |= !r.phone.empty(); anyEmail |= !r.email.empty(); anySpecial |= !r.special_code.empty(); }
+              ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, MB_PHONE), anyPhone); ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, MB_EMAIL), anyEmail); ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, MB_SPECIAL), anySpecial); }
             ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager);
             auto P = [&](int c) { return ListPos(mdl.g.order, c); };
             for (auto& r : pg.rows) {
@@ -12688,6 +12693,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
 
     GLFWwindow* window = glfwCreateWindow(1400, 900, "PropertyManager", nullptr, nullptr);
     g_glfwWindow = window;
+    glfwSetWindowSizeLimits(window, 1100, 700, GLFW_DONT_CARE, GLFW_DONT_CARE);      // small enough to fit a laptop, big enough that the tables never crumple
     if (!window) return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -12713,8 +12719,8 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         style.ScrollbarRounding = 8.0f;
         style.GrabRounding = 4.0f;
         style.TabRounding = 7.0f;
-        style.ScrollbarSize = 13.0f;
-        style.GrabMinSize = 11.0f;
+        style.ScrollbarSize = 18.0f;                // wide enough to grab with the mouse
+        style.GrabMinSize = 28.0f;                  // (also the grab of sliders and of the scrollbars)
         style.TabBarBorderSize = 1.0f;
         style.SeparatorTextBorderSize = 2.0f;
         style.WindowTitleAlign = ImVec2(0.02f, 0.5f);
@@ -12740,10 +12746,12 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         colors[ImGuiCol_TitleBgCollapsed]   = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
         colors[ImGuiCol_MenuBarBg]          = ImVec4(0.12f, 0.12f, 0.15f, 1.00f);
         colors[ImGuiCol_ScrollbarBg]        = ImVec4(0.09f, 0.09f, 0.11f, 0.60f);
-        colors[ImGuiCol_ScrollbarGrab]      = ImVec4(0.30f, 0.32f, 0.40f, 1.00f);
-        colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.38f, 0.41f, 0.51f, 1.00f);
+        colors[ImGuiCol_ScrollbarGrab]      = ImVec4(0.36f, 0.45f, 0.58f, 1.00f);
+        colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.46f, 0.62f, 0.80f, 1.00f);
         colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.24f, 0.55f, 0.75f, 1.00f);
         colors[ImGuiCol_CheckMark]          = ImVec4(0.30f, 0.72f, 0.85f, 1.00f);
+        colors[ImGuiCol_TextDisabled]       = ImVec4(0.62f, 0.66f, 0.74f, 1.00f);       // hints and notes: readable, still quieter than normal text
+        colors[ImGuiCol_TextSelectedBg]     = ImVec4(0.24f, 0.55f, 0.75f, 0.45f);
         colors[ImGuiCol_SliderGrab]         = ImVec4(0.28f, 0.62f, 0.80f, 1.00f);
         colors[ImGuiCol_SliderGrabActive]   = ImVec4(0.32f, 0.70f, 0.90f, 1.00f);
         colors[ImGuiCol_Button]             = ImVec4(0.19f, 0.34f, 0.44f, 0.85f);
@@ -12769,7 +12777,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         colors[ImGuiCol_TableBorderStrong]  = ImVec4(0.28f, 0.29f, 0.35f, 1.00f);
         colors[ImGuiCol_TableBorderLight]   = ImVec4(0.22f, 0.23f, 0.28f, 1.00f);
         colors[ImGuiCol_TableRowBg]         = ImVec4(1, 1, 1, 0.00f);
-        colors[ImGuiCol_TableRowBgAlt]      = ImVec4(1, 1, 1, 0.035f);
+        colors[ImGuiCol_TableRowBgAlt]      = ImVec4(1, 1, 1, 0.05f);       // clearer stripes: easier to follow a row across
         colors[ImGuiCol_Text]               = ImVec4(0.90f, 0.92f, 0.96f, 1.00f);
         colors[ImGuiCol_TextDisabled]       = ImVec4(0.52f, 0.56f, 0.64f, 1.00f);
         colors[ImGuiCol_TabSelectedOverline] = ImVec4(0.45f, 0.88f, 1.00f, 1.00f);
