@@ -59,7 +59,8 @@ static std::string NotHiddenSql(const char* entity, const std::string& idExpr);
 static const char* kUserSelect =
     "SELECT u.id, u.full_name, u.phone, u.special_code, u.created_at, u.apartment_id, "
     "       a.label, COALESCE(b.id, cb.id), COALESCE(b.address, cb.address), COALESCE(b.area, cb.area), COALESCE(b.postal_code, cb.postal_code), "
-    "       COALESCE(u.kind, 'person'), COALESCE(u.email, ''), COALESCE(u.afm, ''), COALESCE(u.client_building_id, -1), COALESCE(u.resident, 0) "
+    "       COALESCE(u.kind, 'person'), COALESCE(u.email, ''), COALESCE(u.afm, ''), COALESCE(u.client_building_id, -1), COALESCE(u.resident, 0), "
+    "       COALESCE(u.code, ''), COALESCE(u.extra_json, ''), COALESCE(u.manager_name, '') "
     "FROM users u "
     "LEFT JOIN apartments a ON a.id = u.apartment_id "
     "LEFT JOIN buildings  b ON b.id = a.building_id "
@@ -83,6 +84,9 @@ static User MapUserRow(sqlite3_stmt* s) {
     u.afm          = ColText(s, 13);
     u.client_building_id = sqlite3_column_int(s, 14);
     u.resident     = sqlite3_column_int(s, 15) != 0;
+    u.code         = ColText(s, 16);
+    u.extra_json   = ColText(s, 17);
+    u.manager_name = ColText(s, 18);
     return u;
 }
 
@@ -105,7 +109,7 @@ static std::string NormalizeDirection(const char* raw) {
 // column order (they used SELECT * with hard-coded positions). Timestamps are stored UTC and returned in
 // local time; the date is one ISO column split back into the parts the UI uses.
 static const char* kPaymentCols =
-    "p.id, p.service_id, p.user_id, p.apartment_id, p.pay_date, p.amount_due, p.amount_paid, p.balance, "
+    "p.id, p.service_id, p.user_id, p.apartment_id, p.charge_date, p.amount_due, p.amount_paid, p.balance, "
     "p.status, p.direction, p.notes, COALESCE(p.resolution_date,''), "
     "COALESCE(datetime(p.resolved_at,'localtime'),''), COALESCE(datetime(p.created_at,'localtime'),''), "
     // the receipt covering the money paid on this charge (an issued one first), -1 = none
@@ -116,7 +120,8 @@ static const char* kPaymentCols =
     "COALESCE((SELECT o.id FROM joint_ops o WHERE o.batch_id = p.batch_id), -1), "
     // the offer used for this charge (offer_uses, one row per charge): "id|name|list price|discount" in ONE lookup
     "COALESCE((SELECT u.offer_id || char(31) || o.name || char(31) || u.list_price || char(31) || u.discount "
-    "          FROM offer_uses u JOIN offers o ON o.id = u.offer_id WHERE u.charge_id = p.id LIMIT 1), '')";
+    "          FROM offer_uses u JOIN offers o ON o.id = u.offer_id WHERE u.charge_id = p.id LIMIT 1), ''), "
+    "COALESCE(p.contract_id, -1)";
 
 static Payment ReadPayment(sqlite3_stmt* st) {
     auto txt = [&](int c) { const unsigned char* t = sqlite3_column_text(st, c); return std::string(t ? (const char*)t : ""); };
@@ -144,6 +149,7 @@ static Payment ReadPayment(sqlite3_stmt* st) {
         std::vector<std::string> f; size_t b = 0;
         for (size_t k; (k = u.find('\x1f', b)) != std::string::npos; b = k + 1) f.push_back(u.substr(b, k - b));
         if (!u.empty()) f.push_back(u.substr(b));
+        p.contract_id = sqlite3_column_int(st, 18);
         if (f.size() == 4) { p.used_offer_id = std::atoi(f[0].c_str()); p.used_offer_name = f[1]; p.used_list_price = std::atof(f[2].c_str()); p.used_discount = std::atof(f[3].c_str()); }
     }
     return p;
@@ -179,7 +185,7 @@ static const char* kAuditedTables[] = {
     "buildings", "apartments", "users", "residencies", "services", "service_users", "master_services",
     "master_service_components", "payment_batches", "charges", "payments", "allocations", "receipts", "notes",
     "attachments", "joint_services", "joint_ops", "joint_shares", "payment_plans", "offers", "offer_uses",
-    "service_costs", "partners", "partner_costs", "user_deletions", "record_deletions", "managed_buildings", "fund_moves", "residents", "expense_shares",
+    "service_costs", "partners", "partner_costs", "user_deletions", "record_deletions", "managed_buildings", "fund_moves", "residents", "expense_shares", "contracts", "contract_items", "receipt_lines", "partner_docs", "monthly_bills", "monthly_bill_reasons", "deposit_limits", "contract_cancels",
 };
 
 static bool TableExists(sqlite3* db, const std::string& t) {
@@ -1683,15 +1689,287 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v25) απέτυχε: " + why; }
     }
 
+    // --- v26: a client's own number (ΚΩΔ, editable; id stays the database's), extra details and a building's manager.
+    // Existing clients start with their old number as their code. ---
+    if (UserVersion(db) < 26) {
+        bool ok = executeQuery("BEGIN;") &&
+                  executeQuery("ALTER TABLE users ADD COLUMN code TEXT;") &&
+                  executeQuery("ALTER TABLE users ADD COLUMN extra_json TEXT;") &&
+                  executeQuery("ALTER TABLE users ADD COLUMN manager_name TEXT;");
+        ok = ok && executeQuery("UPDATE users SET code = CAST(id AS TEXT) WHERE COALESCE(resident, 0) = 0;");
+        if (ok) {
+            ensureAuditTriggers();
+            ok = executeQuery(std::string("INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                         "SELECT 'users', rowid, 'BASELINE', NULL, ") + JsonRowExpr(db, "users", "") + ", 'db', 'migration v26', "
+                         "'Κωδικός πελάτη, επιπλέον στοιχεία, διαχειριστής' FROM users;") &&
+                 executeQuery("PRAGMA user_version = 26; COMMIT;");
+        }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v26) απέτυχε: " + why; }
+    }
+
+    // --- v27: Συμβάσεις. A contract keeps its own copy of the services; its installments are charges that point to it,
+    // and payments and receipts reach it through those charges. Contracts are never removed or rewritten. ---
+    if (UserVersion(db) < 27) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE TABLE IF NOT EXISTS contracts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL REFERENCES users(id),
+                source_type  TEXT    NOT NULL CHECK (source_type IN ('service','package')),
+                source_id    INTEGER NOT NULL,
+                label        TEXT    NOT NULL,
+                start_date   TEXT    NOT NULL,
+                end_date     TEXT    NOT NULL,
+                total        REAL    NOT NULL CHECK (total > 0),
+                cost         REAL    NOT NULL DEFAULT 0,
+                installments INTEGER NOT NULL CHECK (installments >= 1),
+                partner_id   INTEGER,
+                notes        TEXT,
+                created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS contract_items (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_id  INTEGER NOT NULL REFERENCES contracts(id),
+                service_id   INTEGER NOT NULL,
+                label        TEXT    NOT NULL,
+                amount       REAL    NOT NULL,
+                cost         REAL    NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_contracts_user ON contracts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_contract_items ON contract_items(contract_id);
+            ALTER TABLE charges ADD COLUMN contract_id INTEGER REFERENCES contracts(id);
+            CREATE INDEX IF NOT EXISTS idx_charges_contract ON charges(contract_id);
+            CREATE TRIGGER IF NOT EXISTS trg_contracts_fixed BEFORE UPDATE ON contracts
+            BEGIN SELECT RAISE(ABORT, 'Η σύμβαση δεν αλλάζει'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_contracts_no_delete BEFORE DELETE ON contracts
+            BEGIN SELECT RAISE(ABORT, 'Η σύμβαση δεν διαγράφεται'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_contract_items_fixed BEFORE UPDATE ON contract_items
+            BEGIN SELECT RAISE(ABORT, 'Οι υπηρεσίες της σύμβασης δεν αλλάζουν'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_contract_items_no_delete BEFORE DELETE ON contract_items
+            BEGIN SELECT RAISE(ABORT, 'Οι υπηρεσίες της σύμβασης δεν διαγράφονται'); END;
+        )");
+        if (ok) {
+            ensureAuditTriggers();
+            ok = executeQuery(std::string("INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                         "SELECT 'charges', rowid, 'BASELINE', NULL, ") + JsonRowExpr(db, "charges", "") + ", 'db', 'migration v27', "
+                         "'Σύνδεση χρεώσεων με συμβάσεις' FROM charges;") &&
+                 executeQuery("PRAGMA user_version = 27; COMMIT;");
+        }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v27) απέτυχε: " + why; }
+    }
+
+    // --- v28: a building's monthly expenses (joint_ops.kind = 'monthly'). While a bill is open its collections stay out of the
+    // fund; once it is resolved, a resident's late payment goes back into the fund (the Αποθεματικό) that covered it. ---
+    if (UserVersion(db) < 28) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE TABLE IF NOT EXISTS monthly_bills (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                building_id   INTEGER NOT NULL REFERENCES buildings(id),
+                ym            TEXT    NOT NULL,
+                op_id         INTEGER NOT NULL UNIQUE REFERENCES joint_ops(id),
+                total         REAL    NOT NULL CHECK (total > 0),
+                status        TEXT    NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
+                resolved_date TEXT,
+                covered       REAL    NOT NULL DEFAULT 0,
+                note          TEXT,
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS monthly_bill_reasons (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                bill_id INTEGER NOT NULL REFERENCES monthly_bills(id),
+                reason  TEXT    NOT NULL,
+                amount  REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_monthly_bills ON monthly_bills(building_id, ym);
+            CREATE INDEX IF NOT EXISTS idx_monthly_bill_reasons ON monthly_bill_reasons(bill_id);
+            CREATE TRIGGER IF NOT EXISTS trg_monthly_bills_no_delete BEFORE DELETE ON monthly_bills
+            BEGIN SELECT RAISE(ABORT, 'Τα μηνιαία έξοδα δεν διαγράφονται'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_monthly_bill_reasons_fixed BEFORE UPDATE ON monthly_bill_reasons
+            BEGIN SELECT RAISE(ABORT, 'Η ανάλυση εξόδων δεν αλλάζει'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_monthly_bill_reasons_no_delete BEFORE DELETE ON monthly_bill_reasons
+            BEGIN SELECT RAISE(ABORT, 'Η ανάλυση εξόδων δεν διαγράφεται'); END;
+            DROP TRIGGER IF EXISTS trg_fund_collect;
+            CREATE TRIGGER trg_fund_collect AFTER INSERT ON allocations
+            WHEN EXISTS (SELECT 1 FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id
+                         WHERE c.id = NEW.charge_id AND c.direction = 'in' AND o.kind <> 'fee' AND o.building_id IN (SELECT id FROM buildings)
+                           AND (o.kind <> 'monthly' OR EXISTS (SELECT 1 FROM monthly_bills mb WHERE mb.op_id = o.id AND mb.status = 'resolved')))
+            BEGIN
+                INSERT INTO fund_moves (building_id, move_date, direction, amount, kind, description, user_id, apartment_id, payment_id, charge_id, joint_op_id, allocation_id)
+                SELECT o.building_id, COALESCE((SELECT pay_date FROM payments WHERE id = NEW.payment_id), date('now','localtime')), 'in', NEW.amount,
+                       CASE o.kind WHEN 'contribution' THEN 'contribution' WHEN 'monthly' THEN 'correction' ELSE 'collection' END,
+                       CASE o.kind WHEN 'monthly' THEN 'Επιστροφή στο αποθεματικό: ' || o.label ELSE o.label END, c.user_id, c.apartment_id,
+                       NEW.payment_id, NEW.charge_id, CASE o.kind WHEN 'monthly' THEN NULL ELSE o.id END, NEW.id
+                FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE c.id = NEW.charge_id;
+            END;
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 28; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v28) απέτυχε: " + why; }
+    }
+
+    // --- v29: a resident paying back what the deposit covered says so in the deposit's moves, with the cost it belonged to. ---
+    if (UserVersion(db) < 29) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            DROP TRIGGER IF EXISTS trg_fund_collect;
+            CREATE TRIGGER trg_fund_collect AFTER INSERT ON allocations
+            WHEN EXISTS (SELECT 1 FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id
+                         WHERE c.id = NEW.charge_id AND c.direction = 'in' AND o.kind <> 'fee' AND o.building_id IN (SELECT id FROM buildings)
+                           AND (o.kind <> 'monthly' OR EXISTS (SELECT 1 FROM monthly_bills mb WHERE mb.op_id = o.id AND mb.status = 'resolved')))
+            BEGIN
+                INSERT INTO fund_moves (building_id, move_date, direction, amount, kind, description, user_id, apartment_id, payment_id, charge_id, joint_op_id, allocation_id)
+                SELECT o.building_id, COALESCE((SELECT pay_date FROM payments WHERE id = NEW.payment_id), date('now','localtime')), 'in', NEW.amount,
+                       CASE o.kind WHEN 'contribution' THEN 'contribution' WHEN 'monthly' THEN 'correction' ELSE 'collection' END,
+                       CASE o.kind WHEN 'monthly' THEN 'Από οφειλή: ' || o.label || ' (συνολικό κόστος ' || printf('%.2f', o.total) || ' €, το κάλυψε το αποθεματικό)' ELSE o.label END, c.user_id, c.apartment_id,
+                       NEW.payment_id, NEW.charge_id, CASE o.kind WHEN 'monthly' THEN NULL ELSE o.id END, NEW.id
+                FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE c.id = NEW.charge_id;
+            END;
+        )") && executeQuery("PRAGMA user_version = 29; COMMIT;");
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v29) απέτυχε: " + why; }
+    }
+
+    // --- v30: the level a building's Αποθεματικό should stay above. ---
+    if (UserVersion(db) < 30) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE TABLE IF NOT EXISTS deposit_limits (
+                building_id INTEGER PRIMARY KEY REFERENCES buildings(id),
+                min_amount  REAL NOT NULL CHECK (min_amount >= 0)
+            );
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 30; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v30) απέτυχε: " + why; }
+    }
+
+    // --- v31: a logged monthly cost can be taken back while nothing was collected; a contract can be ended. ---
+    if (UserVersion(db) < 31) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            DROP TRIGGER IF EXISTS trg_monthly_bills_no_delete;
+            DROP TRIGGER IF EXISTS trg_monthly_bill_reasons_no_delete;
+            DROP TRIGGER IF EXISTS trg_joint_ops_no_delete;
+            CREATE TRIGGER trg_joint_ops_no_delete BEFORE DELETE ON joint_ops WHEN OLD.kind <> 'monthly'
+            BEGIN SELECT RAISE(ABORT, 'Η κοινόχρηστη χρέωση δεν διαγράφεται'); END;
+            DROP TRIGGER IF EXISTS trg_joint_shares_no_delete;
+            CREATE TRIGGER trg_joint_shares_no_delete BEFORE DELETE ON joint_shares
+            WHEN (SELECT kind FROM joint_ops WHERE id = OLD.op_id) <> 'monthly'
+            BEGIN SELECT RAISE(ABORT, 'Η κατανομή κοινοχρήστων δεν διαγράφεται'); END;
+            CREATE TABLE IF NOT EXISTS contract_cancels (
+                contract_id  INTEGER PRIMARY KEY REFERENCES contracts(id),
+                cancelled_on TEXT NOT NULL DEFAULT (date('now','localtime')),
+                reason       TEXT
+            );
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 31; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v31) απέτυχε: " + why; }
+    }
+
+    // --- v32: a partner's IBAN and extra details. ---
+    if (UserVersion(db) < 32) {
+        bool ok = executeQuery("BEGIN;") && executeQuery("ALTER TABLE partners ADD COLUMN iban TEXT;") && executeQuery("ALTER TABLE partners ADD COLUMN extra_json TEXT;");
+        if (ok) {
+            ensureAuditTriggers();
+            ok = executeQuery(std::string("INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                         "SELECT 'partners', rowid, 'BASELINE', NULL, ") + JsonRowExpr(db, "partners", "") + ", 'db', 'migration v32', 'IBAN και επιπλέον στοιχεία' FROM partners;") &&
+                 executeQuery("PRAGMA user_version = 32; COMMIT;");
+        }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v32) απέτυχε: " + why; }
+    }
+
+    // --- v33: a charge's own date is charge_date (payments keep pay_date: when the money came), completed_on is when the last
+    //     money filled it, and status always follows the money. Each receipt keeps its own lines. ---
+    if (UserVersion(db) < 33) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            ALTER TABLE charges RENAME COLUMN pay_date TO charge_date;
+            ALTER TABLE charges ADD COLUMN completed_on TEXT;
+            DROP TRIGGER IF EXISTS trg_charge_receipted_update;
+            CREATE TRIGGER trg_charge_receipted_update BEFORE UPDATE OF amount_due, user_id, service_id, apartment_id, charge_date, direction ON charges
+            WHEN EXISTS (SELECT 1 FROM allocations a JOIN payments p ON p.id = a.payment_id JOIN receipts r ON r.id = p.receipt_id
+                         WHERE a.charge_id = OLD.id AND r.status = 'issued')
+             AND (NEW.amount_due IS NOT OLD.amount_due OR NEW.user_id IS NOT OLD.user_id OR NEW.service_id IS NOT OLD.service_id
+                  OR NEW.apartment_id IS NOT OLD.apartment_id OR NEW.charge_date IS NOT OLD.charge_date OR NEW.direction IS NOT OLD.direction)
+            BEGIN SELECT RAISE(ABORT, 'Η χρέωση έχει εξοφληθεί με απόδειξη - ακυρώστε πρώτα την απόδειξη για να την αλλάξετε'); END;
+            CREATE TRIGGER trg_charge_state_ins AFTER INSERT ON charges BEGIN
+                UPDATE charges SET
+                    status = CASE WHEN CAST(ROUND(balance*100) AS INTEGER) <= 0 THEN 'paid' WHEN status = 'future' THEN 'future' ELSE 'pending' END,
+                    completed_on = CASE WHEN CAST(ROUND(balance*100) AS INTEGER) <= 0 THEN charge_date END
+                WHERE id = NEW.id;
+            END;
+            CREATE TRIGGER trg_charge_state_upd AFTER UPDATE OF balance, status ON charges BEGIN
+                UPDATE charges SET
+                    status = CASE WHEN CAST(ROUND(balance*100) AS INTEGER) <= 0 THEN 'paid' WHEN status = 'future' THEN 'future' ELSE 'pending' END,
+                    completed_on = CASE WHEN CAST(ROUND(balance*100) AS INTEGER) <= 0 THEN
+                        COALESCE((SELECT MAX(m.pay_date) FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = charges.id), charge_date) END
+                WHERE id = NEW.id;
+            END;
+            CREATE TABLE IF NOT EXISTS receipt_lines (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_id  INTEGER NOT NULL REFERENCES receipts(id),
+                charge_id   INTEGER NOT NULL,
+                service_id  INTEGER,
+                charge_date TEXT,
+                label       TEXT,
+                amount      REAL NOT NULL CHECK (amount > 0),
+                UNIQUE (receipt_id, charge_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_receipt_lines_fixed BEFORE UPDATE ON receipt_lines
+            BEGIN SELECT RAISE(ABORT, 'Οι γραμμές απόδειξης δεν αλλάζουν'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_receipt_lines_no_delete BEFORE DELETE ON receipt_lines
+            BEGIN SELECT RAISE(ABORT, 'Οι γραμμές απόδειξης δεν διαγράφονται'); END;
+        )");
+        if (ok) {
+            ensureAuditTriggers();
+            ok = executeQuery(R"(
+                UPDATE charges SET status = status;
+                INSERT INTO receipt_lines (receipt_id, charge_id, service_id, charge_date, label, amount)
+                SELECT m.receipt_id, a.charge_id, c.service_id, c.charge_date, COALESCE(c.notes,''), SUM(CAST(ROUND(a.amount*100) AS INTEGER)) / 100.0
+                FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN charges c ON c.id = a.charge_id
+                WHERE m.receipt_id IS NOT NULL GROUP BY m.receipt_id, a.charge_id;
+            )") && executeQuery(std::string("INSERT INTO audit_log (table_name, record_id, action_type, old_data, new_data, category, actor, reason) "
+                         "SELECT 'charges', rowid, 'BASELINE', NULL, ") + JsonRowExpr(db, "charges", "") + ", 'db', 'migration v33', 'Ημερομηνία χρέωσης, ολοκλήρωση, κατάσταση από τα χρήματα' FROM charges;") &&
+                 executeQuery("PRAGMA user_version = 33; COMMIT;");
+        }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v33) απέτυχε: " + why; }
+    }
+
+    // --- v34: a resident's stay can only point at a resident's accounting record. ---
+    if (UserVersion(db) < 34) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE TRIGGER IF NOT EXISTS trg_residents_only_residents BEFORE INSERT ON residents
+            WHEN COALESCE((SELECT resident FROM users WHERE id = NEW.user_id), 0) <> 1
+            BEGIN SELECT RAISE(ABORT, 'Ο ένοικος πρέπει να έχει δική του εγγραφή ενοίκου'); END;
+            PRAGMA user_version = 34; COMMIT;
+        )");
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v34) απέτυχε: " + why; }
+    }
+    // --- v35: Τιμολόγια: the document a partner gave us for what we paid him. ---
+    if (UserVersion(db) < 35) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE TABLE IF NOT EXISTS partner_docs (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id INTEGER NOT NULL REFERENCES payments(id),
+                charge_id  INTEGER REFERENCES charges(id),
+                partner_id INTEGER REFERENCES partners(id),
+                doc_type   TEXT NOT NULL CHECK (doc_type IN ('invoice','receipt')),
+                number     TEXT,
+                doc_date   TEXT NOT NULL CHECK (doc_date IS date(doc_date)),
+                amount     REAL NOT NULL CHECK (amount > 0),
+                notes      TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_partner_docs_partner ON partner_docs(partner_id, doc_date);
+            CREATE TRIGGER IF NOT EXISTS trg_partner_docs_fixed BEFORE UPDATE ON partner_docs
+            BEGIN SELECT RAISE(ABORT, 'Το τιμολόγιο δεν αλλάζει'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_partner_docs_no_delete BEFORE DELETE ON partner_docs
+            BEGIN SELECT RAISE(ABORT, 'Το τιμολόγιο δεν διαγράφεται'); END;
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 35; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v35) απέτυχε: " + why; }
+    }
+    // Every REFERENCES in the schema is enforced from here on (after the migrations, which reshape tables).
+    executeQuery("PRAGMA foreign_keys = ON;");
+
     executeQuery("CREATE INDEX IF NOT EXISTS idx_joint_shares_user ON joint_shares(user_id);");
 
     // A scheduled bill falls due on its date: from then on it is owed like any other (every screen tells "due" from
     // "scheduled" by the status, so the status must follow the calendar). Bills already settled with an issued receipt
     // keep their status (the database does not let them change).
-    executeQuery("UPDATE charges SET status = CASE WHEN balance <= 0.005 THEN 'paid' ELSE 'pending' END "
-                 "WHERE status = 'future' AND pay_date <= date('now','localtime') "
-                 "AND NOT EXISTS (SELECT 1 FROM allocations a JOIN payments p ON p.id = a.payment_id JOIN receipts r ON r.id = p.receipt_id "
-                 "                WHERE a.charge_id = charges.id AND r.status = 'issued');");
+    refreshDueCharges();
 
     // Audit triggers must exist and be exactly ours. After a schema migration they are regenerated as part of
     // it; on a plain start any difference means someone dropped or altered them -> restore, record it, warn.
@@ -1872,17 +2150,19 @@ bool SqliteConn::addUser(const User& u) {
         Building b; b.address = u.full_name; b.afm = u.afm;
         int bid = addBuilding(b);
         sqlite3_stmt* st = nullptr;
-        bool ok = bid > 0 && sqlite3_prepare_v2(db, "UPDATE users SET phone = ?, email = ?, special_code = ? WHERE client_building_id = ?", -1, &st, nullptr) == SQLITE_OK;
+        bool ok = bid > 0 && sqlite3_prepare_v2(db, "UPDATE users SET phone = ?, email = ?, special_code = ?, code = ?, extra_json = ?, manager_name = ? WHERE client_building_id = ?", -1, &st, nullptr) == SQLITE_OK;
         if (ok) {
             sqlite3_bind_text(st, 1, u.phone.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, u.email.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 3, u.special_code.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 4, bid);
+            sqlite3_bind_text(st, 3, u.special_code.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 4, u.code.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 5, u.extra_json.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 6, u.manager_name.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 7, bid);
             ok = sqlite3_step(st) == SQLITE_DONE;
         }
         sqlite3_finalize(st);
         if (!ok || !release("add_bclient")) { rollbackTo("add_bclient"); return false; }
         return true;
     }
-    std::string sql = "INSERT INTO users (full_name, phone, special_code, apartment_id, kind, email, afm) VALUES (?,?,?,?,?,?,?)";
+    std::string sql = "INSERT INTO users (full_name, phone, special_code, apartment_id, kind, email, afm, code, extra_json, manager_name) VALUES (?,?,?,?,?,?,?,?,?,?)";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, u.full_name.c_str(), -1, SQLITE_TRANSIENT);
@@ -1893,6 +2173,9 @@ bool SqliteConn::addUser(const User& u) {
     sqlite3_bind_text(stmt, 5, kind.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, u.email.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 7, u.afm.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, u.code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, u.extra_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 10, u.manager_name.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
@@ -1912,7 +2195,7 @@ bool SqliteConn::editUser(int id, const User& u) {
         Building b = getBuildingById(old.client_building_id);
         if (b.id > 0 && (b.address != u.full_name || b.afm != u.afm)) { b.address = u.full_name; b.afm = u.afm; editBuilding(b.id, b); }
     }
-    std::string sql = "UPDATE users SET full_name=?, phone=?, special_code=?, apartment_id=?, kind=?, email=?, afm=? WHERE id=?";
+    std::string sql = "UPDATE users SET full_name=?, phone=?, special_code=?, apartment_id=?, kind=?, email=?, afm=?, code=?, extra_json=?, manager_name=? WHERE id=?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, u.full_name.c_str(), -1, SQLITE_TRANSIENT);
@@ -1922,7 +2205,10 @@ bool SqliteConn::editUser(int id, const User& u) {
     sqlite3_bind_text(stmt, 5, kind.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, u.email.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 7, u.afm.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 8, id);
+    sqlite3_bind_text(stmt, 8, u.code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, u.extra_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 10, u.manager_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 11, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
@@ -1941,6 +2227,8 @@ bool SqliteConn::removeUser(int id) {
     if (getUserById(id).id < 0) { lastError_ = "Ο πελάτης δεν υπάρχει."; return false; }
     if (!savepoint("rm_user")) return false;
     std::string sid = std::to_string(id);
+    for (auto& stay : getResidentStays(id))                       // a resident moves to the past residents, with what he owes noted
+        if (stay.active() && !endResident(stay.id, [] { std::time_t t = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &t); char d[16]; std::strftime(d, sizeof(d), "%Y-%m-%d", &tm); return std::string(d); }())) { rollbackTo("rm_user"); return false; }
     bool ok = executeQuery("UPDATE residencies SET to_date = date('now','localtime') WHERE user_id = " + sid + " AND to_date IS NULL;") &&   // his stay ends
               executeQuery("UPDATE users SET apartment_id = NULL WHERE id = " + sid + ";") &&
               executeQuery("INSERT INTO user_deletions (user_id) VALUES (" + sid + ");");                                                      // and when he was deleted
@@ -2077,6 +2365,10 @@ bool SqliteConn::removeBuilding(int id) {
     Building old = getBuildingById(id);
     char* err = nullptr;
     std::string sid = std::to_string(id);
+    { sqlite3_stmt* mg = nullptr; bool managed = false;
+      sqlite3_prepare_v2(db, "SELECT 1 FROM managed_buildings WHERE building_id = ?1 UNION ALL SELECT 1 FROM fund_moves WHERE building_id = ?1 LIMIT 1", -1, &mg, nullptr);
+      sqlite3_bind_int(mg, 1, id); managed = sqlite3_step(mg) == SQLITE_ROW; sqlite3_finalize(mg);
+      if (managed) { lastError_ = "Η πολυκατοικία έχει διαχείριση ή κινήσεις αποθεματικού και δεν διαγράφεται."; return false; } }
     const std::string snap = "{\"building\":" + TableRowsJson(db, "buildings", "id = " + sid) + ",\"apartments\":" + TableRowsJson(db, "apartments", "building_id = " + sid) +
                              ",\"residencies\":" + TableRowsJson(db, "residencies", "apartment_id IN (SELECT id FROM apartments WHERE building_id = " + sid + ")") + "}";
     std::string sql =
@@ -2086,6 +2378,7 @@ bool SqliteConn::removeBuilding(int id) {
         "DELETE FROM apartments WHERE building_id = " + sid + ";"
         // its client stays in the books (its charges reference it) but leaves the lists, like a deleted client
         "INSERT OR IGNORE INTO user_deletions (user_id, note) SELECT id, 'η πολυκατοικία διαγράφηκε' FROM users WHERE client_building_id = " + sid + ";"
+        "UPDATE users SET client_building_id = NULL WHERE client_building_id = " + sid + ";"
         "DELETE FROM buildings WHERE id = " + sid + ";"
         "COMMIT;";
     if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
@@ -2223,8 +2516,8 @@ bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& h
     sql += "UPDATE users SET apartment_id = " + (currentApt > 0 ? std::to_string(currentApt) : std::string("NULL")) + " WHERE id = " + uid + ";";
     sql += "UPDATE charges SET apartment_id = COALESCE(("
            "SELECT r.apartment_id FROM residencies r WHERE r.user_id = charges.user_id "
-           "AND r.from_date <= charges.pay_date "
-           "AND (r.to_date IS NULL OR r.to_date >= charges.pay_date) "
+           "AND r.from_date <= charges.charge_date "
+           "AND (r.to_date IS NULL OR r.to_date >= charges.charge_date) "
            "ORDER BY r.from_date DESC, r.id DESC LIMIT 1), apartment_id) WHERE user_id = " + uid +
            // receipted payments keep the apartment printed on their receipt
            " AND NOT EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN receipts rc ON rc.id = m.receipt_id "
@@ -2239,7 +2532,7 @@ bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& h
 }
 
 std::vector<Payment> SqliteConn::getPaymentsForApartment(int apartmentId) {
-    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.apartment_id = ? ORDER BY p.pay_date, p.id", {apartmentId});
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.apartment_id = ? ORDER BY p.charge_date, p.id", {apartmentId});
 }
 
 std::string SqliteConn::takeLastError() {
@@ -2562,15 +2855,15 @@ Payment SqliteConn::getPaymentById(int id) {
 }
 
 std::vector<Payment> SqliteConn::getPaymentsForService(int serviceId) {
-    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.service_id = ? ORDER BY p.pay_date, p.id", {serviceId});
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.service_id = ? ORDER BY p.charge_date, p.id", {serviceId});
 }
 
 std::vector<Payment> SqliteConn::getPaymentsForUser(int userId) {
-    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.user_id = ? ORDER BY p.pay_date, p.id", {userId});
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.user_id = ? ORDER BY p.charge_date, p.id", {userId});
 }
 
 std::vector<Payment> SqliteConn::getRecentPayments(int limit) {
-    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.status != 'future' ORDER BY p.pay_date DESC, p.id DESC LIMIT ?", {limit});
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.status != 'future' ORDER BY p.charge_date DESC, p.id DESC LIMIT ?", {limit});
 }
 
 // Relational search: payment's own columns plus a JOIN against users/services so the
@@ -2600,9 +2893,9 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
         params.push_back(val);
     };
     addTextClause("CAST(p.id AS TEXT)", idQuery);
-    addTextClause("CAST(CAST(strftime('%Y', p.pay_date) AS INTEGER) AS TEXT)", year);
-    addTextClause("CAST(CAST(strftime('%m', p.pay_date) AS INTEGER) AS TEXT)", month);
-    addTextClause("CAST(CAST(strftime('%d', p.pay_date) AS INTEGER) AS TEXT)", day);
+    addTextClause("CAST(CAST(strftime('%Y', p.charge_date) AS INTEGER) AS TEXT)", year);
+    addTextClause("CAST(CAST(strftime('%m', p.charge_date) AS INTEGER) AS TEXT)", month);
+    addTextClause("CAST(CAST(strftime('%d', p.charge_date) AS INTEGER) AS TEXT)", day);
     addTextClause("CAST(p.amount_due AS TEXT)", amount_due_query);
     addTextClause("CAST(p.amount_paid AS TEXT)", amount_paid_query);
     addTextClause("p.status", status);
@@ -2613,7 +2906,7 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
     addTextClause("s.label", serviceLabel);
     addTextClause("CAST(p.service_id AS TEXT)", serviceIdQuery);
     addTextClause("CAST(p.user_id AS TEXT)", userIdQuery);
-    sql += " ORDER BY p.pay_date DESC, p.id DESC LIMIT 2000";
+    sql += " ORDER BY p.charge_date DESC, p.id DESC LIMIT 2000";
 
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
@@ -2626,11 +2919,11 @@ std::vector<Payment> SqliteConn::advancedSearchPayments(const std::string& year,
 }
 
 std::vector<Payment> SqliteConn::getAllPayments() {
-    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p ORDER BY p.pay_date, p.id");
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p ORDER BY p.charge_date, p.id");
 }
 
 std::vector<Payment> SqliteConn::getFuturePayments() {
-    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.status = 'future' ORDER BY p.pay_date, p.id");
+    return QueryPayments(db, std::string("SELECT ") + kPaymentCols + " FROM charges p WHERE p.status = 'future' ORDER BY p.charge_date, p.id");
 }
 
 // --- TIMELINE ---
@@ -2679,7 +2972,7 @@ std::vector<std::string> SqliteConn::getTimelineActions(const std::string& dateF
 // --- METRICS ---
 double SqliteConn::getTotalPaid(int year, int month, int userId, int serviceId) {
     double total = 0;
-    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM charges WHERE pay_date >= ?1 AND pay_date < date(?1, '+1 month') AND status != 'future'";
+    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM charges WHERE charge_date >= ?1 AND charge_date < date(?1, '+1 month') AND status != 'future'";
     if(userId != -1) sql += " AND user_id=" + std::to_string(userId);
     if(serviceId != -1) sql += " AND service_id=" + std::to_string(serviceId);
     sqlite3_stmt* stmt;
@@ -2693,7 +2986,7 @@ double SqliteConn::getTotalPaid(int year, int month, int userId, int serviceId) 
 
 double SqliteConn::getTotalPending(int year, int month, int userId, int serviceId) {
     double total = 0;
-    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_due*100) AS INTEGER) - CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM charges WHERE pay_date >= ?1 AND pay_date < date(?1, '+1 month') AND status='pending'";
+    std::string sql = "SELECT TOTAL(CAST(ROUND(amount_due*100) AS INTEGER) - CAST(ROUND(amount_paid*100) AS INTEGER)) / 100.0 FROM charges WHERE charge_date >= ?1 AND charge_date < date(?1, '+1 month') AND status='pending'";
     if(userId != -1) sql += " AND user_id=" + std::to_string(userId);
     if(serviceId != -1) sql += " AND service_id=" + std::to_string(serviceId);
     sqlite3_stmt* stmt;
@@ -3055,11 +3348,37 @@ int SqliteConn::pickerServicesCount(const std::string& nameSearch) {
 // anything extra.
 
 // Shared builder for pageUsers / countUsers so both stay in lockstep.
+// What each column of the client list shows, as SQL (whitelisted, never built from user text). Column numbers: 0 id, 1 address,
+// 2 apartment, 3 name, 4 phone, 5 area, 6 ΤΚ, 7 special code, 8 kind, 9 email, 10 ΑΦΜ, 11 code, 12 extra, 13 manager.
+// Buildings and businesses are called by their address, and show no name.
+static std::string UserColExpr(int col) {
+    switch (col) {
+        case 0: return "CAST(u.id AS TEXT)";
+        case 1: return "CASE WHEN COALESCE(u.kind,'person') = 'person' THEN COALESCE(b.address,'') ELSE u.full_name END";
+        case 2: return "COALESCE(a.label,'')";
+        case 3: return "CASE WHEN COALESCE(u.kind,'person') = 'person' THEN u.full_name ELSE '' END";
+        case 4: return "COALESCE(u.phone,'')";
+        case 5: return "COALESCE(b.area, cb.area, '')";
+        case 6: return "COALESCE(b.postal_code, cb.postal_code, '')";
+        case 7: return "COALESCE(u.special_code,'')";
+        case 8: return "CASE COALESCE(u.kind,'person') WHEN 'building' THEN 'Πολυκατοικία' WHEN 'business' THEN 'Επιχείρηση' ELSE 'Ιδιώτης' END";
+        case 9: return "COALESCE(u.email,'')";
+        case 10: return "COALESCE(u.afm,'')";
+        case 11: return "COALESCE(u.code,'')";
+        case 12: return "COALESCE(u.extra_json,'')";
+        case 13: return "COALESCE(u.manager_name,'')";
+        default: return "";
+    }
+}
+static const char* kUserExtraEach = "json_each(CASE WHEN json_valid(u.extra_json) THEN u.extra_json ELSE '{}' END) je";
+
 static std::string BuildUserPageWhere(const std::string& query, int scope,
                                        const std::vector<std::string>& letters,
-                                       std::vector<std::string>& bindValues, int kinds = 7) {
+                                       std::vector<std::string>& bindValues, int kinds = 7,
+                                       const DataConn::ColFilters* cf = nullptr, int skipCol = -1) {
     // residents are never clients: their accounting record is not listed here
-    std::string where = " WHERE NOT EXISTS (SELECT 1 FROM user_deletions d WHERE d.user_id = u.id) AND COALESCE(u.resident, 0) = 0";
+    // kinds bit 8: the past clients instead of the current ones
+    std::string where = std::string(kinds & 8 ? " WHERE EXISTS" : " WHERE NOT EXISTS") + " (SELECT 1 FROM user_deletions d WHERE d.user_id = u.id) AND COALESCE(u.resident, 0) = 0";
     if ((kinds & 7) != 7) {          // 1 people, 2 buildings, 4 businesses
         std::string in;
         if (kinds & 1) in += std::string(in.empty() ? "" : ",") + "'person'";
@@ -3071,7 +3390,7 @@ static std::string BuildUserPageWhere(const std::string& query, int scope,
         bindValues.push_back(query);
         switch (scope) {
             case 1:  where += " AND u.full_name    LIKE '%' || ? || '%'"; break;
-            case 2:  where += " AND u.special_code LIKE '%' || ? || '%'"; break;
+            case 2:  where += " AND (u.special_code LIKE '%' || ? || '%' OR u.code LIKE '%' || ? || '%')"; bindValues.push_back(query); break;
             case 3:  where += " AND u.phone        LIKE '%' || ? || '%'"; break;
             case 4:  where += " AND b.address      LIKE '%' || ? || '%'"; break;
             default:
@@ -3084,9 +3403,12 @@ static std::string BuildUserPageWhere(const std::string& query, int scope,
                          " OR b.postal_code LIKE '%' || ? || '%'"
                          " OR u.email LIKE '%' || ? || '%'"
                          " OR u.afm LIKE '%' || ? || '%'"
+                         " OR u.code LIKE '%' || ? || '%'"
+                         " OR u.manager_name LIKE '%' || ? || '%'"
+                         " OR u.extra_json LIKE '%' || ? || '%'"
                          " OR CAST(u.id AS TEXT) = ?)";
-                // Push the query nine more times to fill the extra placeholders.
-                for (int k = 0; k < 9; k++) bindValues.push_back(query);
+                // Push the query twelve more times to fill the extra placeholders.
+                for (int k = 0; k < 12; k++) bindValues.push_back(query);
                 break;
         }
     }
@@ -3098,6 +3420,19 @@ static std::string BuildUserPageWhere(const std::string& query, int scope,
             bindValues.push_back(letters[i]);
         }
         where += ")";
+    }
+    if (cf) {
+        for (auto& [col, vals] : cf->in) {
+            if (col == skipCol || vals.empty()) continue;
+            std::string qs; for (auto& v : vals) { qs += qs.empty() ? "?" : ",?"; bindValues.push_back(v); }
+            if (col == 12) where += std::string(" AND EXISTS (SELECT 1 FROM ") + kUserExtraEach + " WHERE je.key || ': ' || je.value IN (" + qs + "))";
+            else { const std::string e = UserColExpr(col); if (!e.empty()) where += " AND (" + e + ") IN (" + qs + ")"; else for (size_t k = 0; k < vals.size(); k++) bindValues.pop_back(); }
+        }
+        for (auto& [col, t] : cf->text) {
+            const std::string e = UserColExpr(col);
+            if (col == skipCol || t.empty() || e.empty()) continue;
+            where += " AND instr(fold(" + e + "), fold(?)) > 0"; bindValues.push_back(t);
+        }
     }
     return where;
 }
@@ -3115,7 +3450,8 @@ static std::string UserOrderBy(const SortSpec& spec) {
             case 4: key = "u.phone"; break;        case 5: key = "b.area"; break;
             case 6: key = "b.postal_code"; break;  case 7: key = "u.special_code"; break;
             case 8: key = "u.kind"; break;         case 9: key = "u.email"; break;
-            case 10: key = "u.afm"; break;
+            case 10: key = "u.afm"; break;         case 11: key = "u.code"; break;
+            case 12: key = "u.extra_json"; break;  case 13: key = "u.manager_name"; break;
             default: break;
         }
         if (key) out += std::string(out.empty() ? "" : ", ") + key + (k.second ? " ASC" : " DESC");
@@ -3126,9 +3462,9 @@ static std::string UserOrderBy(const SortSpec& spec) {
 
 std::vector<User> SqliteConn::pageUsers(const std::string& query, int scope,
                                          const std::vector<std::string>& letters,
-                                         int offset, int limit, const SortSpec& sort, int kinds) {
+                                         int offset, int limit, const SortSpec& sort, int kinds, const ColFilters* cf) {
     std::vector<std::string> binds;
-    std::string where = BuildUserPageWhere(query, scope, letters, binds, kinds);
+    std::string where = BuildUserPageWhere(query, scope, letters, binds, kinds, cf);
     std::string sql = std::string(kUserSelect) + where + " ORDER BY " + UserOrderBy(sort) + " LIMIT ? OFFSET ?";
     sqlite3_stmt* stmt;
     sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
@@ -3143,9 +3479,9 @@ std::vector<User> SqliteConn::pageUsers(const std::string& query, int scope,
 }
 
 int SqliteConn::countUsers(const std::string& query, int scope,
-                            const std::vector<std::string>& letters, int kinds) {
+                            const std::vector<std::string>& letters, int kinds, const ColFilters* cf) {
     std::vector<std::string> binds;
-    std::string where = BuildUserPageWhere(query, scope, letters, binds, kinds);
+    std::string where = BuildUserPageWhere(query, scope, letters, binds, kinds, cf);
     // kUserSelect's FROM/JOINs are reused so a.label/b.* exist for the WHERE
     // clauses above; COUNT(*) is applied on top of that same join.
     std::string sql =
@@ -3161,6 +3497,28 @@ int SqliteConn::countUsers(const std::string& query, int scope,
     if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
     return count;
+}
+
+std::vector<std::pair<std::string, int>> SqliteConn::distinctUserValues(int col, const std::string& search, const std::string& query, int scope,
+                                         const std::vector<std::string>& letters, int kinds, const ColFilters* cf, int limit) {
+    std::vector<std::pair<std::string, int>> out;
+    const std::string e = col == 12 ? std::string("je.key || ': ' || je.value") : UserColExpr(col);
+    if (e.empty()) return out;
+    std::vector<std::string> binds;
+    std::string where = BuildUserPageWhere(query, scope, letters, binds, kinds, cf, col);       // its own filter does not hide its own values
+    if (!search.empty()) { where += " AND instr(fold(" + e + "), fold(?)) > 0"; binds.push_back(search); }
+    std::string sql = "SELECT " + e + " AS v, COUNT(DISTINCT u.id) FROM users u "
+        "LEFT JOIN apartments a ON a.id = u.apartment_id LEFT JOIN buildings b ON b.id = a.building_id "
+        "LEFT JOIN buildings cb ON cb.id = u.client_building_id " + (col == 12 ? ", " + std::string(kUserExtraEach) + " " : std::string()) +
+        where + " GROUP BY v ORDER BY " + (col == 0 ? "CAST(v AS INTEGER)" : "fold(v)") + " LIMIT ?";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    int i = 1;
+    for (auto& b : binds) sqlite3_bind_text(st, i++, b.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, i, limit);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back({ColText(st, 0), sqlite3_column_int(st, 1)});
+    sqlite3_finalize(st);
+    return out;
 }
 
 // Services table columns: 0 id, 1 label, 2 price, 3 notes.
@@ -3248,15 +3606,17 @@ static std::string BuildPaymentPageWhere(const std::string& startDate, const std
                                           std::vector<int>& intBinds, bool missingReceipt = false, int joint = 0) {
     std::string where = " WHERE 1=1";
     if (missingReceipt) where += kMissingReceiptSql;
+    if (joint == 4) where += " AND (batch_id IS NULL OR (batch_id NOT IN (SELECT batch_id FROM joint_ops) AND batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL))) AND contract_id IS NULL";
+    if (joint == 7) where += " AND contract_id IS NOT NULL";
     if (joint == 1) where += " AND batch_id IN (SELECT batch_id FROM joint_ops)";
     if (joint == 2) where += " AND (batch_id IS NULL OR (batch_id NOT IN (SELECT batch_id FROM joint_ops) AND batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL)))";
     if (joint == 3) where += " AND (batch_id IN (SELECT batch_id FROM joint_ops) OR batch_id IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL))";
     if (!startDate.empty()) {
-        where += " AND pay_date >= ?";
+        where += " AND charge_date >= ?";
         textBinds.push_back(startDate);
     }
     if (!endDate.empty()) {
-        where += " AND pay_date <= ?";
+        where += " AND charge_date <= ?";
         textBinds.push_back(endDate);
     }
     // Placeholder order must equal bind order: every text placeholder first (dates, direction),
@@ -3289,7 +3649,7 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
         std::string part;
         switch (k.first) {
             case 0: part = "id" + d; break;
-            case 1: part = "pay_date" + d; break;
+            case 1: part = "charge_date" + d; break;
             case 2: part = "(SELECT full_name FROM users WHERE users.id = p.user_id)" + d; break;
             case 3: part = "(SELECT label FROM services WHERE services.id = p.service_id)" + d; break;
             case 4: part = "direction" + d; break;
@@ -3303,7 +3663,7 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
         }
         if (!part.empty()) order += std::string(order.empty() ? "" : ", ") + part;
     }
-    if (order.empty()) order = "pay_date DESC";
+    if (order.empty()) order = "charge_date DESC";
     order += ", id DESC";
     std::string sql = std::string("SELECT ") + kPaymentCols + " FROM charges p" + where + " ORDER BY " + order + " LIMIT ? OFFSET ?";
     sqlite3_stmt* stmt;
@@ -3349,7 +3709,7 @@ static const char* kReceiptCols =
 // A receipt with no joint-batch payment AND a building user is still "personal" at this level (the
 // building-as-client case); the sub-tab filters use a broader rule so it lands in Διαχείριση.
 static std::string ReceiptKindSql(const std::string& idExpr) {
-    return "CASE WHEN EXISTS (SELECT 1 FROM payments km WHERE km.receipt_id = " + idExpr + " AND km.batch_id IN (SELECT batch_id FROM joint_ops)) THEN 'joint' ELSE 'personal' END";
+    return "CASE WHEN EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = " + idExpr + " AND kc.batch_id IN (SELECT batch_id FROM joint_ops)) THEN 'joint' ELSE 'personal' END";
 }
 
 static Receipt ReadReceipt(sqlite3_stmt* st) {
@@ -3717,8 +4077,8 @@ struct PayWhere {
 
 PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
     PayWhere w;
-    if (!f.fromDate.empty()) w.text(" AND p.pay_date >= ?", f.fromDate);
-    if (!f.toDate.empty())   w.text(" AND p.pay_date <= ?", f.toDate);
+    if (!f.fromDate.empty()) w.text(" AND p.charge_date >= ?", f.fromDate);
+    if (!f.toDate.empty())   w.text(" AND p.charge_date <= ?", f.toDate);
     if (f.userId >= 0)       w.num(" AND p.user_id = ?", f.userId);
     if (f.serviceId >= 0)    w.num(" AND p.service_id = ?", f.serviceId);
     if (f.apartmentId >= 0)  w.num(" AND p.apartment_id = ?", f.apartmentId);
@@ -3731,11 +4091,16 @@ PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
     if (f.partnerId >= 0) w.num(" AND p.id IN (SELECT charge_id FROM partner_costs WHERE partner_id = ?)", f.partnerId);
     if (f.minDue > 0) w.num(" AND p.amount_due >= ?", f.minDue);
     if (f.maxDue > 0) w.num(" AND p.amount_due <= ?", f.maxDue);
+    if (f.joint == 4) w.where += " AND (p.batch_id IS NULL OR (p.batch_id NOT IN (SELECT batch_id FROM joint_ops) AND p.batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL))) AND p.contract_id IS NULL";
+    if (f.joint == 7) w.where += " AND p.contract_id IS NOT NULL";
     if (f.joint == 1) w.where += " AND p.batch_id IN (SELECT batch_id FROM joint_ops)";
     if (f.joint == 2) w.where += " AND (p.batch_id IS NULL OR (p.batch_id NOT IN (SELECT batch_id FROM joint_ops) AND p.batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL)))";
     if (f.joint == 3) w.where += " AND (p.batch_id IN (SELECT batch_id FROM joint_ops) OR p.batch_id IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL))";
     if (f.jointOpId >= 0) w.num(" AND p.batch_id = (SELECT batch_id FROM joint_ops WHERE id = ?)", f.jointOpId);
     if (f.requireUser) w.where += " AND p.user_id IS NOT NULL";
+    if (f.oursOnly) w.where += " AND COALESCE(p.batch_id, -1) NOT IN (SELECT batch_id FROM joint_ops WHERE kind <> 'fee' AND batch_id IS NOT NULL)"
+                               " AND COALESCE(p.batch_id, -1) NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops"
+                               " WHERE kind <> 'fee' AND json_extract(params_json,'$.cost_batch') IS NOT NULL)";
     bool needNames = !f.text.empty() || !f.clientText.empty() || !f.serviceText.empty() || !f.buildingText.empty();
     if (needNames)
         w.joins = " LEFT JOIN users u ON u.id = p.user_id LEFT JOIN services s ON s.id = p.service_id"
@@ -3743,7 +4108,7 @@ PayWhere BuildPayWhere(const DataConn::PaymentFilter& f) {
     auto has = [&](const std::string& expr, const std::string& needle) {
         if (!needle.empty()) w.text(" AND instr(fold(" + expr + "), fold(?)) > 0", needle);
     };
-    has("COALESCE(u.full_name,'') || ' ' || COALESCE(s.label,'') || ' ' || COALESCE(p.notes,'') || ' ' || p.status || ' ' || p.pay_date || ' ' || COALESCE(ub.address,'')", f.text);
+    has("COALESCE(u.full_name,'') || ' ' || COALESCE(s.label,'') || ' ' || COALESCE(p.notes,'') || ' ' || p.status || ' ' || p.charge_date || ' ' || COALESCE(ub.address,'')", f.text);
     has("COALESCE(u.full_name,'')", f.clientText);
     has("COALESCE(s.label,'')", f.serviceText);
     has("COALESCE(p.notes,'')", f.notesText);
@@ -3785,19 +4150,20 @@ DataConn::MoneyTotals ReadTotals(sqlite3_stmt* st, int c0) {
 
 std::vector<Payment> SqliteConn::findPayments(const PaymentFilter& f, PayOrder order, int offset, int limit) {
     PayWhere w = BuildPayWhere(f);
-    const char* ord = order == PayOrder::DateAsc ? " ORDER BY p.pay_date, p.id"
+    const char* ord = order == PayOrder::DateAsc ? " ORDER BY p.charge_date, p.id"
                     : order == PayOrder::ResolutionDesc ? " ORDER BY p.resolution_date DESC, p.id DESC"
-                    : " ORDER BY p.pay_date DESC, p.id DESC";
+                    : " ORDER BY p.charge_date DESC, p.id DESC";
     std::string custom;
     for (auto& k : f.sort) {
         std::string d = k.second ? " ASC" : " DESC", part;
         switch (k.first) {
-            case 0: part = "p.pay_date" + d; break;
+            case 0: part = "p.charge_date" + d; break;
             case 1: part = "(SELECT full_name FROM users WHERE users.id = p.user_id)" + d; break;
             case 2: part = "(SELECT label FROM services WHERE services.id = p.service_id)" + d; break;
             case 3: part = "p.amount_due" + d; break;
             case 4: part = "p.amount_paid" + d; break;
             case 5: part = "(p.amount_due - p.amount_paid)" + d; break;
+            case 7: part = "p.created_at" + d; break;
             case 6: part = "(CASE WHEN p.status = 'future' THEN 3 WHEN p.amount_paid >= p.amount_due THEN 2 WHEN p.amount_paid > 0 THEN 1 ELSE 0 END)" + d; break;
             default: break;
         }
@@ -3837,12 +4203,12 @@ std::vector<DataConn::GroupedTotals> SqliteConn::paymentTotalsBy(PayGroup group,
     std::string key = group == PayGroup::User ? "COALESCE(p.user_id,-1)"
                     : group == PayGroup::Service ? "p.service_id"
                     : group == PayGroup::Apartment ? "COALESCE(p.apartment_id,-1)"
-                    : group == PayGroup::Day ? "p.pay_date"
+                    : group == PayGroup::Day ? "p.charge_date"
                     : group == PayGroup::ApartmentUser ? "COALESCE(p.apartment_id,-1) || '|' || COALESCE(p.user_id,-1)"
                     : "COALESCE(p.user_id,-1) || '|' || p.service_id";
     // group by the real columns (not the text key) so SQLite can stream an index instead of sorting
     std::string groupCols = group == PayGroup::User ? "p.user_id" : group == PayGroup::Service ? "p.service_id"
-                          : group == PayGroup::Apartment ? "p.apartment_id" : group == PayGroup::Day ? "p.pay_date"
+                          : group == PayGroup::Apartment ? "p.apartment_id" : group == PayGroup::Day ? "p.charge_date"
                           : group == PayGroup::ApartmentUser ? "p.apartment_id, p.user_id"
                           : "p.user_id, p.service_id";
     std::string sql = "SELECT " + key + ", " + kTotalsCols + " FROM charges p" + w.joins + w.where + " GROUP BY " + groupCols;
@@ -3912,7 +4278,7 @@ int SqliteConn::insertCharge(const Payment& in, int batchId) {
     int aptId = p.apartment_id >= 0 ? p.apartment_id : apartmentAt(p.user_id, p.year, p.month, p.day);
     std::string date = PayDate(p);
     sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "INSERT INTO charges (service_id, user_id, apartment_id, pay_date, amount_due, amount_paid, balance, status, "
+    sqlite3_prepare_v2(db, "INSERT INTO charges (service_id, user_id, apartment_id, charge_date, amount_due, amount_paid, balance, status, "
                            "direction, notes, resolution_date, resolved_at, created_at, batch_id) "
                            "VALUES (?,?,?,?,?,0,?,?,?,?,?, datetime(?11,'utc'), COALESCE(datetime(?12,'utc'), datetime('now')), ?13)", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, p.service_id);
@@ -4118,10 +4484,25 @@ int SqliteConn::addPaymentsWithReceipt(const std::vector<Payment>& lines, const 
     return charges.front();
 }
 
+bool SqliteConn::isMonthlyShare(int chargeId) {
+    sqlite3_stmt* st = nullptr; bool yes = false;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE c.id = ? AND o.kind = 'monthly'", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, chargeId); yes = sqlite3_step(st) == SQLITE_ROW; sqlite3_finalize(st);
+    return yes;
+}
+
 bool SqliteConn::editPayment(int id, const Payment& in) {
     Payment p = in;
     p.amount_due = RoundMoney(p.amount_due);
     Payment old = getPaymentById(id);
+    if (old.contract_id > 0 && ToCents(old.amount_due) != ToCents(p.amount_due)) { lastError_ = "Το ποσό δόσης σύμβασης δεν αλλάζει."; return false; }
+    if (isMonthlyShare(id) && (ToCents(old.amount_due) != ToCents(p.amount_due) || old.user_id != p.user_id)) { lastError_ = "Το μερίδιο μηνιαίων εξόδων δεν αλλάζει: ακυρώστε όλη την καταχώριση."; return false; }
+    if (old.user_id != p.user_id) {          // money that also paid other charges can't follow this one to someone else
+        sqlite3_stmt* sh = nullptr; bool shared = false;
+        sqlite3_prepare_v2(db, "SELECT 1 FROM allocations a WHERE a.charge_id = ?1 AND EXISTS (SELECT 1 FROM allocations x WHERE x.payment_id = a.payment_id AND x.charge_id <> ?1)", -1, &sh, nullptr);
+        sqlite3_bind_int(sh, 1, id); shared = sqlite3_step(sh) == SQLITE_ROW; sqlite3_finalize(sh);
+        if (shared) { lastError_ = "Η πληρωμή αυτής της χρέωσης εξοφλεί κι άλλες χρεώσεις: ο πελάτης δεν αλλάζει."; return false; }
+    }
     int aptId = p.apartment_id;
     if (aptId < 0) {
         bool moved = old.user_id != p.user_id || old.year != p.year || old.month != p.month || old.day != p.day;
@@ -4130,7 +4511,7 @@ bool SqliteConn::editPayment(int id, const Payment& in) {
     if (!savepoint("edit_line")) return false;
     std::string date = PayDate(p);
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db, "UPDATE charges SET pay_date=?, amount_due=?, status=?, notes=?, user_id=?, direction=?, "
+    sqlite3_prepare_v2(db, "UPDATE charges SET charge_date=?, amount_due=?, status=?, notes=?, user_id=?, direction=?, "
                            "resolution_date=?, resolved_at=datetime(?8,'utc'), apartment_id=? WHERE id=?", -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, date.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_double(stmt, 2, p.amount_due);
@@ -4149,17 +4530,17 @@ bool SqliteConn::editPayment(int id, const Payment& in) {
     // money paid only for this line follows the line's client / date / direction (as the old single-row model did)
     std::string sid = std::to_string(id);
     if (!executeQuery("UPDATE payments SET user_id = (SELECT user_id FROM charges WHERE id = " + sid + "), "
-                      "pay_date = (SELECT pay_date FROM charges WHERE id = " + sid + "), "
                       "direction = (SELECT direction FROM charges WHERE id = " + sid + ") "
                       "WHERE id IN (SELECT a.payment_id FROM allocations a WHERE a.charge_id = " + sid + ") "
                       "AND (SELECT COUNT(*) FROM allocations x WHERE x.payment_id = payments.id) = 1 "
                       "AND (receipt_id IS NULL OR (SELECT status FROM receipts r WHERE r.id = payments.receipt_id) = 'void') "
                       "AND (user_id IS NOT (SELECT user_id FROM charges WHERE id = " + sid + ") "
-                      "  OR pay_date IS NOT (SELECT pay_date FROM charges WHERE id = " + sid + ") "
                       "  OR direction IS NOT (SELECT direction FROM charges WHERE id = " + sid + "));"))
         { rollbackTo("edit_line"); return false; }
     double desired = p.status == "future" ? 0.0 : p.amount_paid;
     if (!reconcilePaid(id, desired)) { rollbackTo("edit_line"); return false; }
+    { Payment now = getPaymentById(id);
+      if (ToCents(now.amount_paid) > ToCents(now.amount_due)) { lastError_ = "Το ποσό της χρέωσης δεν μπορεί να είναι μικρότερο από όσα έχουν πληρωθεί (" + FormatMoney(now.amount_paid) + " €)."; rollbackTo("edit_line"); return false; } }
     if (!closePlanIfPaid(old.batch_id)) { rollbackTo("edit_line"); return false; }
     if (!release("edit_line")) { rollbackTo("edit_line"); return false; }
     return true;
@@ -4179,8 +4560,101 @@ bool SqliteConn::payOutCharge(int chargeId, double amount, const std::string& pa
     if (a == bal && !executeQuery("UPDATE charges SET status = 'paid' WHERE id = " + std::to_string(chargeId) + ";")) { rollbackTo("pay_out"); return false; }
     return release("pay_out");
 }
+// A payment to a partner with the document he gave us for it (docType "invoice", "receipt", or "" for none). All or nothing.
+bool SqliteConn::payOutWithDoc(int chargeId, double amount, const std::string& payDate, const std::string& method, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) {
+    Payment c = getPaymentById(chargeId);
+    if (c.id <= 0 || c.direction != "out") { lastError_ = "Η γραμμή δεν είναι κόστος που πληρώνουμε."; return false; }
+    long long a = ToCents(amount), bal = ToCents(c.balance);
+    if (a <= 0) { lastError_ = "Το ποσό πρέπει να είναι μεγαλύτερο από 0."; return false; }
+    if (a > bal) { lastError_ = "Το ποσό ξεπερνά αυτό που οφείλουμε (" + FormatMoney(c.balance) + " €)."; return false; }
+    if (payDate.size() != 10) { lastError_ = "Μη έγκυρη ημερομηνία."; return false; }
+    if (!docType.empty() && docDate.size() != 10) { lastError_ = "Ορίστε την ημερομηνία του παραστατικού."; return false; }
+    if (!savepoint("pay_doc")) return false;
+    MoneyPayment m; m.user_id = -1; m.direction = "out"; m.amount = FromCents(a); m.batch_id = c.batch_id; m.pay_date = payDate; m.method = method; m.reference = number;
+    int mid = insertMoney(m);
+    if (mid < 0 || !allocate(mid, chargeId, FromCents(a))) { rollbackTo("pay_doc"); return false; }
+    if (!docType.empty()) {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "INSERT INTO partner_docs (payment_id, charge_id, partner_id, doc_type, number, doc_date, amount, notes) VALUES (?,?,(SELECT partner_id FROM partner_costs WHERE charge_id = ?2),?,?,?,?,?)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, mid); sqlite3_bind_int(st, 2, chargeId); sqlite3_bind_text(st, 3, docType.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, number.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 5, docDate.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(st, 6, FromCents(a)); sqlite3_bind_text(st, 7, notes.c_str(), -1, SQLITE_TRANSIENT);
+        const int rc = sqlite3_step(st); if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db); sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { rollbackTo("pay_doc"); return false; }
+    }
+    return release("pay_doc");
+}
+
+std::vector<DataConn::PartnerDoc> SqliteConn::getPartnerDocs(int partnerId, const std::string& from, const std::string& to) {
+    std::vector<PartnerDoc> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT d.id, d.payment_id, COALESCE(d.partner_id,-1), COALESCE(pr.name,''), d.doc_type, COALESCE(d.number,''), d.doc_date, d.amount, COALESCE(d.notes,''), COALESCE(m.pay_date,''), COALESCE(m.method,''), COALESCE(s.label,''), COALESCE(d.charge_id,-1) "
+                               "FROM partner_docs d LEFT JOIN partners pr ON pr.id = d.partner_id LEFT JOIN payments m ON m.id = d.payment_id LEFT JOIN charges c ON c.id = d.charge_id LEFT JOIN services s ON s.id = c.service_id "
+                               "WHERE (?1 <= 0 OR d.partner_id = ?1) AND (?2 = '' OR d.doc_date >= ?2) AND (?3 = '' OR d.doc_date <= ?3) ORDER BY d.doc_date DESC, d.id DESC", -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, partnerId); sqlite3_bind_text(st, 2, from.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, to.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        PartnerDoc d; d.id = sqlite3_column_int(st, 0); d.payment_id = sqlite3_column_int(st, 1); d.partner_id = sqlite3_column_int(st, 2); d.partner = ColText(st, 3); d.type = ColText(st, 4); d.number = ColText(st, 5);
+        d.date = ColText(st, 6); d.amount = RoundMoney(sqlite3_column_double(st, 7)); d.notes = ColText(st, 8); d.pay_date = ColText(st, 9); d.method = ColText(st, 10); d.what = ColText(st, 11); d.charge_id = sqlite3_column_int(st, 12);
+        out.push_back(d);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+// What a charge is: part of a contract, of a package (several different services charged together), or a single service.
+#define KIND_SQL "CASE WHEN c.contract_id IS NOT NULL THEN 'contract' WHEN c.batch_id IS NOT NULL AND (SELECT COUNT(DISTINCT x.service_id) FROM charges x WHERE x.batch_id = c.batch_id AND x.direction = 'in') > 1 THEN 'package' ELSE 'service' END"
+#define OURS_SQL "(c.batch_id IS NULL OR (c.batch_id NOT IN (SELECT batch_id FROM joint_ops WHERE batch_id IS NOT NULL) AND c.batch_id NOT IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE json_extract(params_json,'$.cost_batch') IS NOT NULL)))"
+
+std::vector<DataConn::ClientMix> SqliteConn::clientMix(const std::string& from, const std::string& to) {
+    std::vector<ClientMix> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT user_id, SUM(CASE WHEN k='service' THEN v ELSE 0 END), SUM(CASE WHEN k='package' THEN v ELSE 0 END), SUM(CASE WHEN k='contract' THEN v ELSE 0 END) FROM ("
+                               "SELECT c.user_id AS user_id, " KIND_SQL " AS k, CAST(ROUND(c.amount_due*100) AS INTEGER) AS v FROM charges c WHERE c.direction = 'in' AND c.status != 'future' AND c.user_id IS NOT NULL AND " OURS_SQL
+                               " AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2)) GROUP BY user_id", -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_text(st, 1, from.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, to.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) { ClientMix m; m.user_id = sqlite3_column_int(st, 0); m.services = FromCents(sqlite3_column_int64(st, 1)); m.packages = FromCents(sqlite3_column_int64(st, 2)); m.contracts = FromCents(sqlite3_column_int64(st, 3)); out.push_back(m); }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<DataConn::ProfitRow> SqliteConn::profitAnalysis(const std::string& from, const std::string& to) {
+    std::vector<ProfitRow> out; sqlite3_stmt* st = nullptr;
+    const char* sql =
+        "SELECT k, label, SUM(d='in'), SUM(CASE WHEN d='in' THEN due ELSE 0 END), SUM(CASE WHEN d='out' THEN due ELSE 0 END), SUM(CASE WHEN d='in' THEN paid ELSE 0 END), SUM(CASE WHEN d='in' THEN bal ELSE 0 END), SUM(CASE WHEN d='out' THEN paid ELSE 0 END), SUM(CASE WHEN d='out' THEN bal ELSE 0 END), COUNT(DISTINCT CASE WHEN d='in' THEN uid END), "
+        "  SUM(CASE WHEN d='in' THEN wdays ELSE 0 END) / NULLIF(SUM(CASE WHEN d='in' THEN paid ELSE 0 END),0) FROM ("
+        " SELECT " KIND_SQL " AS k, CASE WHEN c.contract_id IS NOT NULL THEN COALESCE((SELECT label FROM contracts WHERE id = c.contract_id),'') "
+        "   WHEN (" KIND_SQL ") = 'package' THEN COALESCE(NULLIF((SELECT label FROM payment_batches WHERE id = c.batch_id),''),'Πακέτο') ELSE COALESCE(s.label,'') END AS label, c.direction AS d, c.user_id AS uid, "
+        "   CAST(ROUND(c.amount_due*100) AS INTEGER) AS due, CAST(ROUND(c.amount_paid*100) AS INTEGER) AS paid, CAST(ROUND(c.balance*100) AS INTEGER) AS bal, "
+        "   COALESCE((SELECT SUM(CAST(ROUND(a.amount*100) AS INTEGER) * MAX(0, julianday(m.pay_date) - julianday(c.charge_date))) FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id),0) AS wdays "
+        " FROM charges c LEFT JOIN services s ON s.id = c.service_id WHERE c.status != 'future' AND " OURS_SQL " AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2)"
+        ") GROUP BY k, label";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_text(st, 1, from.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, to.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        ProfitRow r; r.kind = ColText(st, 0); r.label = ColText(st, 1); r.lines = sqlite3_column_int(st, 2); r.charged = FromCents(sqlite3_column_int64(st, 3)); r.cost = FromCents(sqlite3_column_int64(st, 4));
+        r.collected = FromCents(sqlite3_column_int64(st, 5)); r.owed = FromCents(sqlite3_column_int64(st, 6)); r.costPaid = FromCents(sqlite3_column_int64(st, 7)); r.costOwed = FromCents(sqlite3_column_int64(st, 8)); r.clients = sqlite3_column_int(st, 9);
+        r.avgDays = sqlite3_column_type(st, 10) == SQLITE_NULL ? -1.0 : sqlite3_column_double(st, 10);
+        out.push_back(r);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+// Contract installments only: what was paid within 30 days of its date, against all that should have been paid by now.
+std::map<int, std::pair<double, double>> SqliteConn::contractPayScores() {
+    std::map<int, std::pair<double, double>> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT c.user_id, SUM(CASE WHEN m.pay_date <= date(c.charge_date,'+30 day') THEN CAST(ROUND(a.amount*100) AS INTEGER) ELSE 0 END), SUM(CAST(ROUND(a.amount*100) AS INTEGER)) "
+                               "FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN charges c ON c.id = a.charge_id WHERE c.contract_id IS NOT NULL AND c.direction = 'in' GROUP BY c.user_id", -1, &st, nullptr) == SQLITE_OK)
+        while (sqlite3_step(st) == SQLITE_ROW) out[sqlite3_column_int(st, 0)] = { FromCents(sqlite3_column_int64(st, 1)), FromCents(sqlite3_column_int64(st, 2)) };
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db, "SELECT c.user_id, SUM(CAST(ROUND(c.balance*100) AS INTEGER)) FROM charges c WHERE c.contract_id IS NOT NULL AND c.direction = 'in' AND c.status != 'future' AND c.balance > 0.005 AND c.charge_date < date('now','localtime','-30 day') GROUP BY c.user_id", -1, &st, nullptr) == SQLITE_OK)
+        while (sqlite3_step(st) == SQLITE_ROW) { auto& v = out[sqlite3_column_int(st, 0)]; v.second = FromCents(ToCents(v.second) + sqlite3_column_int64(st, 1)); }
+    sqlite3_finalize(st);
+    return out;
+}
+
 bool SqliteConn::removePayment(int id) {
     Payment old = getPaymentById(id);
+    if (old.contract_id > 0) { lastError_ = "Η δόση σύμβασης δεν διαγράφεται."; return false; }
+    if (isMonthlyShare(id)) { lastError_ = "Το μερίδιο μηνιαίων εξόδων δεν διαγράφεται μόνο του: ακυρώστε όλη την καταχώριση."; return false; }
     int batch = old.batch_id;
     if (!savepoint("remove_line")) return false;
     std::string sid = std::to_string(id);
@@ -4231,6 +4705,12 @@ int SqliteConn::issueReceiptInTx(const Receipt& in, const std::vector<int>& mone
         users.insert(sqlite3_column_int(st, 4));
         sqlite3_finalize(st);
         if (direction != "in")     return refuse("Η πληρωμή #" + std::to_string(mid) + " είναι πληρωμή προς τρίτους, όχι είσπραξη.");
+        {   // a receipt proves money that paid charges: its total is exactly what its lines say
+            sqlite3_stmt* ac = nullptr; long long allocated = 0;
+            sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(CAST(ROUND(amount*100) AS INTEGER)),0) FROM allocations WHERE payment_id = ?", -1, &ac, nullptr);
+            sqlite3_bind_int(ac, 1, mid); if (sqlite3_step(ac) == SQLITE_ROW) allocated = sqlite3_column_int64(ac, 0); sqlite3_finalize(ac);
+            if (allocated != cents) return refuse("Η απόδειξη πρέπει να ταιριάζει ακριβώς με τις χρεώσεις: η πληρωμή είναι " + FormatMoney(FromCents(cents)) + " € αλλά εξοφλεί " + FormatMoney(FromCents(allocated)) + " €.");
+        }
         if (onReceipt == "issued") return refuse("Η πληρωμή #" + std::to_string(mid) + " έχει ήδη απόδειξη.");
         if (batch > 0) batches.insert(batch); else anyUnbatched = true;
         totalCents += cents;
@@ -4244,9 +4724,11 @@ int SqliteConn::issueReceiptInTx(const Receipt& in, const std::vector<int>& mone
     Receipt r = in;
     r.series = series; r.number = number; r.total = FromCents(totalCents); r.rf_code = rf;
     if (r.user_id < 0 && users.size() == 1) r.user_id = *users.begin();
-    if (r.issue_date.empty()) {
-        std::time_t t = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &t);
-        char d[16]; std::strftime(d, sizeof(d), "%Y-%m-%d", &tm); r.issue_date = d;
+    if (r.issue_date.empty()) {        // the screens ask for the date; anything automatic uses the day the money came
+        std::string list0; for (int mid : ids) list0 += (list0.empty() ? "" : ",") + std::to_string(mid);
+        sqlite3_stmt* ds = nullptr; sqlite3_prepare_v2(db, ("SELECT MAX(pay_date) FROM payments WHERE id IN (" + list0 + ")").c_str(), -1, &ds, nullptr);
+        if (sqlite3_step(ds) == SQLITE_ROW) r.issue_date = ColText(ds, 0);
+        sqlite3_finalize(ds);
     }
     sqlite3_stmt* st = nullptr;
     sqlite3_prepare_v2(db, "INSERT INTO receipts (series, number, issue_date, user_id, building_id, total, method, rf_code, paper_ref, bank_ref, notes) "
@@ -4272,6 +4754,10 @@ int SqliteConn::issueReceiptInTx(const Receipt& in, const std::vector<int>& mone
                       (r.bank_ref.empty() ? std::string() : ", reference = " + std::string("'") + [&] { std::string e; for (char c : r.bank_ref) { if (c == '\'') e += '\''; e += c; } return e; }() + "'") +
                       " WHERE id IN (" + list + ");"))
         return refuse(std::string("Αποτυχία σύνδεσης πληρωμής: ") + lastError_);
+    if (!executeQuery("INSERT INTO receipt_lines (receipt_id, charge_id, service_id, charge_date, label, amount) "
+                      "SELECT " + std::to_string(r.id) + ", a.charge_id, c.service_id, c.charge_date, COALESCE(c.notes,''), SUM(CAST(ROUND(a.amount*100) AS INTEGER)) / 100.0 "
+                      "FROM allocations a JOIN charges c ON c.id = a.charge_id WHERE a.payment_id IN (" + list + ") GROUP BY a.charge_id;"))
+        return refuse(std::string("Αποτυχία γραμμών απόδειξης: ") + lastError_);
     return r.id;
 }
 
@@ -4325,9 +4811,6 @@ int SqliteConn::recordPayment(const MoneyPayment& money, const std::vector<Alloc
     int mid = insertMoney(m);
     if (mid < 0) return fail();
     for (auto& a : allocations) {
-        // money on a scheduled installment makes it real (resolved today)
-        if (!executeQuery("UPDATE charges SET status = 'paid', resolved_at = datetime('now') WHERE id = " +
-                          std::to_string(a.charge_id) + " AND status = 'future';")) return fail();
         if (!allocate(mid, a.charge_id, a.amount)) return fail();
     }
     if (receipt && issueReceiptInTx(*receipt, {mid}) < 0) return fail();
@@ -4396,7 +4879,7 @@ std::vector<Allocation> SqliteConn::getAllocationsForMoney(int paymentId) {
 std::vector<Payment> SqliteConn::getOpenCharges(int userId) {
     return QueryPayments(db, std::string("SELECT ") + kPaymentCols +
         // open bills, plus the not-yet-due installments of payment plans (they can be paid early)
-        " FROM charges p WHERE p.user_id = ? AND p.balance > 0.005 ORDER BY p.pay_date, p.id", {userId});
+        " FROM charges p WHERE p.user_id = ? AND p.balance > 0.005 ORDER BY p.charge_date, p.id", {userId});
 }
 
 double SqliteConn::getClientCredit(int userId) {
@@ -4431,13 +4914,20 @@ int SqliteConn::getReceiptIdForPayment(int chargeId) {
 std::vector<DataConn::ReceiptLine> SqliteConn::getReceiptLines(int receiptId) {
     std::vector<ReceiptLine> out;
     sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "SELECT a.charge_id, SUM(CAST(ROUND(a.amount*100) AS INTEGER)) FROM allocations a JOIN payments m ON m.id = a.payment_id "
-                           "WHERE m.receipt_id = ? GROUP BY a.charge_id ORDER BY a.charge_id", -1, &st, nullptr);
+    sqlite3_prepare_v2(db, "SELECT charge_id, CAST(ROUND(amount*100) AS INTEGER), COALESCE(service_id,-1), COALESCE(charge_date,''), COALESCE(label,'') FROM receipt_lines WHERE receipt_id = ? ORDER BY charge_id", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, receiptId);
-    std::vector<std::pair<int, long long>> rows;
-    while (sqlite3_step(st) == SQLITE_ROW) rows.push_back({sqlite3_column_int(st, 0), sqlite3_column_int64(st, 1)});
+    struct Row { int cid; long long cents; int svc; std::string date, label; };
+    std::vector<Row> rows;
+    while (sqlite3_step(st) == SQLITE_ROW) rows.push_back({sqlite3_column_int(st, 0), sqlite3_column_int64(st, 1), sqlite3_column_int(st, 2), ColText(st, 3), ColText(st, 4)});
     sqlite3_finalize(st);
-    for (auto& [cid, cents] : rows) out.push_back({getPaymentById(cid), FromCents(cents)});
+    for (auto& r : rows) {
+        Payment c = getPaymentById(r.cid);
+        if (c.id < 0) {                 // the charge is gone (its receipt was voided first): the receipt still says what it was
+            c.id = r.cid; c.service_id = r.svc; c.notes = r.label; c.amount_due = FromCents(r.cents); c.amount_paid = FromCents(r.cents);
+            std::sscanf(r.date.c_str(), "%d-%d-%d", &c.year, &c.month, &c.day);
+        }
+        out.push_back({c, FromCents(r.cents)});
+    }
     return out;
 }
 
@@ -4459,16 +4949,15 @@ static std::string ReceiptWhere(const DataConn::ReceiptQuery& q, std::vector<std
         binds.push_back(q.text); binds.push_back(q.text);
     }
     if (q.kind == "managed") {
-        // Διαχείριση: the building paid (as a client) for an expense, OR a resident paid
-        // a joint charge. Both are represented by "money that belongs to a building's account".
-        w += " AND (r.user_id IN (SELECT id FROM users WHERE kind = 'building')"
-             " OR EXISTS (SELECT 1 FROM payments km WHERE km.receipt_id = r.id AND km.batch_id IN (SELECT batch_id FROM joint_ops)))";
+        // Διαχείριση: only what a resident paid for his building. The building's own bills to us are under Πελάτες.
+        w += " AND (EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.batch_id IN (SELECT batch_id FROM joint_ops)))";
     }
+    if (q.kind == "contracts") w += " AND EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.contract_id IS NOT NULL)";
     if (q.kind == "clients") {
+        w += " AND NOT EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.contract_id IS NOT NULL)";
         // Πελάτες: money received from a person/business client for their OWN purchase.
-        // Excluded: buildings and any receipt that has a joint-batch payment.
-        w += " AND r.user_id NOT IN (SELECT id FROM users WHERE kind = 'building')"
-             " AND NOT EXISTS (SELECT 1 FROM payments km WHERE km.receipt_id = r.id AND km.batch_id IN (SELECT batch_id FROM joint_ops))";
+        // Excluded: any receipt for a resident's share. A building's own bills are listed here in Πληρωμές, so their receipts are too.
+        w += " AND NOT EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.batch_id IN (SELECT batch_id FROM joint_ops))";
     }
     const std::string covers = "SELECT 1 FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id WHERE m.receipt_id = r.id";
     std::string conds;
@@ -4513,6 +5002,8 @@ std::vector<Receipt> SqliteConn::searchReceipts(const ReceiptQuery& q, int offse
         sortCols.push_back("r.status");
         sortCols.push_back(ReceiptKindSql("r.id"));
     }
+    while (sortCols.size() < 9) sortCols.push_back("r.id");        // the actions column
+    sortCols.push_back("r.created_at");                            // 9: when it was logged
     std::string sql = std::string("SELECT ") + kReceiptCols + ", " + ReceiptKindSql("r.id") + " FROM receipts r" + ReceiptWhere(q, binds) +
                       OrderBy(q.sort, sortCols, "r.issue_date DESC, r.id DESC") + " LIMIT ? OFFSET ?";
     std::vector<Receipt> out;
@@ -4537,6 +5028,534 @@ long long SqliteConn::countReceipts(const ReceiptQuery& q, double* total) {
     if (sqlite3_step(st) == SQLITE_ROW) { n = sqlite3_column_int64(st, 0); if (total) *total = FromCents((long long)sqlite3_column_double(st, 1)); }
     sqlite3_finalize(st);
     return n;
+}
+
+// --- ΜΗΝΙΑΙΑ ΕΞΟΔΑ ------------------------------------------------------------------------------------------
+int SqliteConn::addMonthlyBill(int buildingId, const std::string& ym, const std::string& note, const std::vector<BillReason>& reasons, const std::vector<JointShare>& shares) {
+    auto refuse = [&](const std::string& why) { lastError_ = why; return -1; };
+    if (getBuildingById(buildingId).id < 0) return refuse("Η πολυκατοικία δεν υπάρχει.");
+    int y = 0, m = 0;
+    if (ym.size() != 7 || std::sscanf(ym.c_str(), "%d-%d", &y, &m) != 2 || m < 1 || m > 12) return refuse("Μη έγκυρος μήνας.");
+    long long total = 0;
+    for (auto& r : reasons) {
+        if (r.reason.find_first_not_of(" \t") == std::string::npos) return refuse("Κάθε έξοδο χρειάζεται αιτία.");
+        if (ToCents(r.amount) <= 0) return refuse("Κάθε έξοδο πρέπει να είναι μεγαλύτερο από 0.");
+        total += ToCents(r.amount);
+    }
+    if (total <= 0) return refuse("Δεν γράφτηκε κανένα έξοδο.");
+    // charged on the month's last day, or today while the month is still running: the residents owe at once
+    std::time_t now = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &now); char today[16]; std::strftime(today, sizeof(today), "%Y-%m-%d", &tm);
+    std::string date; {
+        sqlite3_stmt* d = nullptr; sqlite3_prepare_v2(db, "SELECT date(? || '-01', '+1 month', '-1 day')", -1, &d, nullptr);
+        sqlite3_bind_text(d, 1, ym.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(d) == SQLITE_ROW) date = ColText(d, 0);
+        sqlite3_finalize(d);
+    }
+    if (date > today) date = today;
+    if (!savepoint("mbill")) return -1;
+    auto fail = [&]() { rollbackTo("mbill"); return -1; };
+    int svc = -1;
+    for (auto& j : getJointCatalog(true)) if (j.service.label == "Μηνιαία έξοδα") svc = j.service.id;
+    if (svc <= 0) { Service sv; sv.label = "Μηνιαία έξοδα"; sv.extra_notes = "Τα έξοδα του μήνα μιας πολυκατοικίας, ανά ένοικο."; int jid = addJointService(sv, "equal"); if (jid > 0) svc = getJointServiceById(jid).service.id; }
+    if (svc <= 0) return fail();
+    JointOp op; op.building_id = buildingId; op.source_type = "service"; op.source_id = svc; op.kind = "monthly"; op.label = "Έξοδα " + ym; op.total = FromCents(total); op.op_date = date;
+    JointLine line; line.service_id = svc; line.total = FromCents(total);
+    int opId = chargeJoint(op, {line}, shares);
+    if (opId <= 0) return fail();
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO monthly_bills (building_id, ym, op_id, total, note) VALUES (?,?,?,?,?)", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, buildingId); sqlite3_bind_text(st, 2, ym.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 3, opId);
+    sqlite3_bind_double(st, 4, FromCents(total)); sqlite3_bind_text(st, 5, note.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    const int id = (int)sqlite3_last_insert_rowid(db);
+    for (auto& r : reasons) {
+        sqlite3_prepare_v2(db, "INSERT INTO monthly_bill_reasons (bill_id, reason, amount) VALUES (?,?,?)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, id); sqlite3_bind_text(st, 2, r.reason.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_double(st, 3, RoundMoney(r.amount));
+        rc = sqlite3_step(st); sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    }
+    if (!release("mbill")) return fail();
+    return id;
+}
+
+std::vector<DataConn::MonthlyBill> SqliteConn::getMonthlyBills(int buildingId, const std::string& ym, bool openOnly) {
+    std::vector<MonthlyBill> out; sqlite3_stmt* st = nullptr;
+    std::string sql =
+        "SELECT * FROM (SELECT b.id AS id, b.building_id, b.ym AS ym, b.op_id, b.status AS status, COALESCE(b.resolved_date,''), COALESCE(b.note,''), b.total, b.covered, "
+        "  COALESCE((SELECT SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)) FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.id = b.op_id AND c.direction = 'in'),0), "
+        "  COALESCE((SELECT SUM(CAST(ROUND(c.balance*100) AS INTEGER)) FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.id = b.op_id AND c.direction = 'in'),0) AS owed, "
+        "  COALESCE(datetime(b.created_at,'localtime'),'') "
+        "  FROM monthly_bills b WHERE b.building_id = ?1) t WHERE (?2 = '' OR t.ym = ?2)";
+    if (openOnly) sql += " AND (t.status = 'open' OR t.owed > 0)";
+    sql += " ORDER BY t.id DESC";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, buildingId); sqlite3_bind_text(st, 2, ym.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        MonthlyBill b; b.id = sqlite3_column_int(st, 0); b.building_id = sqlite3_column_int(st, 1); b.ym = ColText(st, 2); b.op_id = sqlite3_column_int(st, 3);
+        b.status = ColText(st, 4); b.resolved_date = ColText(st, 5); b.note = ColText(st, 6); b.total = RoundMoney(sqlite3_column_double(st, 7)); b.covered = RoundMoney(sqlite3_column_double(st, 8));
+        b.collected = FromCents(sqlite3_column_int64(st, 9)); b.owed = FromCents(sqlite3_column_int64(st, 10)); b.created_at = ColText(st, 11);
+        out.push_back(b);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<DataConn::BillReason> SqliteConn::getBillReasons(int billId) {
+    std::vector<BillReason> out; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT reason, amount FROM monthly_bill_reasons WHERE bill_id = ? ORDER BY id", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, billId);
+    while (sqlite3_step(st) == SQLITE_ROW) { BillReason r; r.reason = ColText(st, 0); r.amount = RoundMoney(sqlite3_column_double(st, 1)); out.push_back(r); }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<DataConn::BillShare> SqliteConn::getBillShares(int billId) {
+    std::vector<BillShare> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT c.user_id, c.apartment_id, COALESCE((SELECT r.full_name FROM residents r WHERE r.user_id = c.user_id ORDER BY r.start_date DESC LIMIT 1), u.full_name, ''), "
+                           "COALESCE(a.label,''), c.id, CAST(ROUND(c.amount_due*100) AS INTEGER), CAST(ROUND(c.amount_paid*100) AS INTEGER), CAST(ROUND(c.balance*100) AS INTEGER) "
+                           "FROM monthly_bills b JOIN joint_ops o ON o.id = b.op_id JOIN charges c ON c.batch_id = o.batch_id AND c.direction = 'in' "
+                           "LEFT JOIN users u ON u.id = c.user_id LEFT JOIN apartments a ON a.id = c.apartment_id WHERE b.id = ? ORDER BY a.label, c.id", -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, billId);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const int uid = sqlite3_column_int(st, 0), apt = sqlite3_column_int(st, 1);
+        if (out.empty() || out.back().user_id != uid || out.back().apartment_id != apt) { out.emplace_back(); out.back().user_id = uid; out.back().apartment_id = apt; out.back().name = ColText(st, 2); out.back().apartment = ColText(st, 3); }
+        BillShare& s = out.back(); s.charges.push_back(sqlite3_column_int(st, 4));
+        s.amount = FromCents(ToCents(s.amount) + sqlite3_column_int64(st, 5)); s.paid = FromCents(ToCents(s.paid) + sqlite3_column_int64(st, 6)); s.balance = FromCents(ToCents(s.balance) + sqlite3_column_int64(st, 7));
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+bool SqliteConn::cancelMonthlyBill(int billId) {
+    MonthlyBill b; bool found = false; int bid = -1; std::string ym;
+    { sqlite3_stmt* st = nullptr; sqlite3_prepare_v2(db, "SELECT building_id, ym FROM monthly_bills WHERE id = ?", -1, &st, nullptr); sqlite3_bind_int(st, 1, billId);
+      if (sqlite3_step(st) == SQLITE_ROW) { bid = sqlite3_column_int(st, 0); ym = ColText(st, 1); } sqlite3_finalize(st); }
+    for (auto& x : getMonthlyBills(bid, ym)) if (x.id == billId) { b = x; found = true; }
+    if (!found) { lastError_ = "Τα έξοδα δεν υπάρχουν."; return false; }
+    if (b.status != "open") { lastError_ = "Το κόστος έχει ήδη πληρωθεί και δεν ακυρώνεται."; return false; }
+    if (ToCents(b.collected) > 0) { lastError_ = "Έχουν γίνει εισπράξεις για αυτό το κόστος και δεν ακυρώνεται."; return false; }
+    if (!savepoint("mcancel")) return false;
+    const std::string op = std::to_string(b.op_id), id = std::to_string(billId);
+    const std::string snap = "{\"bill\":" + TableRowsJson(db, "monthly_bills", "id = " + id) + ",\"reasons\":" + TableRowsJson(db, "monthly_bill_reasons", "bill_id = " + id) +
+        ",\"shares\":" + TableRowsJson(db, "joint_shares", "op_id = " + op) + ",\"charges\":" + TableRowsJson(db, "charges", "batch_id = (SELECT batch_id FROM joint_ops WHERE id = " + op + ")") + "}";
+    const bool ok = executeQuery("DELETE FROM monthly_bill_reasons WHERE bill_id = " + id + ";") && executeQuery("DELETE FROM monthly_bills WHERE id = " + id + ";") &&
+                    executeQuery("DELETE FROM charges WHERE batch_id = (SELECT batch_id FROM joint_ops WHERE id = " + op + ");") &&
+                    executeQuery("DELETE FROM joint_shares WHERE op_id = " + op + ";") && executeQuery("DELETE FROM joint_ops WHERE id = " + op + ";");
+    if (!ok) { std::string why = lastError_; rollbackTo("mcancel"); lastError_ = why; return false; }
+    ArchiveDeletion(db, "charge", b.op_id, "Μηνιαία έξοδα " + b.ym + " · " + FormatMoney(b.total) + " €", false, snap);
+    return release("mcancel");
+}
+
+bool SqliteConn::resolveMonthlyBill(int billId, const std::string& date) {
+    MonthlyBill b; bool found = false;
+    { sqlite3_stmt* st = nullptr; sqlite3_prepare_v2(db, "SELECT building_id, ym FROM monthly_bills WHERE id = ?", -1, &st, nullptr); sqlite3_bind_int(st, 1, billId);
+      if (sqlite3_step(st) == SQLITE_ROW) { b.building_id = sqlite3_column_int(st, 0); b.ym = ColText(st, 1); found = true; } sqlite3_finalize(st); }
+    if (!found) { lastError_ = "Τα έξοδα δεν υπάρχουν."; return false; }
+    found = false;
+    for (auto& x : getMonthlyBills(b.building_id, b.ym)) if (x.id == billId) { b = x; found = true; }
+    if (!found) return false;
+    if (b.status == "resolved") { lastError_ = "Τα έξοδα έχουν ήδη πληρωθεί."; return false; }
+    if (ToCents(b.owed) > ToCents(getFundBalance(b.building_id))) { lastError_ = "Το αποθεματικό δεν φτάνει για να καλύψει τα " + FormatMoney(b.owed) + " € που λείπουν."; return false; }
+    if (!savepoint("mresolve")) return false;
+    if (ToCents(b.owed) > 0 && fundExpense(b.building_id, b.owed, date, "Κάλυψη κόστους " + b.ym + ": συνολικό κόστος " + FormatMoney(b.total) + " €, εισπράχθηκαν " + FormatMoney(b.collected) + " €", -1, "") <= 0) { rollbackTo("mresolve"); return false; }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE monthly_bills SET status = 'resolved', resolved_date = ?, covered = ? WHERE id = ?", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, date.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_double(st, 2, b.owed); sqlite3_bind_int(st, 3, billId);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); rollbackTo("mresolve"); return false; }
+    return release("mresolve");
+}
+
+std::vector<DataConn::ResidentOwing> SqliteConn::residentOwingsByMonth() {
+    std::vector<ResidentOwing> out; sqlite3_stmt* st = nullptr;
+    const char* sql =
+        "SELECT o.building_id, c.user_id, COALESCE(b.address,''), COALESCE(mb.ym, substr(o.op_date,1,7)) AS ym, "
+        "  COALESCE((SELECT r.full_name FROM residents r WHERE r.user_id = c.user_id ORDER BY r.start_date DESC LIMIT 1), u.full_name, ''), COALESCE(a.label,''), "
+        "  CASE WHEN o.kind = 'fee' THEN 'us' WHEN mb.status = 'open' THEN 'cost' WHEN mb.status = 'resolved' THEN 'deposit' ELSE 'fund' END AS dest, "
+        "  SUM(CAST(ROUND(c.balance*100) AS INTEGER)) "
+        "FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id LEFT JOIN monthly_bills mb ON mb.op_id = o.id LEFT JOIN buildings b ON b.id = o.building_id "
+        "LEFT JOIN users u ON u.id = c.user_id LEFT JOIN apartments a ON a.id = c.apartment_id "
+        "WHERE c.direction = 'in' AND c.status != 'future' AND c.balance > 0.005 AND o.kind <> 'fee' AND o.building_id IN (SELECT building_id FROM managed_buildings WHERE active = 1) "
+        "GROUP BY o.building_id, ym, c.user_id, c.apartment_id, dest ORDER BY ym, b.address, a.label";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        ResidentOwing r; r.building_id = sqlite3_column_int(st, 0); r.user_id = sqlite3_column_int(st, 1); r.building = ColText(st, 2); r.ym = ColText(st, 3);
+        r.name = ColText(st, 4); r.apartment = ColText(st, 5); r.to = ColText(st, 6); r.owed = FromCents(sqlite3_column_int64(st, 7));
+        out.push_back(r);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+// What we offered this building: anything it still owes, and anything charged or paid in the last 30 days.
+std::vector<DataConn::BillSuggestion> SqliteConn::billSuggestions(int buildingId) {
+    std::vector<BillSuggestion> out; sqlite3_stmt* st = nullptr;
+    const char* sql =
+        "SELECT c.id, COALESCE(s.label,''), c.charge_date, CAST(ROUND(c.amount_due*100) AS INTEGER), CAST(ROUND(c.balance*100) AS INTEGER), c.contract_id IS NOT NULL "
+        "FROM charges c JOIN users u ON u.id = c.user_id LEFT JOIN services s ON s.id = c.service_id "
+        "WHERE u.client_building_id = ?1 AND c.direction = 'in' AND c.status != 'future' AND (c.balance > 0.005 OR c.charge_date >= date('now','localtime','-30 day') "
+        "   OR EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id AND m.pay_date >= date('now','localtime','-30 day'))) "
+        "ORDER BY c.balance > 0.005 DESC, c.charge_date DESC, c.id DESC";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, buildingId);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        BillSuggestion b; b.charge_id = sqlite3_column_int(st, 0); b.label = ColText(st, 1); b.date = ColText(st, 2);
+        b.due = FromCents(sqlite3_column_int64(st, 3)); b.owed = FromCents(sqlite3_column_int64(st, 4)); b.contract = sqlite3_column_int(st, 5) != 0;
+        out.push_back(b);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+double SqliteConn::getDepositMin(int buildingId) {
+    double v = 0; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT min_amount FROM deposit_limits WHERE building_id = ?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, buildingId);
+    if (sqlite3_step(st) == SQLITE_ROW) v = RoundMoney(sqlite3_column_double(st, 0));
+    sqlite3_finalize(st);
+    return v;
+}
+bool SqliteConn::setDepositMin(int buildingId, double amount) {
+    if (ToCents(amount) < 0) { lastError_ = "Το όριο δεν μπορεί να είναι αρνητικό."; return false; }
+    if (getBuildingById(buildingId).id < 0) { lastError_ = "Η πολυκατοικία δεν υπάρχει."; return false; }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO deposit_limits (building_id, min_amount) VALUES (?1, ?2) ON CONFLICT(building_id) DO UPDATE SET min_amount = ?2", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, buildingId); sqlite3_bind_double(st, 2, RoundMoney(amount));
+    const int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return false; }
+    return true;
+}
+
+std::vector<DataConn::ManageScore> SqliteConn::manageScores(const std::string& fromYm, const std::string& toYm) {
+    std::vector<ManageScore> out;
+    for (int bid : getManagedBuildings()) {
+        ManageScore m; m.building_id = bid; m.address = getBuildingById(bid).address; m.deposit = getFundBalance(bid); m.depositMin = getDepositMin(bid);
+        double refillSum = 0; int refillN = 0; long long cost = 0, covered = 0, owedDep = 0, activeOwed = 0;
+        for (auto& x : getMonthlyBills(bid, "")) {
+            if ((!fromYm.empty() && x.ym < fromYm) || (!toYm.empty() && x.ym > toYm)) continue;
+            m.bills++; cost += ToCents(x.total);
+            if (x.status == "open") { m.active++; activeOwed += ToCents(x.owed); continue; }
+            if (ToCents(x.covered) <= 0) continue;
+            m.usedDeposit++; covered += ToCents(x.covered); owedDep += ToCents(x.owed);
+            // how long the deposit waited to get it back; still waiting counts as far as today
+            sqlite3_stmt* st = nullptr;
+            sqlite3_prepare_v2(db, "SELECT julianday(CASE WHEN ?2 > 0 THEN date('now','localtime') ELSE COALESCE((SELECT MAX(p.pay_date) FROM allocations al JOIN payments p ON p.id = al.payment_id "
+                                   "JOIN charges c ON c.id = al.charge_id JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.id = ?1), ?3) END) - julianday(?3)", -1, &st, nullptr);
+            sqlite3_bind_int(st, 1, x.op_id); sqlite3_bind_int64(st, 2, ToCents(x.owed)); sqlite3_bind_text(st, 3, x.resolved_date.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW) { refillSum += std::max(0.0, sqlite3_column_double(st, 0)); refillN++; }
+            sqlite3_finalize(st);
+            if (ToCents(x.owed) <= 0) m.refilled++;
+        }
+        m.cost = FromCents(cost); m.covered = FromCents(covered); m.owedToDeposit = FromCents(owedDep); m.activeOwed = FromCents(activeOwed);
+        if (refillN > 0) m.avgRefillDays = refillSum / refillN;
+        {   // money put into the deposit by hand after the first time (residents paying back is not "renewing")
+            const char* flt = "building_id = ?1 AND direction = 'in' AND kind IN ('opening','correction') AND allocation_id IS NULL AND payment_id IS NULL";
+            std::string q = std::string("SELECT COALESCE(SUM(CAST(ROUND(amount*100) AS INTEGER)),0) FROM fund_moves WHERE ") + flt + " AND id <> (SELECT MIN(id) FROM fund_moves WHERE " + flt + ")";
+            sqlite3_stmt* rs = nullptr;
+            if (sqlite3_prepare_v2(db, q.c_str(), -1, &rs, nullptr) == SQLITE_OK) { sqlite3_bind_int(rs, 1, bid); if (sqlite3_step(rs) == SQLITE_ROW) m.renewed = FromCents(sqlite3_column_int64(rs, 0)); }
+            sqlite3_finalize(rs);
+        }
+        // how fast the residents' money came in for these bills, weighted by amount
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT SUM(al.amount * MAX(0, julianday(p.pay_date) - julianday(c.charge_date))), SUM(al.amount) FROM monthly_bills mb JOIN joint_ops o ON o.id = mb.op_id "
+                               "JOIN charges c ON c.batch_id = o.batch_id AND c.direction = 'in' JOIN allocations al ON al.charge_id = c.id JOIN payments p ON p.id = al.payment_id "
+                               "WHERE mb.building_id = ?1 AND (?2 = '' OR mb.ym >= ?2) AND (?3 = '' OR mb.ym <= ?3)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, bid); sqlite3_bind_text(st, 2, fromYm.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, toYm.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_double(st, 1) > 0.005) m.avgCollectDays = sqlite3_column_double(st, 0) / sqlite3_column_double(st, 1);
+        sqlite3_finalize(st);
+        out.push_back(m);
+    }
+    return out;
+}
+
+// --- ΣΥΜΒΑΣΕΙΣ ---------------------------------------------------------------------------------------------
+// the same day k months later; a day the month does not have becomes its last day
+static std::string AddMonthsClamped(const std::string& iso, int k) {
+    int y = 0, m = 0, d = 0; std::sscanf(iso.c_str(), "%d-%d-%d", &y, &m, &d);
+    int t = y * 12 + (m - 1) + k; y = t / 12; m = t % 12 + 1;
+    static const int dm[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int last = dm[m - 1] + ((m == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) ? 1 : 0);
+    char b[16]; std::snprintf(b, sizeof(b), "%04d-%02d-%02d", y, m, std::min(d, last)); return b;
+}
+
+std::vector<std::string> SqliteConn::contractDefaultDates(const std::string& start, int months, int installments) {
+    std::vector<std::string> out;
+    for (int k = 0; k < installments; k++) out.push_back(AddMonthsClamped(start, k * months / std::max(1, installments)));
+    return out;
+}
+
+int SqliteConn::addContract(const Contract& in, const std::vector<ContractItem>& items) {
+    auto refuse = [&](const std::string& why) { lastError_ = why; return -1; };
+    User u = getUserById(in.user_id);
+    if (u.id <= 0 || u.resident) return refuse("Διαλέξτε πελάτη.");
+    int y = 0, mo = 0, d = 0;
+    if (in.start_date.size() != 10 || std::sscanf(in.start_date.c_str(), "%d-%d-%d", &y, &mo, &d) != 3) return refuse("Μη έγκυρη ημερομηνία έναρξης.");
+    if (in.months < 1 || in.months > 600) return refuse("Μη έγκυρη διάρκεια σύμβασης.");
+    if (in.installments < 1 || in.installments > 600) return refuse("Μη έγκυρος αριθμός δόσεων.");
+    if (items.empty()) return refuse("Η σύμβαση χρειάζεται τουλάχιστον μία υπηρεσία.");
+    long long total = 0, cost = 0;
+    for (auto& i : items) {
+        if (ToCents(i.amount) < 0 || ToCents(i.cost) < 0) return refuse("Τα ποσά δεν μπορούν να είναι αρνητικά.");
+        total += ToCents(i.amount); cost += ToCents(i.cost);
+    }
+    if (total <= 0) return refuse("Η ετήσια τιμή πρέπει να είναι μεγαλύτερη από 0.");
+    if (!savepoint("contract")) return -1;
+    auto fail = [&]() { rollbackTo("contract"); lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + lastError_; return -1; };
+    const std::string label = in.label.empty() ? items.front().label : in.label;
+    std::string end; {                                 // the day before its months are up
+        sqlite3_stmt* e = nullptr; sqlite3_prepare_v2(db, "SELECT date(?, '-1 day')", -1, &e, nullptr);
+        const std::string next = AddMonthsClamped(in.start_date, in.months);
+        sqlite3_bind_text(e, 1, next.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(e) == SQLITE_ROW) end = ColText(e, 0);
+        sqlite3_finalize(e);
+    }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO contracts (user_id, source_type, source_id, label, start_date, end_date, total, cost, installments, partner_id, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, in.user_id);
+    sqlite3_bind_text(st, 2, in.source_type == "service" ? "service" : "package", -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 3, in.source_id);
+    sqlite3_bind_text(st, 4, label.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, in.start_date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, end.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 7, FromCents(total)); sqlite3_bind_double(st, 8, FromCents(cost));
+    sqlite3_bind_int(st, 9, in.installments);
+    if (in.partner_id > 0) sqlite3_bind_int(st, 10, in.partner_id); else sqlite3_bind_null(st, 10);
+    sqlite3_bind_text(st, 11, in.notes.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    const int cid = (int)sqlite3_last_insert_rowid(db);
+    for (auto& i : items) {
+        sqlite3_prepare_v2(db, "INSERT INTO contract_items (contract_id, service_id, label, amount, cost) VALUES (?,?,?,?,?)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, cid); sqlite3_bind_int(st, 2, i.service_id); sqlite3_bind_text(st, 3, i.label.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(st, 4, RoundMoney(i.amount)); sqlite3_bind_double(st, 5, RoundMoney(i.cost));
+        rc = sqlite3_step(st); sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    }
+    // the installments: every service's yearly price split exactly over the dates. Only a date still to come is 'future'.
+    std::time_t now = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &now); char today[16]; std::strftime(today, sizeof(today), "%Y-%m-%d", &tm);
+    std::vector<std::string> dates = in.dates.empty() ? contractDefaultDates(in.start_date, in.months, in.installments) : in.dates;
+    std::sort(dates.begin(), dates.end());
+    if ((int)dates.size() != in.installments) { lastError_ = "Χρειάζεται μία ημερομηνία για κάθε δόση."; return fail(); }
+    for (size_t k = 0; k < dates.size(); k++) {
+        int dy = 0, dm = 0, dd = 0;
+        if (dates[k].size() != 10 || std::sscanf(dates[k].c_str(), "%d-%d-%d", &dy, &dm, &dd) != 3) { lastError_ = "Μη έγκυρη ημερομηνία δόσης."; return fail(); }
+        if (dates[k] < in.start_date || dates[k] > end) { lastError_ = "Η δόση της " + dates[k] + " είναι έξω από τη διάρκεια της σύμβασης."; return fail(); }
+        if (k > 0 && dates[k] == dates[k - 1]) { lastError_ = "Δύο δόσεις έχουν την ίδια ημερομηνία: " + dates[k] + "."; return fail(); }
+    }
+    std::vector<Payment> lines;
+    auto addLines = [&](const ContractItem& i, long long cents, const char* dir) {
+        const long long each = cents / in.installments, rest = cents - each * in.installments;
+        for (int k = 0; k < in.installments && cents > 0; k++) {
+            const std::string& date = dates[k];
+            long long amt = each + (k < rest ? 1 : 0);
+            if (amt <= 0) continue;
+            Payment l; l.user_id = in.user_id; l.service_id = i.service_id; l.direction = dir; l.amount_due = FromCents(amt); l.amount_paid = 0; l.balance = FromCents(amt);
+            std::sscanf(date.c_str(), "%d-%d-%d", &l.year, &l.month, &l.day);
+            l.status = date > today ? "future" : "pending"; l.resolution_date = date > today ? date : "";
+            l.apartment_id = 0;
+            l.notes = "Σύμβαση: " + label + " · δόση " + std::to_string(k + 1) + "/" + std::to_string(in.installments);
+            if (std::string(dir) == "out") l.partner_id = in.partner_id;
+            lines.push_back(l);
+        }
+    };
+    for (auto& i : items) addLines(i, ToCents(i.amount), "in");
+    for (auto& i : items) addLines(i, ToCents(i.cost), "out");
+    int first = addPaymentsWithReceipt(lines, "Σύμβαση: " + label, nullptr);
+    if (first < 0) return fail();
+    const int batch = getPaymentById(first).batch_id;
+    if (!executeQuery("UPDATE charges SET contract_id = " + std::to_string(cid) + " WHERE id = " + std::to_string(first) +
+                      (batch > 0 ? " OR batch_id = " + std::to_string(batch) : std::string()) + ";")) return fail();
+    if (!release("contract")) return fail();
+    return cid;
+}
+
+static const char* kContractSelect =
+    "SELECT * FROM (SELECT c.id AS id, c.user_id AS uid, COALESCE(u.full_name,'') AS who, c.source_type, c.source_id, c.label AS label, c.start_date AS sd, c.end_date AS ed, "
+    "  c.total AS total, c.cost, c.installments, COALESCE(c.partner_id,-1), COALESCE(c.notes,''), COALESCE(datetime(c.created_at,'localtime'),''), "
+    "  COALESCE((SELECT SUM(CAST(ROUND(x.amount_paid*100) AS INTEGER)) FROM charges x WHERE x.contract_id = c.id AND x.direction='in'),0) AS coll, "
+    "  COALESCE((SELECT SUM(CAST(ROUND(x.balance*100) AS INTEGER)) FROM charges x WHERE x.contract_id = c.id AND x.direction='in' AND x.status != 'future'),0) AS owed, "
+    "  COALESCE((SELECT SUM(CAST(ROUND(x.balance*100) AS INTEGER)) FROM charges x WHERE x.contract_id = c.id AND x.direction='in' AND x.status = 'future'),0) AS sched, "
+    "  COALESCE((SELECT MIN(x.charge_date) FROM charges x WHERE x.contract_id = c.id AND x.direction='in' AND x.status = 'future' AND x.balance > 0.005),'') AS nextd "
+    "  FROM contracts c LEFT JOIN users u ON u.id = c.user_id) t ";
+static const char* kContractOpen = "((t.ed >= date('now','localtime') AND t.id NOT IN (SELECT contract_id FROM contract_cancels)) OR t.owed > 0 OR t.sched > 0)";
+bool SqliteConn::cancelContract(int id, const std::string& reason) {
+    if (reason.find_first_not_of(" \t") == std::string::npos) { lastError_ = "Γράψτε την αιτία."; return false; }
+    if (getContract(id).id <= 0) { lastError_ = "Η σύμβαση δεν υπάρχει."; return false; }
+    if (getContract(id).cancelled) { lastError_ = "Η σύμβαση έχει ήδη ακυρωθεί."; return false; }
+    if (!savepoint("ctcancel")) return false;
+    const std::string sid = std::to_string(id);
+    ArchiveDeletion(db, "charge", id, "Ακύρωση σύμβασης #" + sid + ": μελλοντικές δόσεις", false, TableRowsJson(db, "charges", "contract_id = " + sid + " AND status = 'future' AND id NOT IN (SELECT charge_id FROM allocations)"));
+    bool ok = executeQuery("DELETE FROM charges WHERE contract_id = " + sid + " AND status = 'future' AND id NOT IN (SELECT charge_id FROM allocations);") &&
+              executeQuery("UPDATE charges SET status = 'pending' WHERE contract_id = " + sid + " AND status = 'future';");      // an installment already part paid is the last one, owed now
+    sqlite3_stmt* st = nullptr;
+    if (ok && sqlite3_prepare_v2(db, "INSERT INTO contract_cancels (contract_id, reason) VALUES (?,?)", -1, &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, id); sqlite3_bind_text(st, 2, reason.c_str(), -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(st) == SQLITE_DONE; if (!ok) lastError_ = sqlite3_errmsg(db);
+    } else ok = false;
+    sqlite3_finalize(st);
+    if (!ok) { rollbackTo("ctcancel"); return false; }
+    return release("ctcancel");
+}
+
+static DataConn::Contract ReadContract(sqlite3_stmt* st) {
+    DataConn::Contract c;
+    c.id = sqlite3_column_int(st, 0); c.user_id = sqlite3_column_int(st, 1); c.user_name = ColText(st, 2); c.source_type = ColText(st, 3); c.source_id = sqlite3_column_int(st, 4);
+    c.label = ColText(st, 5); c.start_date = ColText(st, 6); c.end_date = ColText(st, 7); c.total = RoundMoney(sqlite3_column_double(st, 8)); c.cost = RoundMoney(sqlite3_column_double(st, 9));
+    c.installments = sqlite3_column_int(st, 10); c.partner_id = sqlite3_column_int(st, 11); c.notes = ColText(st, 12); c.created_at = ColText(st, 13);
+    {   int sy = 0, sm = 0, sd = 0, ey = 0, em = 0, ed = 0; std::sscanf(c.start_date.c_str(), "%d-%d-%d", &sy, &sm, &sd); std::sscanf(c.end_date.c_str(), "%d-%d-%d", &ey, &em, &ed);
+        c.months = (ey * 12 + em) - (sy * 12 + sm) + (ed >= sd ? 1 : 0); }
+    { sqlite3_stmt* k = nullptr; sqlite3_prepare_v2(sqlite3_db_handle(st), "SELECT 1 FROM contract_cancels WHERE contract_id = ?", -1, &k, nullptr); sqlite3_bind_int(k, 1, c.id); c.cancelled = sqlite3_step(k) == SQLITE_ROW; sqlite3_finalize(k); }
+    c.collected = FromCents(sqlite3_column_int64(st, 14)); c.owedNow = FromCents(sqlite3_column_int64(st, 15)); c.scheduled = FromCents(sqlite3_column_int64(st, 16)); c.next_date = ColText(st, 17);
+    return c;
+}
+static std::string ContractWhere(int userId, int state, const std::string& text) {
+    std::string w = " WHERE 1=1";
+    if (userId > 0) w += " AND t.uid = " + std::to_string(userId);
+    if (state == 1) w += std::string(" AND ") + kContractOpen;
+    if (state == 2) w += std::string(" AND NOT ") + kContractOpen;
+    if (!text.empty()) w += " AND instr(fold(t.who || ' ' || t.label), fold(?1)) > 0";
+    return w;
+}
+DataConn::Contract SqliteConn::getContract(int id) {
+    Contract c; sqlite3_stmt* st = nullptr;
+    std::string sql = std::string(kContractSelect) + " WHERE t.id = ?";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return c; }
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) c = ReadContract(st);
+    sqlite3_finalize(st);
+    if (c.id > 0) { std::time_t now = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &now); char d[16]; std::strftime(d, sizeof(d), "%Y-%m-%d", &tm);
+                    sqlite3_stmt* k = nullptr; sqlite3_prepare_v2(db, "SELECT 1 FROM contract_cancels WHERE contract_id = ?", -1, &k, nullptr); sqlite3_bind_int(k, 1, id); c.cancelled = sqlite3_step(k) == SQLITE_ROW; sqlite3_finalize(k);
+                    c.open = (c.end_date >= d && !c.cancelled) || ToCents(c.owedNow) > 0 || ToCents(c.scheduled) > 0; }
+    return c;
+}
+std::vector<DataConn::ContractItem> SqliteConn::getContractItems(int id) {
+    std::vector<ContractItem> out; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT service_id, label, amount, cost FROM contract_items WHERE contract_id = ? ORDER BY id", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, id);
+    while (sqlite3_step(st) == SQLITE_ROW) { ContractItem i; i.service_id = sqlite3_column_int(st, 0); i.label = ColText(st, 1); i.amount = RoundMoney(sqlite3_column_double(st, 2)); i.cost = RoundMoney(sqlite3_column_double(st, 3)); out.push_back(i); }
+    sqlite3_finalize(st);
+    return out;
+}
+std::vector<DataConn::ContractInstallment> SqliteConn::getContractInstallments(int id) {
+    std::vector<ContractInstallment> out; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT charge_date, id, CAST(ROUND(amount_due*100) AS INTEGER), CAST(ROUND(amount_paid*100) AS INTEGER), CAST(ROUND(balance*100) AS INTEGER), status "
+                           "FROM charges WHERE contract_id = ? AND direction = 'in' ORDER BY charge_date, id", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, id);
+    long long due = 0, paid = 0, bal = 0;
+    auto flush = [&] { if (!out.empty()) { out.back().due = FromCents(due); out.back().paid = FromCents(paid); out.back().balance = FromCents(bal); } due = paid = bal = 0; };
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        std::string d = ColText(st, 0);
+        if (out.empty() || out.back().date != d) { flush(); out.emplace_back(); out.back().date = d; }
+        out.back().charges.push_back(sqlite3_column_int(st, 1));
+        due += sqlite3_column_int64(st, 2); paid += sqlite3_column_int64(st, 3); bal += sqlite3_column_int64(st, 4);
+        if (ColText(st, 5) == "future") out.back().future = true;
+    }
+    flush();
+    sqlite3_finalize(st);
+    return out;
+}
+std::vector<Receipt> SqliteConn::getContractReceipts(int id) {
+    std::vector<Receipt> out; sqlite3_stmt* st = nullptr;
+    std::string sql = std::string("SELECT ") + kReceiptCols + ", " + ReceiptKindSql("r.id") + " FROM receipts r WHERE r.id IN (SELECT m.receipt_id FROM payments m JOIN allocations a ON a.payment_id = m.id "
+                      "JOIN charges c ON c.id = a.charge_id WHERE c.contract_id = ?) ORDER BY r.issue_date DESC, r.id DESC";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, id);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadReceipt(st));
+    sqlite3_finalize(st);
+    return out;
+}
+std::vector<DataConn::Contract> SqliteConn::pageContracts(int userId, int state, const std::string& text, const SortSpec& sort, int offset, int limit) {
+    std::vector<Contract> out; sqlite3_stmt* st = nullptr;
+    std::string sql = std::string(kContractSelect) + ContractWhere(userId, state, text) +
+        OrderBy(sort, {"fold(t.who)", "fold(t.label)", "t.sd", "t.ed", "t.total", "t.coll", "t.owed", "t.sched", "t.nextd"}, "t.sd DESC, t.id DESC") + " LIMIT ?2 OFFSET ?3";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_text(st, 1, text.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) { Contract c = ReadContract(st); out.push_back(c); }
+    sqlite3_finalize(st);
+    return out;
+}
+DataConn::ContractTotals SqliteConn::contractTotals(int userId, int state, const std::string& text) {
+    ContractTotals r; sqlite3_stmt* st = nullptr;
+    std::string sql = "SELECT COUNT(*), COALESCE(SUM(CAST(ROUND(tt.total*100) AS INTEGER)),0), COALESCE(SUM(tt.coll),0), COALESCE(SUM(tt.owed),0), COALESCE(SUM(tt.sched),0) FROM (SELECT t.* FROM (" +
+                      std::string(kContractSelect) + ") t" + ContractWhere(userId, state, text) + ") tt";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return r; }
+    if (!text.empty()) sqlite3_bind_text(st, 1, text.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) { r.count = sqlite3_column_int(st, 0); r.total = FromCents(sqlite3_column_int64(st, 1)); r.collected = FromCents(sqlite3_column_int64(st, 2)); r.owedNow = FromCents(sqlite3_column_int64(st, 3)); r.scheduled = FromCents(sqlite3_column_int64(st, 4)); }
+    sqlite3_finalize(st);
+    return r;
+}
+int SqliteConn::ensureFeeService() {
+    executeQuery("UPDATE services SET label = 'ΔΙΑΧΕΙΡΙΣΗ' WHERE label = 'ΑΜΟΙΒΗ ' || 'ΔΙΑΧΕΙΡΙΣΗΣ';");      // its earlier name
+    sqlite3_stmt* st = nullptr; int id = -1;
+    sqlite3_prepare_v2(db, "SELECT id FROM services WHERE label = 'ΔΙΑΧΕΙΡΙΣΗ' LIMIT 1", -1, &st, nullptr);
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (id > 0) return id;
+    Service sv; sv.label = "ΔΙΑΧΕΙΡΙΣΗ"; sv.suggested_price = 1.0; sv.extra_notes = "Η αμοιβή μας για τη διαχείριση: χρεώνεται στην πολυκατοικία ως πελάτη.";
+    return addServiceGetId(-1, sv);
+}
+
+DataConn::IncomeSplit SqliteConn::incomeSplit(const std::string& fromDate, const std::string& toDate) {
+    IncomeSplit r; sqlite3_stmt* st = nullptr;
+    const char* in =
+        "SELECT COALESCE(SUM(CASE WHEN c.contract_id IS NOT NULL THEN CAST(ROUND(a.amount*100) AS INTEGER) END),0), "
+        "       COALESCE(SUM(CASE WHEN (o.kind = 'fee' OR (o.id IS NULL AND c.contract_id IS NULL AND s.label = 'ΔΙΑΧΕΙΡΙΣΗ')) THEN CAST(ROUND(a.amount*100) AS INTEGER) END),0) "
+        "FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN charges c ON c.id = a.charge_id LEFT JOIN joint_ops o ON o.batch_id = c.batch_id LEFT JOIN services s ON s.id = c.service_id "
+        "WHERE c.direction = 'in' AND (?1 = '' OR m.pay_date >= ?1) AND (?2 = '' OR m.pay_date <= ?2)";
+    if (sqlite3_prepare_v2(db, in, -1, &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, toDate.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) { r.contracts = FromCents(sqlite3_column_int64(st, 0)); r.fees = FromCents(sqlite3_column_int64(st, 1)); }
+    } else lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st); st = nullptr;
+    const char* open =
+        "SELECT COALESCE(SUM(CASE WHEN c.status != 'future' AND c.contract_id IS NULL AND o.id IS NULL AND COALESCE(s.label,'') <> 'ΔΙΑΧΕΙΡΙΣΗ' THEN CAST(ROUND(c.balance*100) AS INTEGER) END),0), "
+        "       COALESCE(SUM(CASE WHEN c.status != 'future' AND c.contract_id IS NOT NULL THEN CAST(ROUND(c.balance*100) AS INTEGER) END),0), "
+        "       COALESCE(SUM(CASE WHEN c.status = 'future' AND c.contract_id IS NOT NULL THEN CAST(ROUND(c.balance*100) AS INTEGER) END),0), "
+        "       COALESCE(SUM(CASE WHEN c.status != 'future' AND (o.kind = 'fee' OR (o.id IS NULL AND c.contract_id IS NULL AND s.label = 'ΔΙΑΧΕΙΡΙΣΗ')) THEN CAST(ROUND(c.balance*100) AS INTEGER) END),0) "
+        "FROM charges c LEFT JOIN joint_ops o ON o.batch_id = c.batch_id LEFT JOIN services s ON s.id = c.service_id WHERE c.direction = 'in' AND c.user_id IS NOT NULL AND c.balance > 0.005";
+    if (sqlite3_prepare_v2(db, open, -1, &st, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) { r.servicesOwed = FromCents(sqlite3_column_int64(st, 0)); r.contractsOwed = FromCents(sqlite3_column_int64(st, 1)); r.contractsScheduled = FromCents(sqlite3_column_int64(st, 2)); r.feesOwed = FromCents(sqlite3_column_int64(st, 3)); }
+    } else lastError_ = sqlite3_errmsg(db);
+    sqlite3_finalize(st);
+    return r;
+}
+
+std::vector<DataConn::ContractOwing> SqliteConn::contractOwings() {
+    std::vector<ContractOwing> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT c.user_id, COALESCE(u.full_name,''), SUM(CAST(ROUND(c.balance*100) AS INTEGER)), "
+                               "SUM(CASE WHEN julianday('now','localtime') - julianday(c.charge_date) > 30 THEN CAST(ROUND(c.balance*100) AS INTEGER) ELSE 0 END) "
+                               "FROM charges c LEFT JOIN users u ON u.id = c.user_id WHERE c.contract_id IS NOT NULL AND c.direction = 'in' AND c.status != 'future' AND c.balance > 0.005 GROUP BY c.user_id",
+                           -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    while (sqlite3_step(st) == SQLITE_ROW) { ContractOwing o; o.user_id = sqlite3_column_int(st, 0); o.name = ColText(st, 1); o.owed = FromCents(sqlite3_column_int64(st, 2)); o.late = FromCents(sqlite3_column_int64(st, 3)); out.push_back(o); }
+    sqlite3_finalize(st);
+    return out;
+}
+
+bool SqliteConn::refreshDueCharges() {
+    return executeQuery("UPDATE charges SET status = 'pending' WHERE status = 'future' AND charge_date <= date('now','localtime');");
+}
+
+std::vector<DataConn::Contract> SqliteConn::contractTemplates(int limit) {
+    std::vector<int> ids; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT MAX(id) FROM contracts GROUP BY source_type, source_id, label, total, installments ORDER BY MAX(id) DESC LIMIT ?", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, limit);
+    while (sqlite3_step(st) == SQLITE_ROW) ids.push_back(sqlite3_column_int(st, 0));
+    sqlite3_finalize(st);
+    std::vector<Contract> out; for (int id : ids) out.push_back(getContract(id));
+    return out;
+}
+
+std::vector<std::pair<int, std::string>> SqliteConn::topContractPackages(int limit) {
+    std::vector<std::pair<int, std::string>> out;
+    std::map<int, int> uses; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT source_id, COUNT(*) FROM contracts WHERE source_type = 'package' GROUP BY source_id", -1, &st, nullptr);
+    while (sqlite3_step(st) == SQLITE_ROW) uses[sqlite3_column_int(st, 0)] = sqlite3_column_int(st, 1);
+    sqlite3_finalize(st);
+    auto all = getMasterServices();
+    std::stable_sort(all.begin(), all.end(), [&](const MasterService& a, const MasterService& b) { return uses[a.id] > uses[b.id]; });
+    for (auto& m : all) { if ((int)out.size() >= limit) break; out.push_back({m.id, m.label}); }
+    return out;
 }
 
 // --- ATTACHMENTS ------------------------------------------------------------------------------------------
@@ -5031,8 +6050,8 @@ DataConn::HomeFigures SqliteConn::homeFigures(int scope, const std::string& from
         "TOTAL(CASE WHEN c.direction='in'  AND c.status = 'future' THEN " + C("c.balance") + " END), "
         "TOTAL(CASE WHEN c.direction='out' AND c.status = 'future' THEN " + C("c.balance") + " END) "
         "FROM charges c WHERE " + (scope == 1 ? "" : "NOT ") + kIsJointCharge;
-    if (!fromDate.empty()) sql += " AND c.pay_date >= ?1";
-    if (!toDate.empty())   sql += std::string(" AND c.pay_date <= ?") + (fromDate.empty() ? "1" : "2");
+    if (!fromDate.empty()) sql += " AND c.charge_date >= ?1";
+    if (!toDate.empty())   sql += std::string(" AND c.charge_date <= ?") + (fromDate.empty() ? "1" : "2");
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return h; }
     int i = 1;
@@ -5065,9 +6084,9 @@ const char* kOwingFrom =
 
 std::vector<DataConn::ClientOwing> SqliteConn::pageClientOwings(const std::string& text, const SortSpec& sort, int offset, int limit, bool joint) {
     std::vector<ClientOwing> out;
-    std::string sql = std::string("SELECT u.id, u.full_name, SUM(") + C("c.balance") + "), COUNT(*), MIN(c.pay_date) " + kOwingFrom + (joint ? "" : "NOT ") + kIsJointCharge;
+    std::string sql = std::string("SELECT u.id, u.full_name, SUM(") + C("c.balance") + "), COUNT(*), MIN(c.charge_date) " + kOwingFrom + (joint ? "" : "NOT ") + kIsJointCharge;
     if (!text.empty()) sql += " AND instr(fold(u.full_name), fold(?1)) > 0";
-    sql += " GROUP BY u.id" + OrderBy(sort, {"fold(u.full_name)", "SUM(" + C("c.balance") + ")", "COUNT(*)", "MIN(c.pay_date)"}, "fold(u.full_name), u.id") +
+    sql += " GROUP BY u.id" + OrderBy(sort, {"fold(u.full_name)", "SUM(" + C("c.balance") + ")", "COUNT(*)", "MIN(c.charge_date)"}, "fold(u.full_name), u.id") +
            " LIMIT ?" + std::string(text.empty() ? "1" : "2") + " OFFSET ?" + std::string(text.empty() ? "2" : "3");
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5101,7 +6120,7 @@ static DataConn::PartnerJob ReadPartnerJob(sqlite3_stmt* st);
 std::vector<DataConn::QualityRow> SqliteConn::clientQuality(int userId, const std::string& fromDate, const std::string& toDate) {
     std::vector<QualityRow> out;
     std::map<int, size_t> at;
-    const std::string where = " AND (?1 = 0 OR c.user_id = ?1) AND (?2 = '' OR c.pay_date >= ?2) AND (?3 = '' OR c.pay_date <= ?3) ";
+    const std::string where = " AND (?1 = 0 OR c.user_id = ?1) AND (?2 = '' OR c.charge_date >= ?2) AND (?3 = '' OR c.charge_date <= ?3) ";
     auto bindAll = [&](sqlite3_stmt* st) { sqlite3_bind_int(st, 1, userId); sqlite3_bind_text(st, 2, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, toDate.c_str(), -1, SQLITE_TRANSIENT); };
     auto rowOf = [&](int uid, const std::string& name) -> QualityRow& {
         auto it = at.find(uid);
@@ -5110,8 +6129,8 @@ std::vector<DataConn::QualityRow> SqliteConn::clientQuality(int userId, const st
     };
     std::string sql = std::string(
         "SELECT c.user_id, u.full_name, c.direction, ") + kIsJointCharge + ", " + C("c.amount_due") + ", " + C("c.balance") + ", "
-        "(SELECT julianday(MAX(m.pay_date)) - julianday(c.pay_date) FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id), "
-        "julianday('now','localtime') - julianday(c.pay_date) "
+        "(SELECT julianday(MAX(m.pay_date)) - julianday(c.charge_date) FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id), "
+        "julianday('now','localtime') - julianday(c.charge_date) "
         "FROM charges c JOIN users u ON u.id = c.user_id WHERE c.status != 'future' AND COALESCE(u.resident, 0) = 0" + where + "ORDER BY c.user_id";   // residents are not rated
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5141,7 +6160,7 @@ std::vector<DataConn::QualityRow> SqliteConn::clientQuality(int userId, const st
     }
     sqlite3_finalize(st);
     // every payment made on a charge, with its own amount and delay (the speed index counts all of them)
-    sql = std::string("SELECT c.user_id, u.full_name, ") + kIsJointCharge + ", " + C("a.amount") + ", julianday(m.pay_date) - julianday(c.pay_date) "
+    sql = std::string("SELECT c.user_id, u.full_name, ") + kIsJointCharge + ", " + C("a.amount") + ", julianday(m.pay_date) - julianday(c.charge_date) "
           "FROM allocations a JOIN charges c ON c.id = a.charge_id JOIN payments m ON m.id = a.payment_id JOIN users u ON u.id = c.user_id "
           "WHERE c.direction = 'in' AND c.status != 'future' AND COALESCE(u.resident, 0) = 0" + where;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5165,14 +6184,14 @@ std::vector<DataConn::ClientChargeRow> SqliteConn::pageClientCharges(int userId,
     const std::string sameLines = " c.batch_id IS NOT NULL AND x.batch_id = c.batch_id AND x.direction = 'out' AND x.service_id = c.service_id AND x.user_id IS c.user_id ";
     const std::string cost = "(SELECT COALESCE(SUM(CAST(ROUND(x.amount_due*100) AS INTEGER)), 0) FROM charges x WHERE" + sameLines + ")";
     const std::string costPaid = "(SELECT COALESCE(SUM(CAST(ROUND(x.amount_paid*100) AS INTEGER)), 0) FROM charges x WHERE" + sameLines + ")";
-    std::string sql = std::string("SELECT c.id, c.pay_date, COALESCE(s.label,''), c.status, ") + C("c.amount_due") + ", " + C("c.amount_paid") + ", " + C("c.balance") + ", " +
+    std::string sql = std::string("SELECT c.id, c.charge_date, COALESCE(s.label,''), c.status, ") + C("c.amount_due") + ", " + C("c.amount_paid") + ", " + C("c.balance") + ", " +
         cost + " AS costc, " + costPaid + " AS costpc, "
         "COALESCE((SELECT o.name FROM offer_uses u JOIN offers o ON o.id = u.offer_id WHERE u.charge_id = c.id LIMIT 1), '') "
         "FROM charges c LEFT JOIN services s ON s.id = c.service_id "
         "WHERE (?1 = 0 OR c.user_id = ?1) AND c.direction = 'in' AND NOT " + kIsJointCharge + (serviceIds.empty() ? std::string() : " AND c.service_id IN (" + IdListSql(serviceIds) + ")") +
-        " AND (?4 = '' OR c.pay_date >= ?4) AND (?5 = '' OR c.pay_date <= ?5) " +
-        OrderBy(sort, {"c.pay_date", "fold(COALESCE(s.label,''))", "CAST(ROUND(c.amount_due*100) AS INTEGER)", "CAST(ROUND(c.amount_paid*100) AS INTEGER)",
-                       "CAST(ROUND(c.balance*100) AS INTEGER)", "costc", "costpc", "(CAST(ROUND(c.amount_due*100) AS INTEGER) - costc)"}, "c.pay_date DESC, c.id DESC") +
+        " AND (?4 = '' OR c.charge_date >= ?4) AND (?5 = '' OR c.charge_date <= ?5) " +
+        OrderBy(sort, {"c.charge_date", "fold(COALESCE(s.label,''))", "CAST(ROUND(c.amount_due*100) AS INTEGER)", "CAST(ROUND(c.amount_paid*100) AS INTEGER)",
+                       "CAST(ROUND(c.balance*100) AS INTEGER)", "costc", "costpc", "(CAST(ROUND(c.amount_due*100) AS INTEGER) - costc)"}, "c.charge_date DESC, c.id DESC") +
         " LIMIT ?2 OFFSET ?3";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5191,7 +6210,7 @@ std::vector<DataConn::ClientChargeRow> SqliteConn::pageClientCharges(int userId,
 
 int SqliteConn::countClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const std::vector<int>& serviceIds) {
     std::string sql = std::string("SELECT COUNT(*) FROM charges c WHERE (?1 = 0 OR c.user_id = ?1) AND c.direction = 'in' AND NOT ") + kIsJointCharge +
-                      (serviceIds.empty() ? std::string() : " AND c.service_id IN (" + IdListSql(serviceIds) + ")") + " AND (?2 = '' OR c.pay_date >= ?2) AND (?3 = '' OR c.pay_date <= ?3)";
+                      (serviceIds.empty() ? std::string() : " AND c.service_id IN (" + IdListSql(serviceIds) + ")") + " AND (?2 = '' OR c.charge_date >= ?2) AND (?3 = '' OR c.charge_date <= ?3)";
     sqlite3_stmt* st = nullptr; int n = 0;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return 0; }
     sqlite3_bind_int(st, 1, userId); sqlite3_bind_text(st, 2, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, toDate.c_str(), -1, SQLITE_TRANSIENT);
@@ -5209,7 +6228,7 @@ std::vector<DataConn::EntityClientRow> SqliteConn::entityClients(const std::vect
         "SUM((SELECT COALESCE(SUM(CAST(ROUND(x.amount_due*100) AS INTEGER)), 0) FROM charges x WHERE" + sameLines + ")) AS costc, "
         "SUM((SELECT COALESCE(SUM(CAST(ROUND(x.amount_paid*100) AS INTEGER)), 0) FROM charges x WHERE" + sameLines + ")) AS costpc "
         "FROM charges c JOIN users u ON u.id = c.user_id WHERE c.direction = 'in' AND NOT " + kIsJointCharge + " AND c.service_id IN (" + IdListSql(serviceIds) + ") "
-        "AND (?3 = '' OR c.pay_date >= ?3) AND (?4 = '' OR c.pay_date <= ?4) GROUP BY c.user_id " +
+        "AND (?3 = '' OR c.charge_date >= ?3) AND (?4 = '' OR c.charge_date <= ?4) GROUP BY c.user_id " +
         OrderBy(sort, {"fold(u.full_name)", "cnt", "svcs", "duec", "paidc", "owedc", "costc", "(duec - costc)"}, "duec DESC, fold(u.full_name)") + " LIMIT ?1 OFFSET ?2";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5227,7 +6246,7 @@ std::vector<DataConn::EntityClientRow> SqliteConn::entityClients(const std::vect
 int SqliteConn::countEntityClients(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate) {
     if (serviceIds.empty()) return 0;
     std::string sql = std::string("SELECT COUNT(DISTINCT c.user_id) FROM charges c WHERE c.direction = 'in' AND NOT ") + kIsJointCharge + " AND c.service_id IN (" + IdListSql(serviceIds) + ") "
-                      "AND (?1 = '' OR c.pay_date >= ?1) AND (?2 = '' OR c.pay_date <= ?2)";
+                      "AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2)";
     sqlite3_stmt* st = nullptr; int n = 0;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return 0; }
     BindText(st, 1, fromDate); BindText(st, 2, toDate);
@@ -5240,9 +6259,9 @@ std::vector<DataConn::PartnerStat> SqliteConn::entityPartners(const std::vector<
     std::vector<PartnerStat> out;
     if (serviceIds.empty()) return out;
     std::string sql = std::string("SELECT COALESCE(pc.partner_id, -1), COALESCE(p.name, '#-1 Χωρίς συνεργάτη'), COALESCE(p.trade, ''), COUNT(*), SUM(") + C("c.amount_due") + "), SUM(" + C("c.amount_paid") + "), "
-        "SUM(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " ELSE 0 END), MAX(c.pay_date) "
+        "SUM(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " ELSE 0 END), MAX(c.charge_date) "
         "FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id LEFT JOIN partners p ON p.id = pc.partner_id "
-        "WHERE c.direction = 'out' AND c.service_id IN (" + IdListSql(serviceIds) + ") AND (?1 = '' OR c.pay_date >= ?1) AND (?2 = '' OR c.pay_date <= ?2) "
+        "WHERE c.direction = 'out' AND c.service_id IN (" + IdListSql(serviceIds) + ") AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2) "
         "GROUP BY COALESCE(pc.partner_id, -1) ORDER BY SUM(" + C("c.amount_due") + ") DESC";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -5263,7 +6282,7 @@ DataConn::HomeFigures SqliteConn::entityFigures(const std::vector<int>& serviceI
         "TOTAL(CASE WHEN c.direction='in' THEN " + C("c.amount_paid") + " END), TOTAL(CASE WHEN c.direction='in' AND c.balance > 0.005 THEN " + C("c.balance") + " END), "
         "TOTAL(CASE WHEN c.direction='out' THEN " + C("c.amount_due") + " END), TOTAL(CASE WHEN c.direction='out' THEN " + C("c.amount_paid") + " END) "
         "FROM charges c WHERE " + (joint ? "" : "NOT ") + kIsJointCharge + " AND c.service_id IN (" + IdListSql(serviceIds) + ") "
-        "AND (?1 = '' OR c.pay_date >= ?1) AND (?2 = '' OR c.pay_date <= ?2)";
+        "AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2)";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return h; }
     BindText(st, 1, fromDate); BindText(st, 2, toDate);
@@ -5355,9 +6374,10 @@ int SqliteConn::countShares(int userId, int apartmentId, const std::string& from
 
 // partnerId: 0 = every payment going out, > 0 = that partner, -1 = payments with no partner logged (shown as #-1)
 static std::string PartnerJobSelect() {
-    return std::string("SELECT c.id, COALESCE(pc.partner_id, -1), COALESCE(p.name, '#-1 Χωρίς συνεργάτη'), c.pay_date, COALESCE(s.label,''), COALESCE(u.full_name,''), c.status, COALESCE(c.notes,''), ") +
+    return std::string("SELECT c.id, COALESCE(pc.partner_id, -1), COALESCE(p.name, '#-1 Χωρίς συνεργάτη'), c.charge_date, COALESCE(s.label,''), COALESCE(u.full_name,''), c.status, COALESCE(c.notes,''), ") +
         C("c.amount_due") + ", " + C("c.amount_paid") + ", " + C("c.balance") + ", COALESCE(jo.opid, -1), COALESCE(jo.lbl, ''), "
         "CASE WHEN jo.opid IS NOT NULL THEN 'joint' "
+        "WHEN c.contract_id IS NOT NULL THEN 'contract_' || (SELECT k.source_type FROM contracts k WHERE k.id = c.contract_id) "
         "WHEN c.batch_id IS NOT NULL AND EXISTS (SELECT 1 FROM charges x WHERE x.batch_id = c.batch_id AND x.notes LIKE 'Πακέτο:%') THEN 'package' ELSE 'service' END AS kindx "
         "FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id LEFT JOIN partners p ON p.id = pc.partner_id "
         // the joint operation a cost batch belongs to: built once per query (a handful of rows), not looked up per charge
@@ -5376,11 +6396,11 @@ static DataConn::PartnerJob ReadPartnerJob(sqlite3_stmt* st) {
 
 std::vector<DataConn::PartnerJob> SqliteConn::partnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, int kind, bool owedOnly) {
     std::vector<PartnerJob> out;
-    std::string sql = PartnerJobSelect() + " WHERE c.direction = 'out' AND (?1 = 0 OR COALESCE(pc.partner_id, -1) = ?1) AND (?4 = '' OR c.pay_date >= ?4) AND (?5 = '' OR c.pay_date <= ?5) "
+    std::string sql = PartnerJobSelect() + " WHERE c.direction = 'out' AND (?1 = 0 OR COALESCE(pc.partner_id, -1) = ?1) AND (?4 = '' OR c.charge_date >= ?4) AND (?5 = '' OR c.charge_date <= ?5) "
         " AND (?6 = 0 OR (?6 = 1 AND jo.opid IS NULL) OR (?6 = 2 AND jo.opid IS NOT NULL)) "
-        + std::string(owedOnly ? " AND c.balance > 0.005 " : "") + OrderBy(sort, {"c.pay_date", "fold(COALESCE(p.name, '#-1'))", "fold(COALESCE(s.label, ''))", "fold(COALESCE(u.full_name, ''))",
+        + std::string(owedOnly ? " AND c.balance > 0.005 " : "") + OrderBy(sort, {"c.charge_date", "fold(COALESCE(p.name, '#-1'))", "fold(COALESCE(s.label, ''))", "fold(COALESCE(u.full_name, ''))",
                        "CAST(ROUND(c.amount_due*100) AS INTEGER)", "CAST(ROUND(c.amount_paid*100) AS INTEGER)", "CAST(ROUND(c.balance*100) AS INTEGER)", "kindx"},
-                      "c.pay_date DESC, c.id DESC") + " LIMIT ?2 OFFSET ?3";
+                      "c.charge_date DESC, c.id DESC") + " LIMIT ?2 OFFSET ?3";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
     sqlite3_bind_int(st, 1, partnerId); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
@@ -5397,7 +6417,7 @@ int SqliteConn::countPartnerJobs(int partnerId, const std::string& fromDate, con
                            "WHERE c.direction = 'out' AND ")
                            + std::string("")
                            + "(?1 = 0 OR COALESCE(pc.partner_id, -1) = ?1) "
-                           "AND (?2 = '' OR c.pay_date >= ?2) AND (?3 = '' OR c.pay_date <= ?3) AND (?4 = 0 OR (?4 = 1 AND jo.opid IS NULL) OR (?4 = 2 AND jo.opid IS NOT NULL))" + (owedOnly ? " AND c.balance > 0.005" : "")).c_str(), -1, &st, nullptr);
+                           "AND (?2 = '' OR c.charge_date >= ?2) AND (?3 = '' OR c.charge_date <= ?3) AND (?4 = 0 OR (?4 = 1 AND jo.opid IS NULL) OR (?4 = 2 AND jo.opid IS NOT NULL))" + (owedOnly ? " AND c.balance > 0.005" : "")).c_str(), -1, &st, nullptr);
     sqlite3_bind_int(st, 4, kind);
     sqlite3_bind_int(st, 1, partnerId); sqlite3_bind_text(st, 2, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, toDate.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
@@ -5407,12 +6427,12 @@ int SqliteConn::countPartnerJobs(int partnerId, const std::string& fromDate, con
 
 std::vector<DataConn::PartnerStat> SqliteConn::partnerStats(const std::string& fromDate, const std::string& toDate) {
     std::vector<PartnerStat> out;
-    std::string rng = " AND (?1 = '' OR c.pay_date >= ?1) AND (?2 = '' OR c.pay_date <= ?2)";
+    std::string rng = " AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2)";
     std::string sql = "SELECT p.id, p.name, COALESCE(p.trade,''), p.active, "
         "COUNT(CASE WHEN c.id IS NOT NULL" + rng + " THEN 1 END), "
         "TOTAL(CASE WHEN c.id IS NOT NULL" + rng + " THEN " + C("c.amount_due") + " END), "
         "TOTAL(CASE WHEN c.id IS NOT NULL" + rng + " THEN " + C("c.amount_paid") + " END), "
-        "TOTAL(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " END), MAX(c.pay_date) "
+        "TOTAL(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " END), MAX(c.charge_date) "
         "FROM partners p LEFT JOIN partner_costs pc ON pc.partner_id = p.id LEFT JOIN charges c ON c.id = pc.charge_id "
         "WHERE " + NotHiddenSql("partner", "p.id") + " GROUP BY p.id ORDER BY p.active DESC, fold(p.name)";
     sqlite3_stmt* st = nullptr;
@@ -5429,7 +6449,7 @@ std::vector<DataConn::PartnerStat> SqliteConn::partnerStats(const std::string& f
     sqlite3_finalize(st);
     // payments going out with no partner logged: one more line, "#-1" (only when there are any)
     sql = "SELECT COUNT(*), COUNT(CASE WHEN 1" + rng + " THEN 1 END), TOTAL(CASE WHEN 1" + rng + " THEN " + C("c.amount_due") + " END), "
-          "TOTAL(CASE WHEN 1" + rng + " THEN " + C("c.amount_paid") + " END), TOTAL(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " END), MAX(c.pay_date) "
+          "TOTAL(CASE WHEN 1" + rng + " THEN " + C("c.amount_paid") + " END), TOTAL(CASE WHEN c.balance > 0.005 THEN " + C("c.balance") + " END), MAX(c.charge_date) "
           "FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id WHERE c.direction = 'out' AND pc.charge_id IS NULL";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, toDate.c_str(), -1, SQLITE_TRANSIENT);
@@ -5486,11 +6506,11 @@ int SqliteConn::savePartner(const Partner& p) {
     if (p.name.find_first_not_of(" \t") == std::string::npos) { lastError_ = "Ο συνεργάτης χρειάζεται όνομα."; return -1; }
     sqlite3_stmt* st = nullptr;
     auto opt = [&](int k, const std::string& s) { if (s.empty()) sqlite3_bind_null(st, k); else sqlite3_bind_text(st, k, s.c_str(), -1, SQLITE_TRANSIENT); };
-    if (p.id > 0) sqlite3_prepare_v2(db, "UPDATE partners SET name=?1, trade=?2, phone=?3, email=?4, afm=?5, notes=?6, active=?7 WHERE id=?8", -1, &st, nullptr);
-    else sqlite3_prepare_v2(db, "INSERT INTO partners (name, trade, phone, email, afm, notes, active) VALUES (?1,?2,?3,?4,?5,?6,?7)", -1, &st, nullptr);
+    if (p.id > 0) sqlite3_prepare_v2(db, "UPDATE partners SET name=?1, trade=?2, phone=?3, email=?4, afm=?5, notes=?6, active=?7, iban=?9, extra_json=?10 WHERE id=?8", -1, &st, nullptr);
+    else sqlite3_prepare_v2(db, "INSERT INTO partners (name, trade, phone, email, afm, notes, active, iban, extra_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?9,?10)", -1, &st, nullptr);
     if (!st) { lastError_ = sqlite3_errmsg(db); return -1; }
     sqlite3_bind_text(st, 1, p.name.c_str(), -1, SQLITE_TRANSIENT);
-    opt(2, p.trade); opt(3, p.phone); opt(4, p.email); opt(5, p.afm); opt(6, p.notes);
+    opt(2, p.trade); opt(3, p.phone); opt(4, p.email); opt(5, p.afm); opt(6, p.notes); opt(9, p.iban); opt(10, p.extra_json);
     sqlite3_bind_int(st, 7, p.active ? 1 : 0);
     if (p.id > 0) sqlite3_bind_int(st, 8, p.id);
     int rc = sqlite3_step(st);
@@ -5503,11 +6523,11 @@ int SqliteConn::savePartner(const Partner& p) {
 Partner SqliteConn::getPartner(int id) {
     Partner p;
     sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "SELECT id, name, COALESCE(trade,''), COALESCE(phone,''), COALESCE(email,''), COALESCE(afm,''), COALESCE(notes,''), active, datetime(created_at,'localtime') FROM partners WHERE id=?", -1, &st, nullptr);
+    sqlite3_prepare_v2(db, "SELECT id, name, COALESCE(trade,''), COALESCE(phone,''), COALESCE(email,''), COALESCE(afm,''), COALESCE(notes,''), active, datetime(created_at,'localtime'), COALESCE(iban,''), COALESCE(extra_json,'') FROM partners WHERE id=?", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, id);
     if (sqlite3_step(st) == SQLITE_ROW) {
         p.id = sqlite3_column_int(st, 0); p.name = ColText(st, 1); p.trade = ColText(st, 2); p.phone = ColText(st, 3); p.email = ColText(st, 4);
-        p.afm = ColText(st, 5); p.notes = ColText(st, 6); p.active = sqlite3_column_int(st, 7) != 0; p.created_at = ColText(st, 8);
+        p.afm = ColText(st, 5); p.notes = ColText(st, 6); p.active = sqlite3_column_int(st, 7) != 0; p.created_at = ColText(st, 8); p.iban = ColText(st, 9); p.extra_json = ColText(st, 10);
     }
     sqlite3_finalize(st);
     return p;
@@ -5525,11 +6545,11 @@ std::vector<DataConn::PartnerRow> SqliteConn::pagePartnerRows(const std::string&
     const std::string owed = "CAST(TOTAL(CASE WHEN c.balance > 0.005 THEN CAST(ROUND(c.balance*100) AS INTEGER) END) AS INTEGER)";
     std::string sql = std::string("SELECT * FROM ("
         "SELECT p.id AS pid, p.name AS pname, COALESCE(p.trade,'') AS ptrade, COALESCE(p.phone,'') AS pphone, COALESCE(p.email,'') AS pemail, COALESCE(p.afm,'') AS pafm, "
-        "       COALESCE(p.notes,'') AS pnotes, p.active AS pactive, COUNT(c.id) AS jobs, ") + owed + " AS owedc, COALESCE(MAX(c.pay_date),'') AS lastj "
+        "       COALESCE(p.notes,'') AS pnotes, p.active AS pactive, COUNT(c.id) AS jobs, ") + owed + " AS owedc, COALESCE(MAX(c.charge_date),'') AS lastj "
         "FROM partners p LEFT JOIN partner_costs pc ON pc.partner_id = p.id LEFT JOIN charges c ON c.id = pc.charge_id "
         "WHERE " + NotHiddenSql("partner", "p.id") + " GROUP BY p.id "
         "UNION ALL "
-        "SELECT -1, '#-1 Χωρίς συνεργάτη', 'πληρωμές χωρίς καταχωρημένο συνεργάτη', '', '', '', '', 1, COUNT(*), " + owed + ", COALESCE(MAX(c.pay_date),'') "
+        "SELECT -1, '#-1 Χωρίς συνεργάτη', 'πληρωμές χωρίς καταχωρημένο συνεργάτη', '', '', '', '', 1, COUNT(*), " + owed + ", COALESCE(MAX(c.charge_date),'') "
         "FROM charges c LEFT JOIN partner_costs pc ON pc.charge_id = c.id WHERE c.direction = 'out' AND pc.charge_id IS NULL HAVING COUNT(*) > 0"
         ") WHERE (?1 = '' OR instr(fold(pname || ' ' || ptrade || ' ' || pphone || ' ' || pemail || ' ' || pnotes), fold(?1)) > 0) " +
         OrderBy(sort, {"fold(pname)", "fold(ptrade)", "pphone", "fold(pemail)", "jobs", "owedc", "lastj"}, "fold(pname), pid") + " LIMIT ?2 OFFSET ?3";
@@ -5677,8 +6697,8 @@ DataConn::PaymentPlan SqliteConn::getPlanForBatch(int batchId) {
     sqlite3_prepare_v2(db,
         "SELECT pl.id, pl.batch_id, pl.installments, pl.every, pl.receipt_mode, COALESCE(b.label,''), datetime(pl.created_at,'localtime'), pl.total, "
         "  (SELECT COALESCE(SUM(CAST(ROUND(c.amount_paid*100) AS INTEGER)),0) FROM charges c WHERE c.batch_id = pl.batch_id), "
-        "  (SELECT COUNT(DISTINCT c.pay_date) FROM charges c WHERE c.batch_id = pl.batch_id AND c.status != 'future' "
-        "     AND NOT EXISTS (SELECT 1 FROM charges x WHERE x.batch_id = c.batch_id AND x.pay_date = c.pay_date "
+        "  (SELECT COUNT(DISTINCT c.charge_date) FROM charges c WHERE c.batch_id = pl.batch_id AND c.status != 'future' "
+        "     AND NOT EXISTS (SELECT 1 FROM charges x WHERE x.batch_id = c.batch_id AND x.charge_date = c.charge_date "
         "                     AND (x.status = 'future' OR CAST(ROUND(x.balance*100) AS INTEGER) > 0))), "
         "  COALESCE((SELECT m.receipt_id FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id "
         "            JOIN receipts r ON r.id = m.receipt_id WHERE c.batch_id = pl.batch_id AND r.status = 'issued' "
@@ -5722,13 +6742,13 @@ std::vector<DataConn::DebtRow> SqliteConn::debtAging(const std::string& asOf) {
     sqlite3_stmt* st = nullptr;
     sqlite3_prepare_v2(db,
         "SELECT c.user_id, "
-        "  SUM(CASE WHEN julianday(?1) - julianday(c.pay_date) <= 30 THEN CAST(ROUND(c.balance*100) AS INTEGER) ELSE 0 END), "
-        "  SUM(CASE WHEN julianday(?1) - julianday(c.pay_date) > 30 AND julianday(?1) - julianday(c.pay_date) <= 90 "
+        "  SUM(CASE WHEN julianday(?1) - julianday(c.charge_date) <= 30 THEN CAST(ROUND(c.balance*100) AS INTEGER) ELSE 0 END), "
+        "  SUM(CASE WHEN julianday(?1) - julianday(c.charge_date) > 30 AND julianday(?1) - julianday(c.charge_date) <= 90 "
         "      THEN CAST(ROUND(c.balance*100) AS INTEGER) ELSE 0 END), "
-        "  SUM(CASE WHEN julianday(?1) - julianday(c.pay_date) > 90 THEN CAST(ROUND(c.balance*100) AS INTEGER) ELSE 0 END), "
-        "  SUM(CAST(ROUND(c.balance*100) AS INTEGER)), MIN(c.pay_date) "
+        "  SUM(CASE WHEN julianday(?1) - julianday(c.charge_date) > 90 THEN CAST(ROUND(c.balance*100) AS INTEGER) ELSE 0 END), "
+        "  SUM(CAST(ROUND(c.balance*100) AS INTEGER)), MIN(c.charge_date) "
         "FROM charges c WHERE c.direction = 'in' AND CAST(ROUND(c.balance*100) AS INTEGER) > 0 "
-        "  AND c.user_id IS NOT NULL AND c.pay_date <= ?1 "
+        "  AND c.user_id IS NOT NULL AND c.charge_date <= ?1 "
         "GROUP BY c.user_id ORDER BY 5 DESC", -1, &st, nullptr);
     sqlite3_bind_text(st, 1, asOf.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -6110,8 +7130,13 @@ std::vector<MoneyPayment> SqliteConn::pageMoney(const MoneyQuery& q, int offset,
 long long SqliteConn::countMoney(const MoneyQuery& q, double* in, double* out) {
     long long n = 0; sqlite3_stmt* st = nullptr;
     SqlBinds w = MoneyWhere(q);
-    std::string sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN m.direction = 'in' THEN CAST(ROUND(m.amount*100) AS INTEGER) END), 0), "
-                      "COALESCE(SUM(CASE WHEN m.direction = 'out' THEN CAST(ROUND(m.amount*100) AS INTEGER) END), 0) "
+    // oursOnly: a payment may cover a fee and a funding together, so only its fund part is taken off
+    const std::string fundPart = !q.oursOnly ? std::string() :
+        " - COALESCE((SELECT SUM(CAST(ROUND(fa.amount*100) AS INTEGER)) FROM allocations fa JOIN charges fc ON fc.id = fa.charge_id "
+        "WHERE fa.payment_id = m.id AND (fc.batch_id IN (SELECT batch_id FROM joint_ops WHERE kind <> 'fee' AND batch_id IS NOT NULL) "
+        "OR fc.batch_id IN (SELECT CAST(json_extract(params_json,'$.cost_batch') AS INTEGER) FROM joint_ops WHERE kind <> 'fee' AND json_extract(params_json,'$.cost_batch') IS NOT NULL))), 0)";
+    std::string sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN m.direction = 'in' THEN CAST(ROUND(m.amount*100) AS INTEGER)" + fundPart + " END), 0), "
+                      "COALESCE(SUM(CASE WHEN m.direction = 'out' THEN CAST(ROUND(m.amount*100) AS INTEGER)" + fundPart + " END), 0) "
                       "FROM payments m LEFT JOIN users u ON u.id = m.user_id" + w.where;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
         w.bind(st);
@@ -6527,7 +7552,7 @@ const char* kFundActionsCte =
     "        MAX(CASE WHEN kind = 'expense' AND direction = 'out' THEN id END) AS em, "
     "        MAX(CASE WHEN joint_op_id IS NULL THEN id END) AS sm, MAX(joint_op_id) AS op FROM mv GROUP BY k), "
     "lone AS (SELECT -o.id AS k, o.op_date AS d, 0 AS inc, 0 AS outc, NULL AS em, NULL AS sm, o.id AS op FROM joint_ops o "
-    "         WHERE o.building_id = ?1 AND o.kind IN ('contribution','recharge','fee') AND NOT EXISTS (SELECT 1 FROM fund_moves f WHERE f.joint_op_id = o.id)), "
+    "         WHERE o.building_id = ?1 AND o.kind IN ('contribution','recharge') AND NOT EXISTS (SELECT 1 FROM fund_moves f WHERE f.joint_op_id = o.id)), "
     "acts AS (SELECT * FROM agg UNION ALL SELECT * FROM lone), "
     "x AS (SELECT a.k, a.inc, a.outc, a.em, a.sm, a.op, COALESCE(o.op_date, a.d) AS dt, COALESCE(o.kind, '') AS okind, "
     "        COALESCE(o.label, (SELECT description FROM fund_moves WHERE id = COALESCE(a.em, a.sm)), '') AS lbl, "
@@ -6770,7 +7795,7 @@ DataConn::MonthFund SqliteConn::monthFund(int buildingId, const std::string& ym)
         "       WHERE al.charge_id = ch.id AND p.pay_date < ?2) AS pa, "
         "     (SELECT COALESCE(SUM(CAST(ROUND(al.amount*100) AS INTEGER)), 0) FROM allocations al JOIN payments p ON p.id = al.payment_id "
         "       WHERE al.charge_id = ch.id AND p.pay_date < date(?2, '+1 month')) AS pb "
-        "   FROM charges ch JOIN joint_ops o ON o.batch_id = ch.batch_id WHERE o.building_id = ?1 AND ch.direction = 'in') "
+        "   FROM charges ch JOIN joint_ops o ON o.batch_id = ch.batch_id WHERE o.building_id = ?1 AND ch.direction = 'in' AND o.kind <> 'monthly') "
         "SELECT COALESCE(SUM(CASE WHEN NOT fee AND dt < ?2 THEN MAX(due - pa, 0) END), 0), "
         "       COALESCE(SUM(CASE WHEN NOT fee AND dt < date(?2, '+1 month') THEN MAX(due - pb, 0) END), 0), "
         "       COALESCE(SUM(CASE WHEN fee AND dt < ?2 THEN MAX(due - pa, 0) END), 0), "
@@ -6793,7 +7818,7 @@ DataConn::MonthFund SqliteConn::monthFund(int buildingId, const std::string& ym)
         "              AND f.move_date >= ?2 AND f.move_date < date(?2, '+1 month') "
         "            GROUP BY COALESCE(-f.joint_op_id, f.id)), "
         "ops AS (SELECT -1 AS mid, o.id AS op, o.op_date AS dt, o.label AS lbl, 0 AS cost FROM joint_ops o "
-        "        WHERE o.building_id = ?1 AND o.op_date >= ?2 AND o.op_date < date(?2, '+1 month') "
+        "        WHERE o.building_id = ?1 AND o.kind <> 'monthly' AND o.op_date >= ?2 AND o.op_date < date(?2, '+1 month') "
         "          AND NOT EXISTS (SELECT 1 FROM ex WHERE ex.op = o.id)), "
         "it AS (SELECT * FROM ex UNION ALL SELECT * FROM ops) "
         "SELECT it.mid, COALESCE(it.op, -1), it.dt, it.lbl, it.cost, COALESCE(o.kind, ''), "
@@ -6841,7 +7866,7 @@ DataConn::MonthFund SqliteConn::monthFund(int buildingId, const std::string& ym)
     if (sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(CASE WHEN o.kind <> 'fee' THEN CAST(ROUND(al.amount*100) AS INTEGER) END), 0), "
                                "       COALESCE(SUM(CASE WHEN o.kind = 'fee' THEN CAST(ROUND(al.amount*100) AS INTEGER) END), 0) "
                                "FROM allocations al JOIN payments p ON p.id = al.payment_id JOIN charges c ON c.id = al.charge_id "
-                               "JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.building_id = ?1 AND c.direction = 'in' AND o.op_date < ?2 "
+                               "JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.building_id = ?1 AND c.direction = 'in' AND o.kind <> 'monthly' AND o.op_date < ?2 "
                                "  AND p.pay_date >= ?2 AND p.pay_date < date(?2, '+1 month')", -1, &st, nullptr) == SQLITE_OK) {
         bind();
         if (sqlite3_step(st) == SQLITE_ROW) { m.priorPaidIn = FromCents(sqlite3_column_int64(st, 0)); m.feePriorPaidIn = FromCents(sqlite3_column_int64(st, 1)); }
@@ -6861,7 +7886,7 @@ DataConn::MonthResidents SqliteConn::monthResidents(int buildingId, const std::s
     auto bind = [&] { sqlite3_bind_int(st, 1, buildingId); sqlite3_bind_text(st, 2, s.c_str(), -1, SQLITE_TRANSIENT); };
     // the month's actions: the columns
     const char* opsSql =
-        "SELECT id, op_date, kind, label, total FROM joint_ops WHERE building_id = ?1 "
+        "SELECT id, op_date, kind, label, total FROM joint_ops WHERE building_id = ?1 AND kind <> 'monthly' "
         "AND op_date BETWEEN ?2 AND date(?2, '+1 month', '-1 day') ORDER BY op_date, id";
     if (sqlite3_prepare_v2(db, opsSql, -1, &st, nullptr) == SQLITE_OK) {
         bind();
@@ -6880,7 +7905,7 @@ DataConn::MonthResidents SqliteConn::monthResidents(int buildingId, const std::s
         "              s.apartment_id AS ap, s.user_id AS uid, o.id AS op, o.op_date AS dt, o.kind AS kind, o.batch_id AS batch, "
         "              CAST(ROUND(s.amount*100) AS INTEGER) AS amt "
         "       FROM joint_shares s JOIN joint_ops o ON o.id = s.op_id "
-        "       WHERE o.building_id = ?1 AND s.included = 1 AND s.user_id IS NOT NULL AND o.op_date <= date(?2, '+1 month', '-1 day')), "
+        "       WHERE o.building_id = ?1 AND o.kind <> 'monthly' AND s.included = 1 AND s.user_id IS NOT NULL AND o.op_date <= date(?2, '+1 month', '-1 day')), "
         "pd AS (SELECT sh.*, "
         "         (SELECT COALESCE(SUM(CAST(ROUND(al.amount*100) AS INTEGER)), 0) FROM charges c JOIN allocations al ON al.charge_id = c.id "
         "          JOIN payments p ON p.id = al.payment_id WHERE c.batch_id = sh.batch AND c.direction = 'in' AND c.apartment_id = sh.ap "
@@ -6972,20 +7997,20 @@ std::vector<DataConn::ResidentQualityRow> SqliteConn::residentQuality(const std:
     std::vector<ResidentQualityRow> out; std::map<std::pair<int, int>, size_t> at;
     // who: the resident a charge belongs to (his own record, or the old client record he came from)
     const std::string base =
-        "WITH ch AS (SELECT c.id, c.pay_date, CAST(ROUND(c.amount_due*100) AS INTEGER) AS due, CAST(ROUND(c.balance*100) AS INTEGER) AS bal, "
+        "WITH ch AS (SELECT c.id, c.charge_date, CAST(ROUND(c.amount_due*100) AS INTEGER) AS due, CAST(ROUND(c.balance*100) AS INTEGER) AS bal, "
         "              o.kind = 'fee' AS fee, o.building_id AS bid, "
         "              COALESCE((SELECT r.user_id FROM residents r WHERE r.apartment_id = c.apartment_id AND c.user_id IN (r.user_id, COALESCE(r.legacy_user_id, -1)) LIMIT 1), "
         "                       CASE WHEN COALESCE(u.resident, 0) = 1 THEN c.user_id END) AS person "
         "       FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id JOIN users u ON u.id = c.user_id "
-        "       WHERE c.direction = 'in' AND c.status != 'future' AND o.building_id IN (SELECT building_id FROM managed_buildings WHERE active = 1) "
-        "         AND (?1 = '' OR c.pay_date >= ?1) AND (?2 = '' OR c.pay_date <= ?2)) ";
+        "       WHERE c.direction = 'in' AND c.status != 'future' AND o.kind <> 'fee' AND o.building_id IN (SELECT building_id FROM managed_buildings WHERE active = 1) "
+        "         AND (?1 = '' OR c.charge_date >= ?1) AND (?2 = '' OR c.charge_date <= ?2)) ";
     auto rowOf = [&](int bid, int person) -> ResidentQualityRow& {
         auto it = at.find({bid, person});
         if (it == at.end()) { it = at.emplace(std::make_pair(bid, person), out.size()).first; out.emplace_back(); out.back().building_id = bid; out.back().user_id = person; }
         return out[it->second];
     };
     sqlite3_stmt* st = nullptr;
-    std::string sql = base + "SELECT bid, person, fee, due, bal, julianday('now','localtime') - julianday(pay_date) FROM ch WHERE person IS NOT NULL";
+    std::string sql = base + "SELECT bid, person, fee, due, bal, julianday('now','localtime') - julianday(charge_date) FROM ch WHERE person IS NOT NULL";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
     sqlite3_bind_text(st, 1, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, toDate.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -6996,9 +8021,10 @@ std::vector<DataConn::ResidentQualityRow> SqliteConn::residentQuality(const std:
         (fee ? q.feeCharged : q.fundCharged) += due; (fee ? q.feeOpen : q.fundOpen) += open;
         if (open > 0.005 && age > 30.0) { (fee ? q.feeOverdue : q.fundOverdue) += open; q.due += open; }
         q.idxDen += open; q.idxNum += open * std::exp2(-(age + 30.0) / 30.0);        // unpaid: as if paid 30 days from today
+        q.delayNum += open * age; q.delayDen += open;
     }
     sqlite3_finalize(st); st = nullptr;
-    sql = base + "SELECT ch.bid, ch.person, CAST(ROUND(a.amount*100) AS INTEGER), julianday(m.pay_date) - julianday(ch.pay_date) "
+    sql = base + "SELECT ch.bid, ch.person, CAST(ROUND(a.amount*100) AS INTEGER), julianday(m.pay_date) - julianday(ch.charge_date) "
                  "FROM ch JOIN allocations a ON a.charge_id = ch.id JOIN payments m ON m.id = a.payment_id WHERE ch.person IS NOT NULL";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
     sqlite3_bind_text(st, 1, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, toDate.c_str(), -1, SQLITE_TRANSIENT);
@@ -7007,6 +8033,7 @@ std::vector<DataConn::ResidentQualityRow> SqliteConn::residentQuality(const std:
         double amt = FromCents(sqlite3_column_int64(st, 2)), d = std::max(0.0, sqlite3_column_double(st, 3));
         q.idxDen += amt; q.idxNum += amt * std::exp2(-d / 30.0);
         q.due += amt; if (d <= 30.0) q.onTime += amt;
+        q.delayNum += amt * d; q.delayDen += amt;
     }
     sqlite3_finalize(st); st = nullptr;
     // names: his latest stay in that building

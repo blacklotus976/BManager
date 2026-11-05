@@ -95,7 +95,7 @@ int main() {
             bool found = false;
             for (auto& q : rq) if (q.user_id == st1.user_id && q.building_id == bid) {
                 found = true;
-                CHECK(ToCents(q.fundCharged) == 5000 && ToCents(q.fundOpen) == 2000 && ToCents(q.feeCharged) == 500 && ToCents(q.feeOpen) == 0);
+                CHECK(ToCents(q.fundCharged) == 5000 && ToCents(q.fundOpen) == 2000 && ToCents(q.feeCharged) == 0 && ToCents(q.feeOpen) == 0);      // fees are not part of a resident's record
                 CHECK(q.idxDen > 0 && q.idxNum < q.idxDen && q.apartment == "Α2");
                 CHECK(ToCents(q.fundOverdue) == 2000 && ToCents(q.feeOverdue) == 0);          // open since 2025: late
             }

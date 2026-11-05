@@ -86,7 +86,10 @@ echo --- 6. dist\ ---
 if not exist "dist" mkdir dist
 copy /Y "%BUILD_DIR%\Release\PropertyManager.exe" "dist\" >nul
 xcopy /E /I /Y /Q "demo_media" "dist\demo_media" >nul
-for %%F in (data.db empty.db) do if not exist "dist\%%F" copy /Y "release_db\%%F" "dist\" >nul
+if not exist "dist\data.db" copy /Y "release_db\data.db" "dist\" >nul
+rem empty.db is what we share: always the clean one, never one that was used for trying things
+del /Q "dist\empty.db-wal" "dist\empty.db-shm" 2>nul
+copy /Y "release_db\empty.db" "dist\" >nul
 echo dist\PropertyManager.exe  (copy the database folder together with its attachments\ folder and -wal/-shm files)
 
 echo.

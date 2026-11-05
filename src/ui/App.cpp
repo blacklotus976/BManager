@@ -24,6 +24,25 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_internal.h"
 #include "imgui_impl_opengl3.h"
+
+// Plain text. In a table cell a value too long for its column slides left and right inside the cell, and shows whole on hover.
+static void CellText(const char* text, const char* textEnd = nullptr) {
+    if (!ImGui::GetCurrentTable() || textEnd) { ImGui::TextUnformatted(text, textEnd); return; }
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (size.x <= avail + 0.5f || size.y > ImGui::GetTextLineHeight() + 1.0f) { ImGui::TextUnformatted(text); return; }
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    // what it would like to take, up to the list's widest column: the column sizing measures this
+    ImGui::Dummy(ImVec2(size.x < 420.0f ? size.x : 420.0f, size.y));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+    const float over = size.x - avail, speed = 12.0f, pause = 2.5f, travel = over / speed;
+    float t = (float)ImGui::GetTime(); t -= (float)(int)(t / (2.0f * (travel + pause))) * 2.0f * (travel + pause);
+    const float x = t < pause ? 0.0f : t < pause + travel ? (t - pause) * speed : t < 2.0f * pause + travel ? over : over - (t - 2.0f * pause - travel) * speed;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(p, ImVec2(p.x + avail, p.y + size.y), true);
+    dl->AddText(ImVec2(p.x - x, p.y), ImGui::GetColorU32(ImGuiCol_Text), text);
+    dl->PopClipRect();
+}
 #ifdef _WIN32
 #include <windows.h>
 #include <GL/gl.h>
@@ -198,7 +217,7 @@ static bool BeginGuardedModal(const char* name, bool& show, ImGuiWindowFlags fla
                 ImGui::TableHeadersRow();
                 for (auto& d : diffs) {
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(d.field.c_str());
+                    ImGui::TableSetColumnIndex(0); CellText(d.field.c_str());
                     ImGui::TableSetColumnIndex(1); ImGui::TextColored(ImVec4(0.8f,0.4f,0.4f,1), "%s", d.oldVal.c_str());
                     ImGui::TableSetColumnIndex(2); ImGui::TextColored(ImVec4(0.4f,0.8f,0.4f,1), "%s", d.newVal.c_str());
                 }
@@ -243,7 +262,7 @@ static void DrawConfirmModal() {
             ImGui::TableHeadersRow();
             for (auto& d : g_confirm.diffs) {
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(d.field.c_str());
+                ImGui::TableSetColumnIndex(0); CellText(d.field.c_str());
                 ImGui::TableSetColumnIndex(1); ImGui::TextColored(ImVec4(0.8f,0.4f,0.4f,1), "%s", d.oldVal.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::TextColored(ImVec4(0.4f,0.8f,0.4f,1), "%s", d.newVal.c_str());
             }
@@ -407,6 +426,7 @@ static std::string SeriesLabel(const std::string& s) { return s == "A" ? "Α" : 
 static std::string ChargeLabel(const Payment& p) {
     std::string s = g_app.serviceLabel(p.service_id);
     if (p.joint_op_id > 0) s += "  [Κοινόχρηστο]";
+    if (p.contract_id > 0) s += "  [Σύμβαση]";
     if (p.used_offer_id > 0) s += "  [Προσφορά: " + p.used_offer_name + "]";
     return s;
 }
@@ -459,12 +479,13 @@ static bool PickerPopup(const char* popupId, PickerState& ps, const char* hint, 
 }
 
 // Business partner (Συνεργάτης) a cost was paid to. A short list, so a plain combo. -1 = nobody in particular.
-static bool PickPartner(const char* id, int& partnerId, float width = 300.0f) {
+// noCost: when given, the list also offers "no cost" and tells the caller it was chosen (the cost is then cleared there).
+static bool PickPartner(const char* id, int& partnerId, float width = 300.0f, bool* noCost = nullptr) {
     static std::map<std::string, PickerState> states;
     PickerState& ps = states[id];
     static Cached<Partner> curC;
     ImGui::PushID(id);
-    std::string cur = "#-1 (δεν καταγράφεται συνεργάτης)";
+    std::string cur = "#-1 Κόστος χωρίς όνομα συνεργάτη";
     if (partnerId > 0) {
         const Partner& cp = curC.get(std::to_string(partnerId), [&] { return g_app.conn->getPartner(partnerId); });
         if (cp.id == partnerId) cur = cp.name + (cp.trade.empty() ? "" : "  ·  " + cp.trade);
@@ -474,7 +495,8 @@ static bool PickPartner(const char* id, int& partnerId, float width = 300.0f) {
         static Cached<std::pair<std::vector<Partner>, int>> cache;
         const auto& res = cache.get(q + "#" + std::to_string(off), [&] {
             return std::make_pair(g_app.conn->pagePartners(q, true, {}, off, kPickPage), g_app.conn->countPartners(q, true)); });
-        if (off == 0 && q.empty() && ImGui::Selectable("#-1 (δεν καταγράφεται συνεργάτης)", partnerId <= 0)) { partnerId = -1; done = true; }
+        if (off == 0 && q.empty() && noCost && ImGui::Selectable("#0 Χωρίς κόστος: δεν χρειάζεται συνεργάτης")) { *noCost = true; partnerId = -1; done = true; }
+        if (off == 0 && q.empty() && ImGui::Selectable("#-1 Κόστος χωρίς όνομα συνεργάτη", partnerId <= 0)) { partnerId = -1; done = true; }
         for (auto& pr : res.first) {
             ImGui::PushID(pr.id);
             std::string lb = pr.name + (pr.trade.empty() ? "" : "  ·  " + pr.trade);
@@ -599,7 +621,7 @@ static bool PickBuilding(const char* id, int& buildingId, float width = 320.0f, 
         static Cached<std::pair<std::vector<Building>, int>> cache;
         const auto& res = cache.get(q + "#" + std::to_string(off), [&] {
             return std::make_pair(g_app.conn->pageBuildings(q, off, kPickPage), g_app.conn->countBuildings(q)); });
-        if (ImGui::BeginTable("bld", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+        if (ImGui::BeginTable("bld", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("Διεύθυνση", ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableSetupColumn("Περιοχή", ImGuiTableColumnFlags_WidthStretch, 1.2f);
             ImGui::TableSetupColumn("Τ.Κ.", ImGuiTableColumnFlags_WidthFixed, 70);
@@ -785,7 +807,7 @@ static void DrawAttachmentViewer() {
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + 50), ImGuiCond_Always, ImVec2(0.5f, 0));
         ImGui::Begin("##drophint", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings);
-        ImGui::TextUnformatted(g_dropHint.c_str());
+        CellText(g_dropHint.c_str());
         ImGui::End();
     }
     if (!g_showAttachmentViewer) { if (g_imageView.IsOpen()) g_imageView.Close(); if (g_videoView.IsOpen()) g_videoView.Close(); return; }
@@ -852,6 +874,7 @@ static void CardWrapNext(float cardWidth) {
 struct Pager {
     int offset   = 0;
     int pageSize = 50;
+    bool autoFit = false; float autoKey = -1.0f;      // set by the list header: as many rows as fit, no scrolling
     int total    = 0;
 
     int  CurrentPage() const { return pageSize > 0 ? (offset / pageSize) + 1 : 1; }
@@ -887,10 +910,11 @@ static bool DrawPager(Pager& p, const char* id) {
     if (ImGui::ArrowButton("##next", ImGuiDir_Right)) { p.Next(); changed = true; }
     if (!p.HasNext()) ImGui::EndDisabled();
 
+    if (p.autoFit) { ImGui::PopID(); return changed; }
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
-    ImGui::TextUnformatted("Ανά σελίδα:");
+    CellText("Ανά σελίδα:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(90);
     static const char* kSizes[] = { "10", "20", "50", "100", "200" };
@@ -971,10 +995,11 @@ struct ListColDef { const char* name; ImGuiTableColumnFlags flags; float w; bool
 
 // Compact headers (no move buttons): for tables that must fit the page width without sideways scrolling.
 static bool g_listCompact = false;
+static const bool g_listFilterable = true;  // every list has the filter button
 // Width a list column needs so its name and its four header buttons are never squashed.
 static float ListColNeed(const ListColDef& d) {
     float name = ImGui::CalcTextSize(d.name).x + 4.0f;
-    float arrows = d.arrows ? (g_listCompact ? 2.0f : 4.0f) * (ImGui::CalcTextSize("▲").x + 8.0f) + 6.0f : 0.0f;
+    float arrows = d.arrows ? ((g_listCompact ? 2.0f : 4.0f) + (g_listFilterable ? 1.0f : 0.0f)) * (ImGui::CalcTextSize("▲").x + 8.0f) + 6.0f : 0.0f;
     return std::max(name, arrows) + ImGui::GetStyle().CellPadding.x * 2.0f + 6.0f;
 }
 // Every column gets a real width (stretch weights become ~80 px per unit) of at least what its header needs;
@@ -982,17 +1007,73 @@ static float ListColNeed(const ListColDef& d) {
 static void ListSetupColumns(const std::vector<int>& order, const ListColDef* defs) {
     for (int l : order) {
         const ListColDef& d = defs[l];
-        bool stretch = (d.flags & ImGuiTableColumnFlags_WidthStretch) != 0;
-        float w = std::max(stretch ? d.w * 80.0f : d.w, ListColNeed(d));
         ImGuiTableColumnFlags f = (d.flags & ~ImGuiTableColumnFlags_WidthStretch) | ImGuiTableColumnFlags_WidthFixed;
-        ImGui::TableSetupColumn(d.name, f | ImGuiTableColumnFlags_NoReorder | ImGuiTableColumnFlags_NoSort, w);
+        ImGui::TableSetupColumn(d.name, f | ImGuiTableColumnFlags_NoReorder | ImGuiTableColumnFlags_NoSort, ListColNeed(d));
     }
+    ImGuiTable* t = ImGui::GetCurrentTable();
+    if (!t) return;
+    const float kMaxCol = 420.0f, pad = ImGui::GetStyle().CellPadding.x * 2.0f + 1.0f;
+    float avail = t->OuterRect.GetWidth() - ((t->Flags & ImGuiTableFlags_ScrollY) ? ImGui::GetStyle().ScrollbarSize : 0.0f) - 2.0f;
+    // a width set by hand stays; the other columns share what is left
+    static std::map<ImGuiID, std::map<int, float>> manual; auto& man = manual[t->ID];
+    if (t->LastResizedColumn >= 0 && t->LastResizedColumn < (int)order.size()) man[order[t->LastResizedColumn]] = t->Columns[t->LastResizedColumn].WidthRequest;
+    float sum = 0.0f; std::vector<float> w(order.size(), 0.0f);
+    for (size_t d = 0; d < order.size() && (int)d < t->ColumnsCount; d++) {
+        const ImGuiTableColumn& col = t->Columns[(int)d];
+        if (!col.IsEnabled) continue;
+        avail -= pad;
+        if (auto it = man.find(order[d]); it != man.end()) { w[d] = -it->second; avail -= it->second; continue; }
+        const float need = ListColNeed(defs[order[d]]) - pad;
+        w[d] = std::max(need, std::min(col.WidthAuto, std::max(need, kMaxCol)));      // the largest value last frame, capped
+        sum += w[d];
+    }
+    // room left: everybody grows alike. Too wide: only tables without sideways scrolling have to fit.
+    const float scale = sum <= 0.0f ? 1.0f : (sum < avail ? avail / sum : ((t->Flags & ImGuiTableFlags_ScrollX) ? 1.0f : std::max(0.5f, avail / sum)));
+    for (size_t d = 0; d < order.size() && (int)d < t->ColumnsCount; d++) { if (w[d] > 0.0f) t->Columns[(int)d].WidthRequest = std::floor(w[d] * scale); else if (w[d] < 0.0f) t->Columns[(int)d].WidthRequest = -w[d]; }
 }
 static int ListPos(const std::vector<int>& order, int logical) {
     for (int d = 0; d < (int)order.size(); d++) if (order[d] == logical) return d;
     return 0;
 }
-static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSort& sort, Pager& pager) {
+// The column's filter popup, PyCharm CSV viewer style: search, tick the distinct values, or keep only rows containing the text.
+using DistinctFn = std::function<std::vector<std::pair<std::string, int>>(int, const std::string&)>;
+static void ColFilterPopup(int col, const char* name, DataConn::ColFilters& cf, Pager& pager, const DistinctFn& distinct) {
+    static char search[128] = "";
+    if (ImGui::IsWindowAppearing()) { search[0] = 0; ImGui::SetKeyboardFocusHere(); }
+    ImGui::TextDisabled("%s", name);
+    ImGui::SetNextItemWidth(280); ImGui::InputTextWithHint("##cfq", "Αναζήτηση τιμής...", search, sizeof(search));
+    if (ImGui::SmallButton("Μόνο όσα περιέχουν το κείμενο") && search[0]) { cf.text[col] = search; cf.in.erase(col); pager.Reset(); }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Καθαρισμός")) { cf.in.erase(col); cf.text.erase(col); pager.Reset(); }
+    if (cf.text.count(col) && !cf.text[col].empty()) ImGui::TextColored(ImVec4(0.35f, 0.80f, 1.0f, 1.0f), "περιέχει: %s", cf.text[col].c_str());
+    ImGui::Separator();
+    auto vals = distinct(col, search);
+    ImGui::BeginChild("##cfvals", ImVec2(380, 260));
+    for (auto& [v, n] : vals) {
+        auto& sel = cf.in[col];
+        bool on = sel.count(v) > 0;
+        std::string label = (v.empty() ? std::string("(κενό)") : v) + "  (" + std::to_string(n) + ")##" + v;
+        if (ImGui::Checkbox(label.c_str(), &on)) { if (on) sel.insert(v); else sel.erase(v); pager.Reset(); }
+    }
+    if (vals.empty()) ImGui::TextDisabled("Καμία τιμή.");
+    ImGui::EndChild();
+    if (cf.in.count(col) && cf.in[col].empty()) cf.in.erase(col);
+}
+
+static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSort& sort, Pager& pager,
+                          DataConn::ColFilters* cf = nullptr, const DistinctFn* distinct = nullptr) {
+    // the automatic pager: a page is as many rows as fit here without scrolling
+    if (ImGuiTable* t = ImGui::GetCurrentTable(); t && !(t->OuterWindow->Flags & ImGuiWindowFlags_AlwaysAutoResize)) {
+        const float line = ImGui::GetTextLineHeight(), pad = ImGui::GetStyle().CellPadding.y * 2.0f, rowH = line + pad + 1.0f, headH = line * 2.0f + pad + 6.0f;
+        const bool scroll = (t->Flags & ImGuiTableFlags_ScrollY) != 0;
+        const float key = scroll ? t->OuterRect.GetHeight() : ImGui::GetWindowHeight();
+        if (!pager.autoFit || key != pager.autoKey) {
+            const float room = scroll ? t->OuterRect.GetHeight() : ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.4f;
+            const int fit = std::max(5, (int)((room - headH) / rowH));
+            pager.autoFit = true; pager.autoKey = key;
+            if (fit != pager.pageSize) { pager.offset = pager.offset / fit * fit; pager.pageSize = fit; }
+        }
+    }
     ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
     const int n = (int)order.size();
     const ImVec4 accent(0.35f, 0.80f, 1.0f, 1.0f);
@@ -1002,7 +1083,7 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
         const int l = order[d];
         const ListColDef& def = defs[l];
         ImGui::PushID(l);
-        if (!def.arrows) { ImGui::TextUnformatted(def.name); ImGui::PopID(); continue; }
+        if (!def.arrows) { CellText(def.name); ImGui::PopID(); continue; }
 
         // two lines: the full column name, then the buttons (move left, sort up, sort down, move right)
         int ki = -1;
@@ -1012,7 +1093,7 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
         const bool sDesc = sorted && !sort.keys[ki].second;
         std::string title = std::string(def.name) + ((sorted && sort.keys.size() > 1) ? " " + std::to_string(ki + 1) : std::string());
         ImGui::PushStyleColor(ImGuiCol_Text, sorted ? accent : ImGui::GetStyleColorVec4(ImGuiCol_Text));
-        ImGui::TextUnformatted(TruncToWidth(title, ImGui::GetContentRegionAvail().x).c_str());
+        CellText(title.c_str());
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n▲ / ▼ ταξινόμηση κατά αυτή τη στήλη (κλικ ξανά: αφαίρεση)\nShift+κλικ: προσθήκη ως δεύτερο κριτήριο\n◄ / ► μετακίνηση στήλης", def.name);
 
@@ -1034,8 +1115,22 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
         ImGui::SameLine();
         if (btn("▼##d", true, sDesc)) { SortToggle(sort, l, false, ImGui::GetIO().KeyShift); pager.Reset(); }
         if (!g_listCompact) { ImGui::SameLine(); if (btn("►##r", canR, false)) { swapA = d; swapB = d + 1; } }
+        if (cf && distinct) {
+            ImGui::SameLine();
+            if (btn("   ##f", true, cf->active(l))) ImGui::OpenPopup("##colfilter");
+            {   // a magnifying glass, drawn so it looks the same on every machine
+                const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                const float r = (b.y - a.y) * 0.24f; const ImVec2 o((a.x + b.x) * 0.5f - r * 0.3f, (a.y + b.y) * 0.5f - r * 0.3f);
+                const ImU32 col = ImGui::GetColorU32(cf->active(l) ? accent : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddCircle(o, r, col, 12, 1.4f);
+                dl->AddLine(ImVec2(o.x + r * 0.7f, o.y + r * 0.7f), ImVec2(o.x + r * 1.8f, o.y + r * 1.8f), col, 1.6f);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Φίλτρο στήλης: αναζήτηση και επιλογή τιμών");
+        }
         ImGui::PopStyleColor();
         ImGui::PopStyleVar(2);
+        if (cf && distinct && ImGui::BeginPopup("##colfilter")) { ColFilterPopup(l, def.name, *cf, pager, *distinct); ImGui::EndPopup(); }
         ImGui::PopID();
     }
     if (swapA >= 0) std::swap(order[swapA], order[swapB]);
@@ -1054,7 +1149,42 @@ static void GridSort(std::vector<const Row*>& rows, const ColSort& s, Cmp cmp) {
 }
 template <class T> static int Cmp3(const T& a, const T& b) { return a < b ? -1 : (b < a ? 1 : 0); }
 static int CmpText(const std::string& a, const std::string& b) { return Cmp3(FoldGreek(a), FoldGreek(b)); }
-struct GridState { std::vector<int> order; ColSort sort; Pager pager; };
+struct GridState { std::vector<int> order; ColSort sort; Pager pager; DataConn::ColFilters cf; char q[128] = ""; };
+
+// The one list module. A list says only what text each column shows (textOf(row, col)); the module gives it the search bar
+// over all columns and each column's search + distinct values, on every row of the list and not just the page on screen.
+template <class Row, class TextOf>
+static bool ListRowMatches(const Row& r, const GridState& g, const TextOf& textOf, int ncols, int skipCol = -1) {
+    for (auto& [col, vals] : g.cf.in) if (col != skipCol && !vals.empty() && !vals.count(textOf(r, col))) return false;
+    for (auto& [col, t] : g.cf.text) if (col != skipCol && !t.empty() && FoldGreek(textOf(r, col)).find(FoldGreek(t)) == std::string::npos) return false;
+    if (g.q[0]) {
+        const std::string fq = FoldGreek(g.q); bool any = false;
+        for (int c = 0; c < ncols && !any; c++) any = FoldGreek(textOf(r, c)).find(fq) != std::string::npos;
+        if (!any) return false;
+    }
+    return true;
+}
+static std::string ListFilterKey(const GridState& g) {
+    std::string k = g.q;
+    for (auto& [col, vals] : g.cf.in) { k += "|i" + std::to_string(col); for (auto& v : vals) k += "," + v; }
+    for (auto& [col, t] : g.cf.text) k += "|t" + std::to_string(col) + "," + t;
+    return k;
+}
+static void DrawListSearch(GridState& g, float width = 300.0f) {
+    (void)width;
+    if (!g.q[0] && !g.cf.any()) return;
+    ImGui::PushID(&g);
+    if (ImGui::SmallButton("Καθαρισμός φίλτρων στηλών")) { g.q[0] = 0; g.cf = {}; g.pager.Reset(); }
+    ImGui::PopID();
+}
+static std::string ListNum(double d) { if (d < 0) return ""; char b[32]; std::snprintf(b, sizeof(b), "%.0f", d); return b; }
+// a column's distinct values among the rows that pass every other filter
+template <class Rows, class TextOf>
+static std::vector<std::pair<std::string, int>> ListDistinct(const Rows& rows, const GridState& g, const TextOf& textOf, int ncols, int col, const std::string& search) {
+    std::map<std::string, int> n; const std::string fq = FoldGreek(search);
+    for (auto& r : rows) if (ListRowMatches(r, g, textOf, ncols, col)) { std::string v = textOf(r, col); if (fq.empty() || FoldGreek(v).find(fq) != std::string::npos) n[v]++; }
+    return std::vector<std::pair<std::string, int>>(n.begin(), n.end());
+}
 
 // A list's sort keys expressed in the column numbers its SQL query understands (columns without a mapping are dropped),
 // and a short string of them for cache keys. Every key the person clicked is kept: the query sorts by all of them.
@@ -1104,10 +1234,92 @@ template <class Row> struct ListModel {
         if (g.pager.offset > 0 && g.pager.offset >= g.pager.total) g.pager.Reset();
         return p;
     }
+    // The same, with the module's search: while anything is searched every row is read and matched, otherwise only the page.
+    Cached<std::vector<Row>> allCache; Cached<Pg> filteredCache;
+    template <class Fetch> const std::vector<Row>& All(const std::string& key, Fetch fetch) {
+        return allCache.get(key + "|" + SortKeyStr(g.sort.keys), [&] { return fetch(g.sort.keys, 0, 1000000); });
+    }
+    DistinctFn distinct;      // the header's filter values, set on every load (used in the same frame)
+    template <class Fetch, class TextOf> void SetDistinct(const std::string& key, Fetch fetch, TextOf textOf, int ncols) {
+        distinct = [this, key, fetch, textOf, ncols](int col, const std::string& q) { return ListDistinct(All(key, fetch), g, textOf, ncols, col, q); };
+    }
+    template <class Fetch, class Count, class TextOf> const Pg& LoadT(const std::string& key, Fetch fetch, Count count, TextOf textOf, int ncols) {
+        SetDistinct(key, fetch, textOf, ncols);
+        return LoadF(key, fetch, count, textOf, ncols);
+    }
+    // For a list that keeps its own pager and sort: while something is searched, its page and total come from here.
+    std::string lastFilter;
+    template <class Fetch, class TextOf> void Override(Pager& pager, const SortSpec& keys, const std::string& key, Fetch fetch, TextOf textOf, int ncols, std::vector<Row>& rows, int& total) {
+        g.sort.keys = keys; SetDistinct(key, fetch, textOf, ncols);
+        const std::string fk = ListFilterKey(g);
+        if (fk != lastFilter) { lastFilter = fk; pager.Reset(); }
+        if (fk.empty()) return;
+        g.pager.offset = pager.offset; g.pager.pageSize = pager.pageSize;
+        const auto& all = All(key, fetch);
+        const Pg& p = filteredCache.get(key + "|" + SortKeyStr(keys) + "|" + fk + "|" + std::to_string(pager.offset) + "|" + std::to_string(pager.pageSize), [&] {
+            Pg r; for (auto& row : all) if (ListRowMatches(row, g, textOf, ncols)) { if (r.count >= pager.offset && r.count < pager.offset + pager.pageSize) r.rows.push_back(row); r.count++; }
+            return r; });
+        rows = p.rows; total = p.count;
+    }
+    template <class Fetch, class Count, class TextOf> const Pg& LoadF(const std::string& key, Fetch fetch, Count count, TextOf textOf, int ncols) {
+        if (!g.q[0] && !g.cf.any()) return Load(key, fetch, count);
+        const auto& all = All(key, fetch);
+        const Pg& p = filteredCache.get(key + "|" + SortKeyStr(g.sort.keys) + "|" + ListFilterKey(g) + "|" + std::to_string(g.pager.offset) + "|" + std::to_string(g.pager.pageSize), [&] {
+            Pg r; for (auto& row : all) if (ListRowMatches(row, g, textOf, ncols)) { if (r.count >= g.pager.offset && r.count < g.pager.offset + g.pager.pageSize) r.rows.push_back(row); r.count++; }
+            return r; });
+        g.pager.total = p.count;
+        if (g.pager.offset > 0 && g.pager.offset >= g.pager.total) g.pager.Reset();
+        return p;
+    }
 };
 
 // The payment ranking of clients (Προσφορές, and each client's profile): state of one such table.
 struct QualityView { GridState g; char q[128] = ""; std::string from, to; bool blkS = true, blkJ = true, blkT = true, more = false; };
+// "1.234,56 €", "-12", "45%": the number in a cell, so lists sort by value and not by the text
+static bool ListNumber(const std::string& t, double& out) {
+    std::string n; for (size_t i = 0; i < t.size(); i++) { unsigned char ch = t[i];
+        if (ch == '.') continue; if (ch == ',') { n += '.'; continue; } if (ch == '-' || (ch >= '0' && ch <= '9')) { n += (char)ch; continue; }
+        if (ch == ' ' || ch == '%') continue; if (t.compare(i, 3, "€") == 0) { i += 2; continue; } if (t.compare(i, 3, "−") == 0) { n += '-'; i += 2; continue; } if (t[i] == '+') continue; return false; }
+    if (n.empty() || n == "-") return false;
+    out = std::atof(n.c_str()); return true;
+}
+#define LC(name) { name, ImGuiTableColumnFlags_WidthFixed, 0.0f, true }
+#define LCA { "", ImGuiTableColumnFlags_WidthFixed, 0.0f, false }
+// A small list on the shared module: its rows are in memory, text(row, col) is what a column shows, cell(row, col) draws it.
+template <class Row, class Text, class Cell, class Click>
+static void DrawMiniList(const char* id, GridState& g, const ListColDef* cols, int n, const std::vector<Row>& all, Text text, Cell cell, Click click) {
+    if (g.order.empty()) { for (int i = 0; i < n; i++) g.order.push_back(i); g.pager.pageSize = 10; }
+    ImGui::PushID(id);
+    DrawListSearch(g);
+    std::vector<const Row*> rows;
+    for (auto& r : all) if (ListRowMatches(r, g, text, n)) rows.push_back(&r);
+    GridSort(rows, g.sort, [&](int c, const Row& a, const Row& b) {
+        const std::string x = text(a, c), y = text(b, c);
+        double nx = 0, ny = 0; if (ListNumber(x, nx) && ListNumber(y, ny)) return Cmp3(nx, ny);
+        return CmpText(x, y); });
+    g.pager.total = (int)rows.size(); if (g.pager.offset >= g.pager.total) g.pager.Reset();
+    const DistinctFn distinct = [&](int col, const std::string& q) { return ListDistinct(all, g, text, n, col, q); };
+    if (ImGui::BeginTable("##list", n, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+        ListSetupColumns(g.order, cols);
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &distinct);
+        for (int i = g.pager.offset; i < std::min(g.pager.total, g.pager.offset + g.pager.pageSize); i++) {
+            ImGui::PushID(i); ImGui::TableNextRow();
+            ImGuiID rowId = 0;
+            for (int d = 0; d < n; d++) {
+                ImGui::TableSetColumnIndex(d);
+                if (d == 0) rowId = RowSelectable("##row");
+                if (d == 0) ImGui::SameLine(0, 0);
+                cell(*rows[i], g.order[d]);
+            }
+            if (rowId != 0 && ImGui::IsMouseClicked(0) && ImGui::GetCurrentContext()->HoveredId == rowId) click(*rows[i]);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (g.pager.total > g.pager.pageSize) DrawPager(g.pager, "pg");
+    ImGui::PopID();
+}
+
 static void DrawQuality(const char* id, QualityView& v, int onlyUser, float height);
 static void OpenPartnerProfile(int id);
 
@@ -1399,9 +1611,9 @@ static void DrawAptTimeline(int aptId, const char* id, float maxH = 0.0f) {
                 if (ImGui::Selectable(g_app.userName(s.user_id).c_str())) OpenResidentLedger(s.user_id);
                 ImGui::PopStyleColor();
             } else ImGui::TextDisabled(s.current ? "Κανένας κάτοικος αυτή τη στιγμή" : "— κενό —");
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(s.from.empty() ? "—" : AptDateLabel(s.from).c_str());
+            ImGui::TableSetColumnIndex(1); CellText(s.from.empty() ? "—" : AptDateLabel(s.from).c_str());
             ImGui::TableSetColumnIndex(2);
-            if (s.current) ImGui::TextColored(kColIn, "σήμερα"); else ImGui::TextUnformatted(AptDateLabel(s.to).c_str());
+            if (s.current) ImGui::TextColored(kColIn, "σήμερα"); else CellText(AptDateLabel(s.to).c_str());
             ImGui::TableSetColumnIndex(3);
             if (!s.from.empty()) {
                 auto days = [](const std::string& d) { int y = 0, m = 0, dd = 0; std::sscanf(d.c_str(), "%d-%d-%d", &y, &m, &dd);
@@ -1452,9 +1664,9 @@ static void DrawBuildingOpenJoints(int buildingId) {
         for (auto& o : ops) {
             double paid = std::min(o.paid, o.total), pct = o.total > 0.005 ? paid / o.total * 100.0 : 100.0;
             ImGui::PushID(o.id); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(o.op_date).c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(o.label.c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(o.total).c_str());
+            ImGui::TableNextColumn(); CellText(DateGr(o.op_date).c_str());
+            ImGui::TableNextColumn(); CellText(o.label.c_str());
+            ImGui::TableNextColumn(); CellText(Eur(o.total).c_str());
             ImGui::TableNextColumn(); ImGui::TextColored(kColIn, "%s", Eur(paid).c_str());
             ImGui::TableNextColumn(); ImGui::TextColored(kColOwed, "%s", Eur(MoneySub(o.total, paid)).c_str());
             ImGui::TableNextColumn(); { char bf[24]; std::snprintf(bf, sizeof(bf), "%.0f%%", pct);
@@ -1531,9 +1743,9 @@ static void DrawBuildingApartments(const BuildingAgg& b) {
             } else if (r.s.current) ImGui::TextDisabled("Κανένας κάτοικος αυτή τη στιγμή");
             else ImGui::TextDisabled("— κενό —");
             if (history) {
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(r.s.from.empty() ? "—" : AptDateLabel(r.s.from).c_str());
+                ImGui::TableSetColumnIndex(2); CellText(r.s.from.empty() ? "—" : AptDateLabel(r.s.from).c_str());
                 ImGui::TableSetColumnIndex(3);
-                if (r.s.current) ImGui::TextColored(kColIn, "σήμερα"); else ImGui::TextUnformatted(AptDateLabel(r.s.to).c_str());
+                if (r.s.current) ImGui::TextColored(kColIn, "σήμερα"); else CellText(AptDateLabel(r.s.to).c_str());
             }
             ImGui::TableSetColumnIndex(ncol - 1);
             if (r.first) {
@@ -1586,8 +1798,8 @@ static void DrawBuildingClientCharges(int buildingId) {
     if (uid <= 0) { ImGui::TextDisabled("Η πολυκατοικία δεν έχει καρτέλα πελάτη."); return; }
     User u = g_app.conn->getUserById(uid);
     ImGui::TextDisabled("Διαχειριστής:"); ImGui::SameLine();
-    ImGui::TextUnformatted((u.phone.empty() ? std::string("χωρίς τηλέφωνο") : u.phone).c_str()); ImGui::SameLine();
-    ImGui::TextDisabled("·"); ImGui::SameLine(); ImGui::TextUnformatted((u.email.empty() ? std::string("χωρίς email") : u.email).c_str());
+    CellText((u.phone.empty() ? std::string("χωρίς τηλέφωνο") : u.phone).c_str()); ImGui::SameLine();
+    ImGui::TextDisabled("·"); ImGui::SameLine(); CellText((u.email.empty() ? std::string("χωρίς email") : u.email).c_str());
     ImGui::SameLine(); if (ImGui::SmallButton("Στοιχεία πελάτη…")) OpenEditUser(u);
     if (ImGui::Button("+ Χρέωση")) OpenClientCharge(uid);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Υπηρεσία ή πακέτο στην πολυκατοικία, όπως σε κάθε πελάτη");
@@ -1612,26 +1824,28 @@ static void DrawBuildingClientCharges(int buildingId) {
     static std::map<int, ListModel<Payment>> models;
     ListModel<Payment>& m = models[uid];
     m.Init(BB_COUNT, {{BB_DATE, false}}, 15);
-    const auto& pg = m.Load(std::to_string(uid),
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadT(std::to_string(uid),
         [&](const SortSpec& s, int off, int lim) {
             DataConn::PaymentFilter q = f;
             q.sort = MapSort(s, {{BB_DATE, 0}, {BB_WHAT, 2}, {BB_DUE, 3}, {BB_PAID, 4}, {BB_LEFT, 5}, {BB_STATE, 6}});
             return g_app.conn->findPayments(q, DataConn::PayOrder::DateDesc, off, lim); },
-        [&] { return (int)t.count; });
+        [&] { return (int)t.count; },
+        [](const Payment& p, int c) -> std::string { const double left = MoneySub(p.amount_due, p.amount_paid); switch (c) { case BB_DATE: return DateGr(p.year, p.month, p.day); case BB_WHAT: return ChargeLabel(p); case BB_DUE: return Eur(p.amount_due); case BB_PAID: return Eur(p.amount_paid); case BB_LEFT: return Eur(left); case BB_STATE: return p.status == "future" ? "Προγραμματισμένη" : left <= 0.005 ? "Εξοφλήθηκε" : p.amount_paid > 0.005 ? "Μερικώς" : "Απλήρωτη"; default: return ""; } }, BB_COUNT);
     if (pg.count == 0) { ImGui::TextDisabled("Καμία χρέωση στην πολυκατοικία ακόμα. «+ Χρέωση» για υπηρεσία ή πακέτο."); return; }
     float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
     if (ImGui::BeginTable("bldclbills", BB_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(m.g.order, cols);
-        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager);
+        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager, &m.g.cf, &m.distinct);
         auto P = [&](int c) { return ListPos(m.g.order, c); };
         for (auto& p : pg.rows) {
             double left = MoneySub(p.amount_due, p.amount_paid);
             bool fut = p.status == "future";
             ImGui::PushID(p.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(BB_DATE)); ImGui::TextUnformatted(DateGr(p.year, p.month, p.day).c_str());
-            ImGui::TableSetColumnIndex(P(BB_WHAT)); ImGui::TextUnformatted(ChargeLabel(p).c_str());
-            ImGui::TableSetColumnIndex(P(BB_DUE)); ImGui::TextUnformatted(Eur(p.amount_due).c_str());
+            ImGui::TableSetColumnIndex(P(BB_DATE)); CellText(DateGr(p.year, p.month, p.day).c_str());
+            ImGui::TableSetColumnIndex(P(BB_WHAT)); CellText(ChargeLabel(p).c_str());
+            ImGui::TableSetColumnIndex(P(BB_DUE)); CellText(Eur(p.amount_due).c_str());
             ImGui::TableSetColumnIndex(P(BB_PAID)); if (p.amount_paid > 0.005) ImGui::TextColored(kColIn, "%s", Eur(p.amount_paid).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(BB_LEFT)); if (left > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(left).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(BB_STATE));
@@ -1690,10 +1904,10 @@ static void DrawBuildingCharges(int buildingId) {
             const JointOp& o = r.op;
             double paid = std::min(o.paid, o.total), left = MoneySub(o.total, paid);
             ImGui::PushID(o.id); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(o.op_date).c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(o.label.c_str());
+            ImGui::TableNextColumn(); CellText(DateGr(o.op_date).c_str());
+            ImGui::TableNextColumn(); CellText(o.label.c_str());
             if (!o.note.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", o.note.c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(o.total).c_str());
+            ImGui::TableNextColumn(); CellText(Eur(o.total).c_str());
             ImGui::TableNextColumn(); if (paid > 0.005) ImGui::TextColored(kColIn, "%s", Eur(paid).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); if (left > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(left).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); if (r.cost > 0.005) ImGui::TextColored(kColOut, "%s", Eur(r.cost).c_str()); else ImGui::TextDisabled("—");
@@ -1712,7 +1926,7 @@ static void DrawBuildingDetail(const BuildingAgg& b) {
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f,0.95f,1.0f,1.0f));
     ImGui::SetWindowFontScale(1.15f);
-    ImGui::TextUnformatted(b.displayName.c_str());
+    CellText(b.displayName.c_str());
     ImGui::SetWindowFontScale(1.0f);
     ImGui::PopStyleColor();
 
@@ -1809,17 +2023,52 @@ static bool g_usersShowResidence = true;            // Στοιχεία κατο
 static bool g_usersTableView = true;               // false = cards, true = table (default: list)
 
 static const char* kUserSortFields[] = { "ΚΩΔ", "ΔΙΕΥΘΥΝΣΗ", "ΟΝΟΜΑ", "ΤΗΛ", "ΠΕΡΙΟΧΗ", "ΤΚ", "ΕΙΔ.ΚΩΔ" };
-static const int kUserSortToCol[] = { 0, 1, 3, 4, 5, 6, 7 };   // menu entry -> table column
+static const int kUserSortToCol[] = { 11, 1, 3, 4, 5, 6, 7 };   // menu entry -> table column
+
+// A client's extra details: a flat JSON object of strings, kept readable (Greek stays Greek) so it can be searched.
+using ExtraList = std::vector<std::pair<std::string, std::string>>;
+static std::string ExtraToJson(const ExtraList& v) {
+    auto esc = [](const std::string& t) { std::string o; for (char ch : t) { if (ch == '"' || ch == '\\') o += '\\'; if (ch == '\n') { o += "\\n"; continue; } o += ch; } return o; };
+    std::string o;
+    for (auto& [k, x] : v) if (!k.empty()) o += (o.empty() ? "\"" : ",\"") + esc(k) + "\":\"" + esc(x) + "\"";
+    return o.empty() ? std::string() : "{" + o + "}";
+}
+static ExtraList ExtraFromJson(const std::string& j) {
+    ExtraList out; std::vector<std::string> strs; std::string cur; bool in = false;
+    for (size_t i = 0; i < j.size(); i++) {
+        char ch = j[i];
+        if (!in) { if (ch == '"') { in = true; cur.clear(); } continue; }
+        if (ch == '\\' && i + 1 < j.size()) { char n = j[++i]; cur += n == 'n' ? '\n' : n; continue; }
+        if (ch == '"') { in = false; strs.push_back(cur); continue; }
+        cur += ch;
+    }
+    for (size_t i = 0; i + 1 < strs.size(); i += 2) out.push_back({strs[i], strs[i + 1]});
+    return out;
+}
+static std::string ExtraText(const std::string& j) {
+    std::string o; for (auto& [k, x] : ExtraFromJson(j)) o += (o.empty() ? "" : " · ") + k + ": " + x;
+    return o;
+}
+static TextBuf ub_code, ub_manager;
+struct ExtraRow { TextBuf k, v; };
+static std::vector<ExtraRow> ub_extra;
+static void LoadExtraRows(const std::string& j) {
+    ub_extra.clear();
+    for (auto& [k, x] : ExtraFromJson(j)) { ub_extra.emplace_back(); ub_extra.back().k.set(k); ub_extra.back().v.set(x); }
+}
+static std::string ExtraRowsJson() { ExtraList l; for (auto& r : ub_extra) l.push_back({r.k.str(), r.v.str()}); return ExtraToJson(l); }
 
 static void OpenAddUser() {
     g_showUserDialog = true; g_userDialogIsEdit = false; g_userDialogId = -1;
     ub_name.set(""); ub_phone.set(""); ub_special.set(""); ub_email.set(""); ub_afm.set(""); g_userDialogApt = -1; g_userDialogKind = 0;
+    ub_code.set(""); ub_manager.set(""); ub_extra.clear();
 }
 static void OpenEditUser(const User& u) {
     g_showUserDialog = true; g_userDialogIsEdit = true; g_userDialogId = u.id;
     ub_name.set(u.full_name); ub_phone.set(u.phone); ub_special.set(u.special_code); ub_email.set(u.email); ub_afm.set(u.afm);
     g_userDialogApt = u.apartment_id;
     g_userDialogKind = u.kind == "building" ? 2 : (u.kind == "business" ? 1 : 0);
+    ub_code.set(u.code); ub_manager.set(u.manager_name); LoadExtraRows(u.extra_json);
 }
 
 static std::string AptDisplay(int aptId) {
@@ -1849,13 +2098,14 @@ static void DrawUserDialog() {
         std::vector<FieldDiff> d; if (!g_userDialogIsEdit) return d;
         User o = g_app.conn->getUserById(g_userDialogId);
         DiffAdd(d, "Όνομα", o.full_name, ub_name.str()); DiffAdd(d, "Τηλέφωνο", o.phone, ub_phone.str());
-        DiffAdd(d, "Ειδ. Κωδικός", o.special_code, ub_special.str());
+        DiffAdd(d, "Κωδικός", o.code, ub_code.str()); DiffAdd(d, "Ειδ. Κωδικός", o.special_code, ub_special.str());
+        DiffAdd(d, "Διαχειριστής", o.manager_name, ub_manager.str()); DiffAdd(d, "Επιπλέον", ExtraText(o.extra_json), ExtraText(ExtraRowsJson()));
         DiffAdd(d, "Email", o.email, ub_email.str()); DiffAdd(d, "ΑΦΜ", o.afm, ub_afm.str());
         if (o.apartment_id != g_userDialogApt)
             d.push_back({"Κατοικία", o.apartment_id >= 0 ? AptDisplay(o.apartment_id) : "-", g_userDialogApt >= 0 ? AptDisplay(g_userDialogApt) : "-"});
         return d; })) {
         const bool isBuilding = g_userDialogKind == 2;
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Τύπος:"); ImGui::SameLine();
+        ImGui::AlignTextToFramePadding(); CellText("Τύπος:"); ImGui::SameLine();
         if (g_userDialogIsEdit && isBuilding) ImGui::TextColored(KindColor("building"), "Πολυκατοικία");
         else {
             ImGui::RadioButton("Ιδιώτης", &g_userDialogKind, 0); ImGui::SameLine(); ImGui::RadioButton("Επιχείρηση", &g_userDialogKind, 1);
@@ -1863,16 +2113,32 @@ static void DrawUserDialog() {
         }
         ImGui::InputText(g_userDialogKind == 0 ? "Ονοματεπώνυμο" : "Διεύθυνση", ub_name.data, sizeof(ub_name.data));
         ImGui::InputText(isBuilding ? "ΑΦΜ πολυκατοικίας" : "ΑΦΜ", ub_afm.data, sizeof(ub_afm.data));
-        if (isBuilding) ImGui::TextDisabled("Τηλέφωνο και email: του διαχειριστή της πολυκατοικίας.");
+        ImGui::InputText("Κωδικός", ub_code.data, sizeof(ub_code.data));
+        if (isBuilding) {
+            ImGui::TextDisabled("Στοιχεία του τωρινού διαχειριστή (προαιρετικά).");
+            ImGui::InputText("Όνομα διαχειριστή", ub_manager.data, sizeof(ub_manager.data));
+        }
         ImGui::InputText("Τηλέφωνο", ub_phone.data, sizeof(ub_phone.data));
         ImGui::InputText("Email", ub_email.data, sizeof(ub_email.data));
         ImGui::InputText("Ειδικός Κωδικός", ub_special.data, sizeof(ub_special.data));
         // clients do not live anywhere: where people live is Διαχείριση (residents)
         ImGui::Spacing();
+        ImGui::TextDisabled("Επιπλέον στοιχεία");
+        for (size_t i = 0; i < ub_extra.size(); ) {
+            ImGui::PushID((int)i);
+            ImGui::SetNextItemWidth(150); ImGui::InputTextWithHint("##xk", "όνομα", ub_extra[i].k.data, sizeof(ub_extra[i].k.data)); ImGui::SameLine();
+            ImGui::SetNextItemWidth(220); ImGui::InputTextWithHint("##xv", "τιμή", ub_extra[i].v.data, sizeof(ub_extra[i].v.data)); ImGui::SameLine();
+            bool gone = ImGui::SmallButton("x");
+            ImGui::PopID();
+            if (gone) ub_extra.erase(ub_extra.begin() + i); else i++;
+        }
+        if (ImGui::SmallButton("+ Προσθήκη στοιχείου")) ub_extra.emplace_back();
+        ImGui::Spacing();
         if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) {
             User nu;
             nu.full_name = ub_name.str(); nu.phone = ub_phone.str();
-            nu.special_code = ub_special.str();
+            nu.special_code = ub_special.str(); nu.code = ub_code.str(); nu.extra_json = ExtraRowsJson();
+            nu.manager_name = isBuilding ? ub_manager.str() : std::string();
             nu.apartment_id = -1;
             nu.email = ub_email.str(); nu.afm = ub_afm.str();
             nu.kind = isBuilding ? "building" : (g_userDialogKind == 1 ? "business" : "person");
@@ -1882,7 +2148,8 @@ static void DrawUserDialog() {
                     {"Τύπος", KindLabel(old.kind), KindLabel(nu.kind)},
                     {"Όνομα", old.full_name, nu.full_name}, {"Τηλέφωνο", old.phone, nu.phone},
                     {"Email", old.email, nu.email}, {"ΑΦΜ", old.afm, nu.afm},
-                    {"Ειδ. Κωδικός", old.special_code, nu.special_code},
+                    {"Κωδικός", old.code, nu.code}, {"Ειδ. Κωδικός", old.special_code, nu.special_code},
+                    {"Διαχειριστής", old.manager_name, nu.manager_name}, {"Επιπλέον", ExtraText(old.extra_json), ExtraText(nu.extra_json)},
                     {"Κατοικία", old.apartment_id >= 0 ? AptDisplay(old.apartment_id) : "-",
                                  nu.apartment_id >= 0 ? AptDisplay(nu.apartment_id) : "-"},
                 };
@@ -1893,7 +2160,8 @@ static void DrawUserDialog() {
                 });
             } else {
                 std::vector<FieldDiff> diffs = { {"Τύπος", "-", KindLabel(nu.kind)}, {"Όνομα", "-", nu.full_name}, {"Τηλέφωνο", "-", nu.phone},
-                                                 {"Email", "-", nu.email}, {"ΑΦΜ", "-", nu.afm} };
+                                                 {"Email", "-", nu.email}, {"ΑΦΜ", "-", nu.afm}, {"Κωδικός", "-", nu.code}, {"Ειδ. Κωδικός", "-", nu.special_code},
+                                                 {"Διαχειριστής", "-", nu.manager_name}, {"Επιπλέον", "-", ExtraText(nu.extra_json)} };
                 RequestConfirm("Νέος πελάτης", diffs, [nu]() {
                     g_app.conn->addUser(nu);
                     g_app.reloadUsers();
@@ -1923,6 +2191,8 @@ static std::vector<int> g_detailServiceIds;
 static std::vector<int> g_pkgViewIds;                // package viewers (windows) that are open
 static void OpenPackageView(int id) { if (std::find(g_pkgViewIds.begin(), g_pkgViewIds.end(), id) == g_pkgViewIds.end()) g_pkgViewIds.push_back(id); }
 static std::vector<int> g_viewPaymentIds;
+static std::vector<int> g_contractViewIds;           // contracts open in their own windows
+static void OpenContractView(int id) { if (std::find(g_contractViewIds.begin(), g_contractViewIds.end(), id) == g_contractViewIds.end()) g_contractViewIds.push_back(id); }
 
 static int g_resCardUser = -1;       // the resident card that is open (his accounting record)
 // Διαχείριση: a name there is always a RESIDENT (his card), even when the money sits on his old client record
@@ -1996,7 +2266,8 @@ static bool LinkCell(const std::string& text, const std::string& needle = "") {
 }
 
 static void TextHighlighted(const std::string& text, const std::string& needle) {
-    if (needle.empty() || text.empty()) { ImGui::TextUnformatted(text.c_str()); return; }
+    if (needle.empty()) { CellText(text.c_str()); return; }
+    if (needle.empty() || text.empty()) { CellText(text.c_str()); return; }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImU32 hlCol = IM_COL32(255, 220, 40, 170);
     const float lineH = ImGui::GetTextLineHeight();
@@ -2007,7 +2278,7 @@ static void TextHighlighted(const std::string& text, const std::string& needle) 
         if (hit == std::string::npos) hit = text.size();
         if (hit > pos) {
             if (onLine) ImGui::SameLine(0, 0);
-            ImGui::TextUnformatted(text.substr(pos, hit - pos).c_str());
+            CellText(text.substr(pos, hit - pos).c_str());
             onLine = true;
         }
         if (hit >= text.size()) return;
@@ -2016,7 +2287,7 @@ static void TextHighlighted(const std::string& text, const std::string& needle) 
         ImVec2 p  = ImGui::GetCursorScreenPos();
         ImVec2 sz = ImGui::CalcTextSize(seg.c_str());
         dl->AddRectFilled(p, ImVec2(p.x + sz.x, p.y + lineH), hlCol);
-        ImGui::TextUnformatted(seg.c_str());
+        CellText(seg.c_str());
         onLine = true;
         pos = hit + needle.size();
     }
@@ -2047,7 +2318,7 @@ static std::string TruncToWidth(const std::string& s, float maxW) {
 // ---------------------------------------------------------------------------
 enum UserColId {
     UCOL_ID = 0, UCOL_ADDR, UCOL_APT, UCOL_NAME, UCOL_PHONE,
-    UCOL_AREA, UCOL_TK, UCOL_SPECIAL, UCOL_KIND, UCOL_EMAIL, UCOL_AFM,
+    UCOL_AREA, UCOL_TK, UCOL_SPECIAL, UCOL_KIND, UCOL_EMAIL, UCOL_AFM, UCOL_CODE, UCOL_EXTRA, UCOL_MANAGER,
     UCOL_COUNT
 };
 
@@ -2071,10 +2342,13 @@ static const UserColDef kUserColDefs[UCOL_COUNT] = {
     { "ΤΥΠΟΣ",     ImGuiTableColumnFlags_WidthStretch, 1.2f,   false, false },
     { "EMAIL",     ImGuiTableColumnFlags_WidthStretch, 1.8f,   false, false },
     { "ΑΦΜ",       ImGuiTableColumnFlags_WidthStretch, 1.1f,   false, false },
+    { "ΚΩΔ",       ImGuiTableColumnFlags_WidthFixed,   110.0f, false, false },
+    { "ΕΠΙΠΛΕΟΝ",  ImGuiTableColumnFlags_WidthStretch, 2.4f,   false, false },
+    { "ΔΙΑΧΕΙΡΙΣΤΗΣ", ImGuiTableColumnFlags_WidthStretch, 1.8f, false, false },
 };
 // Header definitions for the arrow headers (name, width, has <>^v) and the user's column order.
 static const ListColDef kUserListCols[UCOL_COUNT] = {
-    { "ΚΩΔ",       ImGuiTableColumnFlags_WidthFixed,   110.0f, true  },
+    { "DB ID",     ImGuiTableColumnFlags_WidthFixed,   110.0f, true  },
     { "ΔΙΕΥΘΥΝΣΗ", ImGuiTableColumnFlags_WidthStretch, 2.0f,   true  },
     { "ΔΙΑΜΕΡ.",   ImGuiTableColumnFlags_WidthStretch, 1.5f,   true  },
     { "ΟΝΟΜΑ",     ImGuiTableColumnFlags_WidthStretch, 2.0f,   true  },
@@ -2085,11 +2359,15 @@ static const ListColDef kUserListCols[UCOL_COUNT] = {
     { "ΤΥΠΟΣ",     ImGuiTableColumnFlags_WidthStretch, 1.2f,   true  },
     { "EMAIL",     ImGuiTableColumnFlags_WidthStretch, 1.8f,   true  },
     { "ΑΦΜ",       ImGuiTableColumnFlags_WidthStretch, 1.1f,   true  },
+    { "ΚΩΔ",       ImGuiTableColumnFlags_WidthFixed,   110.0f, true  },
+    { "ΕΠΙΠΛΕΟΝ",  ImGuiTableColumnFlags_WidthStretch, 2.4f,   true  },
+    { "ΔΙΑΧΕΙΡΙΣΤΗΣ", ImGuiTableColumnFlags_WidthStretch, 1.8f, true },
 };
-static std::vector<int> g_usersColOrder = { 0, 8, 3, 7, 4, 9, 1, 2, 5, 6, 10 };
+static std::vector<int> g_usersColOrder = { 0, 11, 8, 3, 7, 4, 9, 13, 12, 1, 2, 5, 6, 10 };
+static DataConn::ColFilters g_usersColFilters;      // the filters of the column headers
 static bool g_usersKindPerson = true, g_usersKindBuilding = true, g_usersKindBusiness = true;   // which kinds the list shows
 
-static void DrawUsersTable(const std::vector<User>& rows) {
+static void DrawUsersTable(const std::vector<User>& rows, const DistinctFn& distinct) {
     // Fixed canonical setup order (never changed by user drag state). ImGui's
     // own per-column DisplayOrder tracking handles the visual reordering; because
     // the setup order never changes, that display order is preserved across
@@ -2112,7 +2390,7 @@ static void DrawUsersTable(const std::vector<User>& rows) {
     // Στοιχεία κατοικίας: hide/show the residence columns (display index = position).
     for (int d = 0; d < UCOL_COUNT; ++d)
         if (kUserColDefs[g_usersColOrder[d]].residence) ImGui::TableSetColumnEnabled(d, g_usersShowResidence);
-    ListHeaderRow(g_usersColOrder, kUserListCols, g_usersSort, g_usersPager);
+    ListHeaderRow(g_usersColOrder, kUserListCols, g_usersSort, g_usersPager, &g_usersColFilters, &distinct);
     auto P = [&](int logical) { return ListPos(g_usersColOrder, logical); };
 
     // Highlight scope: "Όλα" = every column; specific scope = only that one column.
@@ -2132,24 +2410,27 @@ static void DrawUsersTable(const std::vector<User>& rows) {
         // true, draw; if false, skip. No separate visibility lookup needed.
         ImGuiID rowId = 0;
         if (ImGui::TableSetColumnIndex(P(UCOL_ID))) { char idb[16]; std::snprintf(idb, sizeof(idb), "%d", u.id); rowId = RowSelectable(idb); }
-        // the address / apartment lead to that building with the apartment opened; the name opens the profile
+        // a client's row only ever opens his profile; the address / apartment lead to that building with the apartment opened; the name opens the profile
         // buildings and businesses have no name of their own: what they are called IS their address
         const bool place = u.kind == "building" || u.kind == "business";
         if (ImGui::TableSetColumnIndex(P(UCOL_ADDR)))    { colW = ImGui::GetContentRegionAvail().x;
-            if (place) { if (LinkCell(TruncToWidth(u.full_name, colW), hl(4))) OpenUserProfile(u.id); }
-            else if (LinkCell(TruncToWidth(u.address, colW), hl(4)) && u.apartment_id > 0) { g_aptGotoId = u.apartment_id; g_tabToApartments = true; } }
-        if (ImGui::TableSetColumnIndex(P(UCOL_APT)))     { colW = ImGui::GetContentRegionAvail().x; if (LinkCell(TruncToWidth(u.apartment, colW)) && u.apartment_id > 0) { g_aptGotoId = u.apartment_id; g_tabToApartments = true; } }
+            if (place) TextHighlighted(u.full_name, hl(4));
+            else TextHighlighted(u.address, hl(4)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_APT)))     { colW = ImGui::GetContentRegionAvail().x; CellText(u.apartment.c_str()); }
         if (ImGui::TableSetColumnIndex(P(UCOL_NAME)))    { colW = ImGui::GetContentRegionAvail().x;
-            if (place) ImGui::TextDisabled("—"); else if (LinkCell(TruncToWidth(u.full_name, colW), hl(1))) OpenUserProfile(u.id); }
+            if (place) ImGui::TextDisabled("—"); else TextHighlighted(u.full_name, hl(1)); }
         if (ImGui::TableSetColumnIndex(P(UCOL_PHONE)))   { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(TruncToWidth(u.phone,        colW), hl(3)); }
         if (ImGui::TableSetColumnIndex(P(UCOL_AREA)))    { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(TruncToWidth(u.area,         colW), hl(0)); }
         if (ImGui::TableSetColumnIndex(P(UCOL_TK)))      { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(TruncToWidth(u.postal_code,  colW), hl(0)); }
-        if (ImGui::TableSetColumnIndex(P(UCOL_SPECIAL))) { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(TruncToWidth(u.special_code, colW), hl(2)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_SPECIAL))) { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(u.special_code, hl(2)); }
         if (ImGui::TableSetColumnIndex(P(UCOL_KIND)))    ImGui::TextColored(KindColor(u.kind), "%s", KindLabel(u.kind));
-        if (ImGui::TableSetColumnIndex(P(UCOL_EMAIL)))   { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(TruncToWidth(u.email, colW), hl(0)); }
-        if (ImGui::TableSetColumnIndex(P(UCOL_AFM)))     { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(TruncToWidth(u.afm, colW), hl(0)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_EMAIL)))   { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(u.email, hl(0)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_AFM)))     { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(u.afm, hl(0)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_CODE)))    { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(u.code, hl(2)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_EXTRA)))   { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(ExtraText(u.extra_json), hl(0)); }
+        if (ImGui::TableSetColumnIndex(P(UCOL_MANAGER))) { colW = ImGui::GetContentRegionAvail().x; TextHighlighted(u.manager_name, hl(0)); }
 
-        if (RowDoubleClicked(rowId)) OpenUserProfile(u.id);
+        if (rowId != 0 && ImGui::IsMouseClicked(0) && ImGui::GetCurrentContext()->HoveredId == rowId) OpenUserProfile(u.id);      // anywhere on the row
         ImGui::PopID();
     }
     ImGui::EndTable();
@@ -2173,7 +2454,7 @@ static void DrawUsersScreen() {
     ImGui::InputTextWithHint("##usersearch", "Αναζήτηση ιδιοκτήτη...", g_userSearch, sizeof(g_userSearch));
     SoftSameLine(40 + 160);
 
-    ImGui::TextUnformatted("Ανα:");
+    CellText("Ανα:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(160);
     ImGui::Combo("##usersearchfield", &g_userSearchField, kUserSearchFields, IM_ARRAYSIZE(kUserSearchFields));
@@ -2254,10 +2535,13 @@ static void DrawUsersScreen() {
         if (ImGui::Button(g_usersTableView ? "Κάρτες" : "Λίστα")) g_usersTableView = !g_usersTableView;
     }
     // --- which kinds of clients ---
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Εμφάνιση:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Εμφάνιση:"); ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, KindColor("person"));   ImGui::Checkbox("Ιδιώτες", &g_usersKindPerson);         ImGui::PopStyleColor(); ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, KindColor("building")); ImGui::Checkbox("Πολυκατοικίες", &g_usersKindBuilding);  ImGui::PopStyleColor(); ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, KindColor("business")); ImGui::Checkbox("Επιχειρήσεις", &g_usersKindBusiness);  ImGui::PopStyleColor();
+    if (g_usersColFilters.any()) { ImGui::SameLine(); if (ImGui::SmallButton("Καθαρισμός φίλτρων στηλών")) { g_usersColFilters = {}; g_usersPager.Reset(); } }
+    static bool usersPast = false;
+    ImGui::Checkbox("Πρώην πελάτες", &usersPast);
     ImGui::Separator();
 
     // --- Detect filter changes -> reset pager to page 1 ---
@@ -2267,7 +2551,7 @@ static void DrawUsersScreen() {
     static std::string lastSearch;
     static std::set<std::string> lastLetters;
     static int lastKinds = 7;
-    const int kinds = (g_usersKindPerson ? 1 : 0) | (g_usersKindBuilding ? 2 : 0) | (g_usersKindBusiness ? 4 : 0);
+    const int kinds = (g_usersKindPerson ? 1 : 0) | (g_usersKindBuilding ? 2 : 0) | (g_usersKindBusiness ? 4 : 0) | (usersPast ? 8 : 0);
     if (lastScope != g_userSearchField || lastSearch != g_userSearch ||
         lastLetters != g_usersNameLetters || lastKinds != kinds) {
         g_usersPager.Reset();
@@ -2281,15 +2565,18 @@ static void DrawUsersScreen() {
     std::vector<std::string> lettersVec(g_usersNameLetters.begin(), g_usersNameLetters.end());
     std::vector<User> page = g_app.conn->pageUsers(
         g_userSearch, g_userSearchField, lettersVec,
-        g_usersPager.offset, g_usersPager.pageSize, g_usersSort.keys, kinds);
-    g_usersPager.total = g_app.conn->countUsers(g_userSearch, g_userSearchField, lettersVec, kinds);
+        g_usersPager.offset, g_usersPager.pageSize, g_usersSort.keys, kinds, &g_usersColFilters);
+    g_usersPager.total = g_app.conn->countUsers(g_userSearch, g_userSearchField, lettersVec, kinds, &g_usersColFilters);
+    if (g_usersPager.total > 0 && g_usersPager.offset >= g_usersPager.total) g_usersPager.Reset();
+    const DistinctFn usersDistinct = [&](int col, const std::string& q) {
+        return g_app.conn->distinctUserValues(col, q, g_userSearch, g_userSearchField, lettersVec, kinds, &g_usersColFilters, 300); };
 
     // --- Render: table or cards (only the current page), pager below. ---
     // Reserve a row at the bottom for the pager; the list fills the rest.
     float pagerH = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 3.0f;
     if (g_usersTableView) {
         ImGui::BeginChild("usertablewrap", ImVec2(0, -pagerH), false);
-        DrawUsersTable(page);
+        DrawUsersTable(page, usersDistinct);
         ImGui::EndChild();
     } else {
         ImGui::BeginChild("usercards", ImVec2(0, -pagerH), false);
@@ -2332,7 +2619,7 @@ static void DrawUsersScreen() {
                 TextHighlighted(TruncToWidth("Διαμ.: " + u.apartment + "   Τ.Κ.: " + u.postal_code, innerW), "");
                 TextHighlighted(TruncToWidth("Περιοχή: " + u.area, innerW), hl(0));
             }
-            TextHighlighted(TruncToWidth("Κωδ: " + u.special_code, innerW), hl(2));
+            TextHighlighted(TruncToWidth("Κωδ: " + u.code + (u.special_code.empty() ? "" : "  Ειδ: " + u.special_code), innerW), hl(2));
 
             // Buttons pinned to the bottom of the card -- resize-safe, they
             // never drift into the fields above no matter how tall the row is.
@@ -2340,8 +2627,7 @@ static void DrawUsersScreen() {
 
             const float btnSpacing = ImGui::GetStyle().ItemSpacing.x;
             const float btnW = (ImGui::GetContentRegionAvail().x - btnSpacing) / 2.0f;
-            if (ImGui::Button("Προφίλ", ImVec2(btnW, 0))) OpenUserProfile(u.id);
-            ImGui::SameLine();
+            if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && !ImGui::IsAnyItemHovered() && ImGui::IsMouseClicked(0)) OpenUserProfile(u.id);      // anywhere on the card
             if (ImGui::Button("+Υπ.",   ImVec2(btnW, 0))) {
                 extern int g_prefillOwnerUserId; extern bool g_showServiceDialog; extern bool g_serviceDialogIsEdit;
                 extern void ResetServiceDialogFields();
@@ -2561,8 +2847,6 @@ static void DrawServicesScreen() {
         ResetServiceDialogFields();
         g_showServiceDialog = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) { g_app.reloadServices(); g_app.reloadJoint(); }
     if (!g_servicesTableView) { ImGui::SameLine(); DrawSortMenu("svcsort", kServiceSortNames, kServiceSortCols, 4, g_servicesSort, g_servicesPager); }
 
     {
@@ -2576,17 +2860,10 @@ static void DrawServicesScreen() {
         if (ImGui::Button(g_servicesTableView ? "Κάρτες" : "Λίστα", ImVec2(toggleW, 0)))
             g_servicesTableView = !g_servicesTableView;
     }
-    // smart search: name or notes, accents/capitals ignored; queried when typing pauses (debounce)
-    static char svcQ[128] = ""; static std::string svcQuery; static double svcTypedAt = 0;
-    ImGui::SetNextItemWidth(360);
-    if (ImGui::InputTextWithHint("##svcq", "Αναζήτηση υπηρεσίας (όνομα ή σημειώσεις)...", svcQ, sizeof(svcQ))) svcTypedAt = ImGui::GetTime();
-    if (svcQuery != svcQ && ImGui::GetTime() - svcTypedAt > 0.25) { svcQuery = svcQ; g_servicesPager.Reset(); }
-    ImGui::SameLine();
-    if (svcQ[0] && ImGui::SmallButton("×")) { svcQ[0] = 0; svcQuery.clear(); g_servicesPager.Reset(); }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Οι κοινόχρηστες υπηρεσίες είναι στα «Κοινόχρηστα».");
+    static std::string svcQuery;      // searching is per column now
     ImGui::Separator();
 
+    static ListModel<Service> svcM;
     // --- Query one page from SQL. Joint services are excluded at SQL level. ---
     static Cached<std::pair<std::vector<Service>, int>> svcCache;
     std::string skey = svcQuery + "|" + std::to_string(g_servicesPager.offset) + "|" + std::to_string(g_servicesPager.pageSize) + "|";
@@ -2596,6 +2873,8 @@ static void DrawServicesScreen() {
                               g_app.conn->countServices(svcQuery)); });
     std::vector<Service> page = svcPage.first;
     g_servicesPager.total = svcPage.second;
+    svcM.Override(g_servicesPager, g_servicesSort.keys, svcQuery, [&](const SortSpec& ss, int off, int lim) { return g_app.conn->pageServices(svcQuery, off, lim, ss); },
+        [](const Service& v, int c) -> std::string { switch (c) { case 0: return std::to_string(v.id); case 1: return v.label; case 2: return Eur(v.suggested_price); case 3: return v.extra_notes; default: return ""; } }, 6, page, g_servicesPager.total);
     if (page.empty()) ImGui::TextDisabled(svcQuery.empty() ? "Καμία υπηρεσία ακόμα." : "Καμία υπηρεσία με αυτή την αναζήτηση.");
 
     // Joint-service id set is still needed so the TABLE view (which draws its
@@ -2614,7 +2893,7 @@ static void DrawServicesScreen() {
                 ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable)) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ListSetupColumns(g_servicesColOrder, kServiceListCols);
-            ListHeaderRow(g_servicesColOrder, kServiceListCols, g_servicesSort, g_servicesPager);
+            ListHeaderRow(g_servicesColOrder, kServiceListCols, g_servicesSort, g_servicesPager, &svcM.g.cf, &svcM.distinct);
             auto P = [&](int logical) { return ListPos(g_servicesColOrder, logical); };
             for (auto& s : page) {
                 ImGui::PushID(s.id);
@@ -2623,8 +2902,8 @@ static void DrawServicesScreen() {
                 { char idb[16]; std::snprintf(idb, sizeof(idb), "%d", s.id); ImGui::TableSetColumnIndex(P(0)); rowId = RowSelectable(idb); }
                 ImGui::TableSetColumnIndex(P(1)); if (LinkCell(s.label)) OpenServiceDetail(s.id);
                 ImGui::TableSetColumnIndex(P(2)); ImGui::Text("%s", Eur(s.suggested_price).c_str());
-                ImGui::TableSetColumnIndex(P(4)); if (s.cost_price > 0.005) ImGui::TextUnformatted(Eur(s.cost_price).c_str()); else ImGui::TextDisabled("—");
-                ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(TruncToWidth(s.extra_notes, ImGui::GetContentRegionAvail().x).c_str());
+                ImGui::TableSetColumnIndex(P(4)); if (s.cost_price > 0.005) CellText(Eur(s.cost_price).c_str()); else ImGui::TextDisabled("—");
+                ImGui::TableSetColumnIndex(P(3)); CellText((s.extra_notes).c_str());
                 ImGui::TableSetColumnIndex(P(5));
                 if (ImGui::SmallButton("Χρέωση")) OpenChargeService(s.id);
                 if (RowDoubleClicked(rowId)) OpenServiceDetail(s.id);
@@ -2708,7 +2987,7 @@ static void DrawJointServiceDialog() {
 }
 
 // ---- receipts (shared by every charge dialog) ----
-struct ReceiptForm { bool issue = true; int method = 0; TextBuf paper, bank, rf; };
+struct ReceiptForm { bool issue = true; int method = 0; TextBuf paper, bank, rf; std::string date; };
 static const char* kReceiptMethodCodes[] = { "cash", "collector", "bank", "ebanking", "card", "iris", "other" };
 static const char* kReceiptMethodNames[] = { "Μετρητά", "Εισπράκτορας", "Κατάθεση σε τράπεζα", "e-banking", "Κάρτα", "IRIS", "Άλλο" };
 static std::string ReceiptMethodName(const std::string& code) {
@@ -2730,6 +3009,9 @@ static bool DrawReceiptForm(const char* id, ReceiptForm& f, double total, int pa
         ImGui::TextDisabled("θα εκδοθεί Α-%06d · %s%s", n, Eur(total).c_str(),
                             payments > 1 ? (perPayment ? ("  (" + std::to_string(payments) + " πληρωμές, κάθε μία με δική της απόδειξη)").c_str() : ("  (" + std::to_string(payments) + " πληρωμές, μία απόδειξη)").c_str()) : "");
         if (ToCents(total) <= 0) { ImGui::TextColored(kInvalidMoneyCol, "Η απόδειξη χρειάζεται πληρωμένο ποσό μεγαλύτερο από 0."); ok = false; }
+        ImGui::TextUnformatted("Ημερομηνία απόδειξης:"); ImGui::SameLine();
+        DatePicker("rdate", f.date, ImVec2(0, 1));
+        if (f.date.size() != 10) { ImGui::SameLine(); ImGui::TextColored(kInvalidMoneyCol, "ορίστε την ημερομηνία"); ok = false; }
         ImGui::SetNextItemWidth(220);
         ImGui::Combo("Τρόπος πληρωμής", &f.method, kReceiptMethodNames, IM_ARRAYSIZE(kReceiptMethodNames));
         bool electronic = f.method >= 2 && f.method <= 5;
@@ -2759,6 +3041,7 @@ static Receipt ReceiptFromForm(const ReceiptForm& f, int userId) {
     r.paper_ref = f.paper.str();
     r.bank_ref = (f.method >= 2 && f.method <= 5) ? f.bank.str() : "";
     r.rf_code = f.rf.str();
+    r.issue_date = f.date;
     return r;
 }
 
@@ -2916,7 +3199,7 @@ static void DrawJointChargeDialog() {
     // 2. where
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.70f,0.85f,1.0f,1.0f), "%s", g_jc.sourceFixed ? "Σε ποια πολυκατοικία" : "2. Σε ποια πολυκατοικία");
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Πολυκατοικία:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Πολυκατοικία:"); ImGui::SameLine();
     PickBuilding("jcbld", g_jc.buildingId, 420);
     if (g_jc.buildingId > 0) {
         static Cached<bool> mc;
@@ -2941,11 +3224,11 @@ static void DrawJointChargeDialog() {
         ImGui::TextDisabled("Κόστος για εμάς ανά υπηρεσία του πακέτου (προτεινόμενο· αλλάζει):");
         double sumc = 0.0, sump = 0.0;
         for (size_t i = 0; i < g_jc.comps.size(); i++) {
-            ImGui::PushID((int)i); ImGui::SetNextItemWidth(110); InputMoney("##ccost", &g_jc.compCost[i]); ImGui::SameLine(); ImGui::TextUnformatted(g_jc.comps[i].label.c_str());
+            ImGui::PushID((int)i); ImGui::SetNextItemWidth(110); InputMoney("##ccost", &g_jc.compCost[i]); ImGui::SameLine(); CellText(g_jc.comps[i].label.c_str());
             double cc = std::max(0.0, g_jc.compCost[i]);
             if (!g_jc.compPaidManual[i]) g_jc.compPaid[i] = cc;
             ImGui::Indent(24);
-            ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("κόστος προς"); ImGui::SameLine(); PickPartner("jcrowpart", g_jc.compPartner[i], 260);
+            ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("κόστος προς"); ImGui::SameLine(); { bool none = false; PickPartner("jcrowpart", g_jc.compPartner[i], 260, &none); if (none) { g_jc.compCost[i] = 0; g_jc.compPaid[i] = 0; } }
             ImGui::SameLine(0, 10); ImGui::SetNextItemWidth(110); if (InputMoney("##cpaid", &g_jc.compPaid[i])) g_jc.compPaidManual[i] = 1;
             g_jc.compPaid[i] = std::min(std::max(0.0, g_jc.compPaid[i]), cc);
             ImGui::SameLine(); ImGui::TextDisabled("πληρωμή τώρα"); if (ToCents(cc) > ToCents(g_jc.compPaid[i])) { ImGui::SameLine(); ImGui::TextColored(kColWeOwe, "οφειλή %s", Eur(MoneySub(cc, g_jc.compPaid[i])).c_str()); }
@@ -2962,10 +3245,10 @@ static void DrawJointChargeDialog() {
     ImGui::SetNextItemWidth(160); if (InputMoney("Πληρωμές από το κόστος (€)", &g_jc.costPaid)) g_jc.costPaidManual = true;
     }
     { double we = MoneySub(std::max(0.0, g_jc.cost), g_jc.costPaid); ImGui::SameLine(); if (we > 0.005) ImGui::TextColored(kColWeOwe, "Οφειλόμενα: %s", Eur(we).c_str()); else ImGui::TextDisabled("καμία οφειλή"); }
-    if (g_jc.comps.empty()) { ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Το κόστος πληρώθηκε σε:"); ImGui::SameLine(); PickPartner("jcpart", g_jc.partner, 300); }
+    if (g_jc.comps.empty()) { ImGui::AlignTextToFramePadding(); CellText("Το κόστος πληρώθηκε σε:"); ImGui::SameLine(); { bool none = false; PickPartner("jcpart", g_jc.partner, 300, &none); if (none) { g_jc.cost = 0; g_jc.costPaid = 0; } } }
     if (g_jc.cost > 0.005 && g_jc.d.total > 0.005)
         ImGui::TextColored(g_jc.d.total - g_jc.cost >= 0 ? kColIn : kColOut, "Κέρδος: %s", Eur(MoneySub(g_jc.d.total, g_jc.cost)).c_str());
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Ημερομηνία:"); ImGui::SameLine(); DatePicker("jcdate", g_jc.date, ImVec2(0, 1));
+    ImGui::AlignTextToFramePadding(); CellText("Ημερομηνία:"); ImGui::SameLine(); DatePicker("jcdate", g_jc.date, ImVec2(0, 1));
     ImGui::SameLine(); ImGui::SetNextItemWidth(320); ImGui::InputText("Περιγραφή", g_jc.label.data, sizeof(g_jc.label.data));
     ImGui::SetNextItemWidth(560); ImGui::InputText("Σημείωση", g_jc.note.data, sizeof(g_jc.note.data));
     if (g_jc.loadedBuilding != g_jc.buildingId) JointLoadRows();
@@ -2997,9 +3280,9 @@ static void DrawJointChargeDialog() {
             ImGui::BeginDisabled(r.user_id <= 0);
             ImGui::Checkbox("##inc", &r.included);
             ImGui::EndDisabled();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(r.apt_label.c_str());
+            ImGui::TableNextColumn(); CellText(r.apt_label.c_str());
             ImGui::TableNextColumn();
-            if (r.user_id > 0) ImGui::TextUnformatted(r.user_name.c_str()); else ImGui::TextDisabled("— κενό —");
+            if (r.user_id > 0) CellText(r.user_name.c_str()); else ImGui::TextDisabled("— κενό —");
             ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1);
             if (r.included) {
                 if (InputMoney("##amt", &r.amount)) g_jc.manual = true;
@@ -3039,12 +3322,12 @@ static void DrawJointChargeDialog() {
             break;
         }
     if (problem.empty() && g_jc.label.str().empty()) problem = "Δώστε περιγραφή.";
-    ImGui::TextUnformatted("Χρεώνουμε"); ImGui::SameLine(); ImGui::Text("%s", Eur(g_jc.d.total).c_str());
-    ImGui::SameLine(0, 18); ImGui::TextUnformatted("εισπράξεις"); ImGui::SameLine(); ImGui::TextColored(kColIn, "%s", Eur(FromCents(paidSum)).c_str());
-    ImGui::SameLine(0, 18); ImGui::TextUnformatted("οφειλές"); ImGui::SameLine(); ImGui::TextColored(kColOwed, "%s", Eur(FromCents(ToCents(g_jc.d.total) - paidSum)).c_str());
-    ImGui::SameLine(0, 18); ImGui::TextUnformatted("κόστος"); ImGui::SameLine(); ImGui::TextColored(kColOut, "%s", Eur(g_jc.cost).c_str());
-    ImGui::SameLine(0, 18); ImGui::TextUnformatted("πληρωμές"); ImGui::SameLine(); ImGui::TextColored(kColOut, "%s", Eur(g_jc.costPaid).c_str());
-    ImGui::SameLine(0, 18); ImGui::TextUnformatted("οφειλόμενα"); ImGui::SameLine(); ImGui::TextColored(kColWeOwe, "%s", Eur(MoneySub(std::max(0.0, g_jc.cost), g_jc.costPaid)).c_str());
+    CellText("Χρεώνουμε"); ImGui::SameLine(); ImGui::Text("%s", Eur(g_jc.d.total).c_str());
+    ImGui::SameLine(0, 18); CellText("εισπράξεις"); ImGui::SameLine(); ImGui::TextColored(kColIn, "%s", Eur(FromCents(paidSum)).c_str());
+    ImGui::SameLine(0, 18); CellText("οφειλές"); ImGui::SameLine(); ImGui::TextColored(kColOwed, "%s", Eur(FromCents(ToCents(g_jc.d.total) - paidSum)).c_str());
+    ImGui::SameLine(0, 18); CellText("κόστος"); ImGui::SameLine(); ImGui::TextColored(kColOut, "%s", Eur(g_jc.cost).c_str());
+    ImGui::SameLine(0, 18); CellText("πληρωμές"); ImGui::SameLine(); ImGui::TextColored(kColOut, "%s", Eur(g_jc.costPaid).c_str());
+    ImGui::SameLine(0, 18); CellText("οφειλόμενα"); ImGui::SameLine(); ImGui::TextColored(kColWeOwe, "%s", Eur(MoneySub(std::max(0.0, g_jc.cost), g_jc.costPaid)).c_str());
     if (problem.empty() && g_jc.buildingId > 0 && !g_app.conn->isBuildingManaged(g_jc.buildingId))
         problem = "Η πολυκατοικία δεν είναι σε Διαχείριση (πατήστε «Ανάληψη διαχείρισης» πιο πάνω).";
     if (problem.empty()) ImGui::TextColored(kColIn, "Σύνολο %s σε %d ενοίκους — κάθε ένοικος παίρνει τη δική του χρέωση.", Eur(g_jc.d.total).c_str(), nInc);
@@ -3121,9 +3404,9 @@ static void DrawJointViewWindow() {
             for (auto& s : data.second) {
                 ImGui::PushID(s.id);
                 ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(s.apartment_label.c_str());
+                ImGui::TableNextColumn(); CellText(s.apartment_label.c_str());
                 ImGui::TableNextColumn();
-                if (s.user_id > 0) ImGui::TextUnformatted(s.user_name.c_str()); else ImGui::TextDisabled("— κενό —");
+                if (s.user_id > 0) CellText(s.user_name.c_str()); else ImGui::TextDisabled("— κενό —");
                 if (s.included) {
                     ImGui::TableNextColumn(); ImGui::Text("%s", Eur(s.amount).c_str());
                     ImGui::TableNextColumn(); ImGui::Text("%s", Eur(s.paid).c_str());
@@ -3173,8 +3456,7 @@ static void DrawJointOpsTable(int buildingId, const char* id) {
     St& S = states[id];
     GridState& g = S.g;
     if (g.order.empty()) { for (int i = 0; i < JC_COUNT; i++) g.order.push_back(i); g.sort.keys = { { JC_DATE, false } }; }
-    ImGui::SetNextItemWidth(320);
-    if (ImGui::InputTextWithHint("##jq", "Αναζήτηση: περιγραφή ή πολυκατοικία...", S.q, sizeof(S.q))) g.pager.Reset();
+    
     // every sort key goes to SQL (paging needs the ORDER BY in the query)
     std::string key = std::to_string(buildingId) + "|" + S.q + "|" + SortKeyStr(g.sort.keys) + "|" +
                       std::to_string(g.pager.offset) + "|" + std::to_string(g.pager.pageSize);
@@ -3187,11 +3469,15 @@ static void DrawJointOpsTable(int buildingId, const char* id) {
         for (auto& o : p.rows) p.cost[o.id] = g_app.conn->getJointOpCost(o.id);
         return p;
     });
-    ImGui::SameLine();
     ImGui::TextDisabled("%d χρεώσεις · μένουν να εισπραχθούν %s", pg.count, Eur(MoneySub(pg.total, pg.paid)).c_str());
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Σύνολο %s · εισπράχθηκαν %s · ολοκλήρωση %.1f%%\nΔεξί κλικ στις επικεφαλίδες: εμφάνιση περισσότερων στηλών.",
         Eur(pg.total).c_str(), Eur(pg.paid).c_str(), pg.total > 0.005 ? pg.paid / pg.total * 100.0 : 100.0);
     g.pager.total = pg.count;
+    static std::map<std::string, ListModel<JointOp>> joM; ListModel<JointOp>& jm = joM[id];
+    std::vector<JointOp> joRows = pg.rows;
+    { const std::string qs = S.q; DrawListSearch(jm.g, 240);
+      jm.Override(g.pager, g.sort.keys, std::to_string(buildingId) + "|" + qs, [=](const SortSpec& ss, int off, int lim) { return g_app.conn->pageJointOps(buildingId, qs, ss, off, lim); },
+        [](const JointOp& o, int c) -> std::string { switch (c) { case JC_DATE: return DateGr(o.op_date); case JC_BLD: return o.building_address; case JC_LABEL: return o.label; case JC_TOTAL: return Eur(o.total); case JC_PAID: return Eur(std::min(o.paid, o.total)); case JC_LEFT: return Eur(MoneySub(o.total, std::min(o.paid, o.total))); case JC_PCT: return ListNum(JointPct(o)) + "%"; case JC_INC: return std::to_string(o.included); case JC_EXC: return std::to_string(o.excluded); default: return ""; } }, JC_COUNT, joRows, g.pager.total); }
     if (pg.count == 0) { ImGui::TextDisabled(S.q[0] ? "Καμία χρέωση με αυτή την αναζήτηση." : "Δεν έχουν γίνει κοινόχρηστες χρεώσεις ακόμα."); return; }
     const bool all = buildingId <= 0;
     float h = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
@@ -3200,15 +3486,15 @@ static void DrawJointOpsTable(int buildingId, const char* id) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(g.order, kJointCols);
         if (!all) ImGui::TableSetColumnEnabled(ListPos(g.order, JC_BLD), false);
-        ListHeaderRow(g.order, kJointCols, g.sort, g.pager);
+        ListHeaderRow(g.order, kJointCols, g.sort, g.pager, &jm.g.cf, &jm.distinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
-        for (const JointOp& o : pg.rows) {
+        for (const JointOp& o : joRows) {
             ImGui::PushID(o.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(JC_DATE)); ImGui::TextUnformatted(DateGr(o.op_date).c_str());
-            ImGui::TableSetColumnIndex(P(JC_BLD)); ImGui::TextUnformatted(o.building_address.c_str());
-            ImGui::TableSetColumnIndex(P(JC_LABEL)); ImGui::TextUnformatted(o.label.c_str());
+            ImGui::TableSetColumnIndex(P(JC_DATE)); CellText(DateGr(o.op_date).c_str());
+            ImGui::TableSetColumnIndex(P(JC_BLD)); CellText(o.building_address.c_str());
+            ImGui::TableSetColumnIndex(P(JC_LABEL)); CellText(o.label.c_str());
             ImGui::TableSetColumnIndex(P(JC_KIND)); { double cs = pg.cost.count(o.id) ? pg.cost.at(o.id) : 0.0; if (cs > 0.005) ImGui::TextColored(kColOut, "%s", Eur(cs).c_str()); else ImGui::TextDisabled("—"); }
-            ImGui::TableSetColumnIndex(P(JC_TOTAL)); ImGui::TextUnformatted(Eur(o.total).c_str());
+            ImGui::TableSetColumnIndex(P(JC_TOTAL)); CellText(Eur(o.total).c_str());
             ImGui::TableSetColumnIndex(P(JC_PAID)); ImGui::TextColored(kColIn, "%s", Eur(std::min(o.paid, o.total)).c_str());
             double left = MoneySub(o.total, std::min(o.paid, o.total));
             ImGui::TableSetColumnIndex(P(JC_LEFT)); ImGui::TextColored(left > 0.005 ? kColOwed : kColMuted, "%s", Eur(left).c_str());
@@ -3238,26 +3524,29 @@ static void DrawJointServicesScreen() {
     static GridState g; static char q[128] = "";
     Pager& pager = g.pager;
     if (g.order.empty()) { for (int i = 0; i < JK_COUNT; i++) g.order.push_back(i); g.sort.keys = { { JK_NAME, true } }; }
-    ImGui::SetNextItemWidth(320);
-    if (ImGui::InputTextWithHint("##jcq", "Αναζήτηση...", q, sizeof(q))) pager.Reset();
+    
     struct Pg { std::vector<JointService> rows; int count = 0; };
     static Cached<Pg> cache;
     const Pg& pg = cache.get(std::string(q) + "|" + SortKeyStr(g.sort.keys) + "|" + std::to_string(pager.offset) + "|" + std::to_string(pager.pageSize), [&] {
         Pg r; r.count = g_app.conn->countJointCatalog(q); r.rows = g_app.conn->pageJointCatalog(q, pager.offset, pager.pageSize, g.sort.keys); return r; });
     pager.total = pg.count;
-    ImGui::SameLine(); ImGui::TextDisabled("%d συνηθισμένες χρεώσεις", pg.count);
+    static ListModel<JointService> jcM; std::vector<JointService> jcRows = pg.rows;
+    DrawListSearch(jcM.g, 220);
+    jcM.Override(pager, g.sort.keys, q, [&](const SortSpec& ss, int off, int lim) { return g_app.conn->pageJointCatalog(q, off, lim, ss); },
+        [](const JointService& j, int c) -> std::string { return c == JK_NAME ? j.service.label : c == JK_NOTES ? j.service.extra_notes : std::string(); }, JK_COUNT, jcRows, pager.total);
+    ImGui::TextDisabled("%d συνηθισμένες χρεώσεις", pg.count);
     if (pg.count == 0) ImGui::TextDisabled("Δεν έχετε ορίσει συντομεύσεις ακόμα. Πατήστε «+ Νέα συνηθισμένη χρέωση».");
     float h = std::min(ImGui::GetContentRegionAvail().y * 0.34f, 60.0f + 28.0f * (float)pg.rows.size());
     if (pg.count > 0 && ImGui::BeginTable("jointcat", JK_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
                                           ImGuiTableFlags_Resizable, ImVec2(0, std::max(160.0f, h)))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(g.order, kCatCols);
-        ListHeaderRow(g.order, kCatCols, g.sort, g.pager);
+        ListHeaderRow(g.order, kCatCols, g.sort, g.pager, &jcM.g.cf, &jcM.distinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
-        for (auto& j : pg.rows) {
+        for (auto& j : jcRows) {
             ImGui::PushID(j.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(JK_NAME)); ImGui::TextUnformatted(j.service.label.c_str());
-            ImGui::TableSetColumnIndex(P(JK_NOTES)); ImGui::TextDisabled("%s", TruncToWidth(j.service.extra_notes, ImGui::GetContentRegionAvail().x).c_str());
+            ImGui::TableSetColumnIndex(P(JK_NAME)); CellText(j.service.label.c_str());
+            ImGui::TableSetColumnIndex(P(JK_NOTES)); ImGui::TextDisabled("%s", j.service.extra_notes.c_str());
             ImGui::TableSetColumnIndex(P(JK_ACT));
             if (ImGui::SmallButton("Χρέωση")) OpenJointChargeFor(2, j.service.id, j.service.label);
             ImGui::SameLine(); if (ImGui::SmallButton("Επεξεργασία")) OpenJointServiceDialog(&j);
@@ -3314,7 +3603,7 @@ static void DrawPackageEditor() {
         ImGui::TableHeadersRow();
         for (auto& c : comps) {
             ImGui::PushID(c.id); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(c.label.c_str());
+            ImGui::TableNextColumn(); CellText(c.label.c_str());
             ImGui::TableNextColumn(); ImGui::Text("%s", Eur(c.suggested_price).c_str());
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("Αφαίρεση")) {
@@ -3343,8 +3632,6 @@ static void DrawMasterServicesScreen() {
         sb_isPackage = true;
         g_showServiceDialog = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) g_app.reloadServices();
     ImGui::Separator();
 
     // ---------------- LEFT: every package, searched / sorted / paged in SQL ----------------
@@ -3358,8 +3645,7 @@ static void DrawMasterServicesScreen() {
         { "", ImGuiTableColumnFlags_WidthFixed, 390.0f, false } };
     static GridState g; static char q[128] = "";
     if (g.order.empty()) { for (int i = 0; i < PC_COUNT; i++) g.order.push_back(i); g.sort.keys = { { PC_NAME, true } }; }
-    ImGui::SetNextItemWidth(320);
-    if (ImGui::InputTextWithHint("##pkq", "Αναζήτηση πακέτου ή υπηρεσίας του...", q, sizeof(q))) g.pager.Reset();
+    
     SortSpec pkgSort = MapSort(g.sort.keys, {{PC_NAME, 0}, {PC_N, 1}, {PC_TOTAL, 2}, {PC_COST, 3}});
     struct Pg { std::vector<DataConn::PackageRow> rows; int count = 0; };
     static Cached<Pg> cache;
@@ -3367,16 +3653,20 @@ static void DrawMasterServicesScreen() {
                              std::to_string(g.pager.pageSize), [&] {
         Pg p; p.count = g_app.conn->countPackages(q); p.rows = g_app.conn->pagePackages(q, pkgSort, g.pager.offset, g.pager.pageSize); return p; });
     g.pager.total = pg.count;
-    ImGui::SameLine(); ImGui::TextDisabled("%d πακέτα", pg.count);
+    static ListModel<DataConn::PackageRow> pkM; std::vector<DataConn::PackageRow> pkRows = pg.rows;
+    DrawListSearch(pkM.g, 220);
+    pkM.Override(g.pager, pkgSort, q, [&](const SortSpec& ss, int off, int lim) { return g_app.conn->pagePackages(q, ss, off, lim); },
+        [](const DataConn::PackageRow& r, int c) -> std::string { switch (c) { case PC_NAME: return r.pkg.label; case PC_N: return std::to_string(r.components); case PC_PARTS: return r.parts; case PC_TOTAL: return Eur(r.total); case PC_COST: return Eur(r.totalCost); default: return ""; } }, PC_COUNT, pkRows, g.pager.total);
+    ImGui::TextDisabled("%d πακέτα", pg.count);
     if (g_selectedPackageId <= 0 && !pg.rows.empty()) g_selectedPackageId = pg.rows[0].pkg.id;
     float h = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
     if (ImGui::BeginTable("pkgsgrid", PC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                           ImGuiTableFlags_Resizable, ImVec2(0, std::max(160.0f, h)))) {
         ImGui::TableSetupScrollFreeze(1, 1);
         ListSetupColumns(g.order, kPkgCols);
-        ListHeaderRow(g.order, kPkgCols, g.sort, g.pager);
+        ListHeaderRow(g.order, kPkgCols, g.sort, g.pager, &pkM.g.cf, &pkM.distinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
-        for (auto& r : pg.rows) {
+        for (auto& r : pkRows) {
             ImGui::PushID(r.pkg.id); ImGui::TableNextRow();
             bool sel = r.pkg.id == g_selectedPackageId;
             ImGui::TableSetColumnIndex(P(PC_NAME));
@@ -3384,9 +3674,9 @@ static void DrawMasterServicesScreen() {
             if (LinkCell(r.pkg.label)) OpenPackageView(r.pkg.id);
             ImGui::TableSetColumnIndex(P(PC_N)); ImGui::Text("%d", r.components);
             ImGui::TableSetColumnIndex(P(PC_PARTS));
-            ImGui::TextUnformatted(TruncToWidth(r.parts, ImGui::GetContentRegionAvail().x).c_str());
+            CellText((r.parts).c_str());
             if (ImGui::IsItemHovered() && !r.parts.empty()) {
-                ImGui::BeginTooltip(); ImGui::TextUnformatted(r.pkg.label.c_str()); ImGui::Separator();
+                ImGui::BeginTooltip(); CellText(r.pkg.label.c_str()); ImGui::Separator();
                 size_t p0 = 0; std::string s = r.parts;
                 while (p0 < s.size()) { size_t p1 = s.find("), ", p0); std::string part = s.substr(p0, p1 == std::string::npos ? std::string::npos : p1 + 1 - p0);
                                         ImGui::BulletText("%s", part.c_str()); if (p1 == std::string::npos) break; p0 = p1 + 3; }
@@ -3488,6 +3778,7 @@ static std::vector<long long> PlanAmounts(double total, int n) { return SplitCen
 
 // Draws the section. Returns false while invalid.
 static bool DrawPlanForm(const char* id, PlanForm& f, double total, const std::string& start) {
+    f.on = false; return true;      // scheduled payments now come only from Συμβάσεις; the plans already made keep working
     ImGui::PushID(id);
     ImGui::Spacing();
     ImGui::Checkbox("Πληρωμή σε δόσεις", &f.on);
@@ -3518,7 +3809,7 @@ static bool DrawPlanForm(const char* id, PlanForm& f, double total, const std::s
             for (int k = 0; k < f.count; k++) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::Text("%d/%d", k + 1, f.count);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(AddPeriodIso(start, k, f.every).c_str());
+                ImGui::TableNextColumn(); CellText(AddPeriodIso(start, k, f.every).c_str());
                 ImGui::TableNextColumn(); ImGui::Text("%s%s", Eur(FromCents(parts[k])).c_str(), k == 0 && f.firstNow ? "  (πληρώνεται τώρα)" : "");
             }
             ImGui::EndTable();
@@ -3681,16 +3972,16 @@ static void DrawPaymentDialog() {
         DiffAdd(d, "Σημειώσεις", o.notes, pb_notes.str());
         if (pb_isFuture) DiffAdd(d, "Ημ/νία επίλυσης", o.resolution_date, pb_resolutionDate);
         return d; })) {
-        ImGui::TextUnformatted("Πελάτης:"); ImGui::SameLine(110);
-        if (pb_lockUser) ImGui::TextUnformatted(g_app.userName(pb_userId).c_str());
+        CellText("Πελάτης:"); ImGui::SameLine(110);
+        if (pb_lockUser) CellText(g_app.userName(pb_userId).c_str());
         else PickClient("pbcli", pb_userId, 330);
-        ImGui::TextUnformatted("Υπηρεσία:"); ImGui::SameLine(110);
-        if (pb_lockService) ImGui::TextUnformatted(g_app.serviceLabel(pb_serviceId).c_str());
+        CellText("Υπηρεσία:"); ImGui::SameLine(110);
+        if (pb_lockService) CellText(g_app.serviceLabel(pb_serviceId).c_str());
         else if (PickService("pbsvc", pb_serviceId, 330) && !g_paymentDialogIsEdit) {
             Service s = g_app.conn->getServiceById(pb_serviceId);          // a new charge starts at the catalog price
             pb_due.set(FormatMoney(s.suggested_price)); pb_paid.set(FormatMoney(s.suggested_price));
         }
-        ImGui::TextUnformatted("Ημερομηνία πληρωμής:");
+        CellText("Ημερομηνία πληρωμής:");
         DatePicker("paydate", pb_dateStr, ImVec2(0, 1));
         if (!g_paymentDialogIsEdit) pb_direction = 0;      // we do not pay on behalf of clients any more: our payments are costs to partners
         else if (pb_direction == 1) ImGui::TextColored(kColOut, "Πληρωμή προς συνεργάτη (κόστος)");
@@ -3715,13 +4006,13 @@ static void DrawPaymentDialog() {
             amountsOk = DrawPlanForm("pbplan", pb_plan, due, pb_dateStr) && amountsOk;
         }
         if (pb_plan.on) pb_isFuture = false;
-        if (!pb_plan.on) ImGui::Checkbox("Μελλοντική πληρωμή", &pb_isFuture);
+        if (!pb_plan.on && g_paymentDialogIsEdit && pb_isFuture) ImGui::Checkbox("Μελλοντική πληρωμή", &pb_isFuture);   // new scheduled bills: only Συμβάσεις
         if (pb_isFuture) {
             ImGui::TextDisabled("Δεν έχει πληρωθεί ακόμα -- δεν προσμετράται σε κανένα σύνολο μέχρι να επιλυθεί.");
             // Real calendar popup, not handwritten text -- and the picker itself
             // refuses to let you click today or any past day, so the "must be in
             // the future from now" rule is enforced at selection time, not after.
-            ImGui::TextUnformatted("Ημ/νία επίλυσης:");
+            CellText("Ημ/νία επίλυσης:");
             DatePicker("resdate", pb_resolutionDate, ImVec2(0, 1), /*futureOnly=*/true);
             ImGui::TextDisabled("Πότε αναμένεται αυτή η μελλοντική πληρωμή να γίνει πραγματική.");
         } else if (!pb_plan.on) {
@@ -3772,7 +4063,7 @@ static void DrawPaymentDialog() {
                 if (!cpOk) { amountsOk = false; ImGui::TextColored(kColOut, "Το πληρωμένο κόστος δεν μπορεί να ξεπερνά το κόστος."); }
                 else if (ToCents(cp) < ToCents(cst)) ImGui::TextColored(kColWeOwe, "Οφειλόμενα: %s", Eur(MoneySub(cst, cp)).c_str());
                 ImGui::TextColored(dueNow - cst >= 0 ? kColIn : kColOut, "Κέρδος από τη χρέωση: %s", Eur(MoneySub(dueNow, cst)).c_str());
-                ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Πληρώθηκε σε συνεργάτη:"); ImGui::SameLine(); PickPartner("pbpart", pb_partner, 300);
+                ImGui::AlignTextToFramePadding(); CellText("Πληρώθηκε σε συνεργάτη:"); ImGui::SameLine(); { bool none = false; PickPartner("pbpart", pb_partner, 300, &none); if (none) pb_cost.set(""); }
             }
         }
         ImGui::Spacing();
@@ -3911,18 +4202,17 @@ static void DrawPackageChargeDialog() {
         // button, which keeps the action unambiguous.
         std::string pkgName = "(άγνωστο πακέτο)";
         if (pc_pkgId > 0) pkgName = g_app.conn->getPackageLabel(pc_pkgId);
-        ImGui::TextUnformatted("Πακέτο:"); ImGui::SameLine(110);
-        if (pc_lockPkg) ImGui::TextUnformatted(pkgName.c_str());
+        CellText("Πακέτο:"); ImGui::SameLine(110);
+        if (pc_lockPkg) CellText(pkgName.c_str());
         else PickPackage("pcpkg", pc_pkgId, 360);
-        ImGui::TextUnformatted("Πελάτης:"); ImGui::SameLine(110);
-        if (pc_lockUser) ImGui::TextUnformatted(g_app.userName(pc_userId).c_str());
+        CellText("Πελάτης:"); ImGui::SameLine(110);
+        if (pc_lockUser) CellText(g_app.userName(pc_userId).c_str());
         else PickClient("pccli", pc_userId, 360);
-        ImGui::TextUnformatted("Ημερομηνία:");
+        CellText("Ημερομηνία:");
         DatePicker("pkgdate", pc_dateStr, ImVec2(0, 1));
         pc_direction = 0;       // we do not pay on behalf of clients any more
-        if (!pc_plan.on) ImGui::Checkbox("Μελλοντικές πληρωμές (δεν έχουν εξοφληθεί ακόμα)", &pc_isFuture);
         if (pc_isFuture) {
-            ImGui::TextUnformatted("Ημ/νία επίλυσης:");
+            CellText("Ημ/νία επίλυσης:");
             DatePicker("pkgres", pc_resolutionDate, ImVec2(0, 1), /*futureOnly=*/true);
         }
 
@@ -3973,7 +4263,7 @@ static void DrawPackageChargeDialog() {
                 if (!pc_cpaidManual[i]) pc_cpaid[i].set(FormatMoney(cst));
                 ImGui::Indent(24);
                 ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("κόστος %s προς", Eur(cst).c_str()); ImGui::SameLine();
-                PickPartner("pcrowpart", pc_cpart[i], 260);
+                { bool none = false; PickPartner("pcrowpart", pc_cpart[i], 260, &none); if (none) pc_cost[i].set(""); }
                 ImGui::SameLine(0, 10); ImGui::SetNextItemWidth(90);
                 if (ImGui::InputTextWithHint("##pccpaid", "πληρωμή τώρα", pc_cpaid[i].data, sizeof(pc_cpaid[i].data))) pc_cpaidManual[i] = 1;
                 if (!ParseMoney(pc_cpaid[i].str(), cpd) || ToCents(cpd) < 0 || ToCents(cpd) > ToCents(cst)) { costPaidOk = false; cpd = 0.0; }
@@ -4241,7 +4531,7 @@ static void StartEditPayment(const Payment& p) {
     g_showPaymentDialog = true;
 }
 
-static const ListColDef kPaymentListCols[12] = {
+static const ListColDef kPaymentListCols[13] = {
     { "ΚΩΔ",        ImGuiTableColumnFlags_WidthFixed, 100.0f, true  },
     { "ΗΜ/ΝΙΑ",     ImGuiTableColumnFlags_WidthFixed, 140.0f, true  },
     { "ΠΕΛΑΤΗΣ",    ImGuiTableColumnFlags_WidthFixed, 200.0f, true  },
@@ -4254,21 +4544,23 @@ static const ListColDef kPaymentListCols[12] = {
     { "ΑΠΟΔΕΙΞΗ",   ImGuiTableColumnFlags_WidthFixed, 130.0f, true  },
     { "ΕΝΕΡΓΕΙΕΣ",  ImGuiTableColumnFlags_WidthFixed, 310.0f, false },
     { "ΕΚΤΕΛΕΣΤΗΣ ΥΠΗΡΕΣΙΑΣ", ImGuiTableColumnFlags_WidthFixed, 200.0f, false },
+    { "ΚΑΤΑΧΩΡΗΘΗΚΕ", ImGuiTableColumnFlags_WidthFixed, 160.0f, true },
 };
-static std::vector<int> g_paymentsColOrder = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 10 };
+static std::vector<int> g_paymentsColOrder = { 0, 1, 12, 2, 3, 4, 5, 6, 7, 8, 9, 11, 10 };
 static const char* const kPaymentSortNames[] = { "ΚΩΔ", "ΗΜ/ΝΙΑ", "ΠΕΛΑΤΗΣ", "ΥΠΗΡΕΣΙΑ", "ΤΥΠΟΣ", "ΚΑΤΑΣΤΑΣΗ", "ΠΟΣΟ", "ΠΛΗΡΩΜΕΝΟ", "ΣΗΜΕΙΩΣΕΙΣ" };
 static const int kPaymentSortCols[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 
 static void DrawUserFilterPicker(const char* label, int& selectedUserId, float width);
 static void DrawServiceFilterPicker(const char* label, int& selectedServiceId, float width);
 
+static ListModel<Payment>* g_paymentsModel = nullptr;      // the list on screen (one per tab)
 static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
-    if (!ImGui::BeginTable("paymentstable", 12,
+    if (!ImGui::BeginTable("paymentstable", 13,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable)) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ListSetupColumns(g_paymentsColOrder, kPaymentListCols);
-    ListHeaderRow(g_paymentsColOrder, kPaymentListCols, g_paymentsSort, g_paymentsPager);
+    ListHeaderRow(g_paymentsColOrder, kPaymentListCols, g_paymentsSort, g_paymentsPager, &g_paymentsModel->g.cf, &g_paymentsModel->distinct);
     auto P = [&](int logical) { return ListPos(g_paymentsColOrder, logical); };
     // who carried out the service we paid for (partner name, or #-1): looked up for this page's paid-out lines only
     std::string outIds; for (const Payment* pp : rows) if (pp->direction == "out") outIds += (outIds.empty() ? "" : ",") + std::to_string(pp->id);
@@ -4286,19 +4578,20 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
         ImGui::TableNextRow();
         ImGuiID rowId = 0;
         { char idb[16]; std::snprintf(idb, sizeof(idb), "%d", p.id); ImGui::TableSetColumnIndex(P(0)); rowId = RowSelectable(idb); }
-        ImGui::TableSetColumnIndex(P(1)); ImGui::TextUnformatted(DateGr(p.year, p.month, p.day).c_str());
+        ImGui::TableSetColumnIndex(P(1)); CellText(DateGr(p.year, p.month, p.day).c_str());
+        ImGui::TableSetColumnIndex(P(12)); ImGui::TextDisabled("%s", p.created_at.c_str());
         ImGui::TableSetColumnIndex(P(2));
         if (p.direction == "out") ImGui::TextDisabled("—");        // what we pay has no client
-        else ImGui::TextUnformatted(TruncToWidth(g_app.userName(p.user_id), ImGui::GetContentRegionAvail().x).c_str());
+        else CellText((g_app.userName(p.user_id)).c_str());
         ImGui::TableSetColumnIndex(P(11));
-        if (p.direction == "out") { auto it = execOf.find(p.id); ImGui::TextUnformatted(it != execOf.end() ? it->second.c_str() : "#-1"); }
+        if (p.direction == "out") { auto it = execOf.find(p.id); CellText(it != execOf.end() ? it->second.c_str() : "#-1"); }
         else ImGui::TextDisabled("—");
-        ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(TruncToWidth(ChargeLabel(p), ImGui::GetContentRegionAvail().x).c_str());
+        ImGui::TableSetColumnIndex(P(3)); CellText((ChargeLabel(p)).c_str());
         ImGui::TableSetColumnIndex(P(4)); ImGui::TextColored(DirectionColor(p.direction), "%s", DirectionBadge(p.direction));
         ImGui::TableSetColumnIndex(P(5)); StatusCell(p);
-        ImGui::TableSetColumnIndex(P(6)); ImGui::TextUnformatted(Eur(p.amount_due).c_str());
-        ImGui::TableSetColumnIndex(P(7)); ImGui::TextUnformatted(Eur(p.amount_paid).c_str());
-        ImGui::TableSetColumnIndex(P(8)); ImGui::TextUnformatted(TruncToWidth(p.notes, ImGui::GetContentRegionAvail().x).c_str());
+        ImGui::TableSetColumnIndex(P(6)); CellText(Eur(p.amount_due).c_str());
+        ImGui::TableSetColumnIndex(P(7)); CellText(Eur(p.amount_paid).c_str());
+        ImGui::TableSetColumnIndex(P(8)); CellText((p.notes).c_str());
         ImGui::TableSetColumnIndex(P(9));
         if (p.receipt_id > 0) {
             static std::map<int, std::pair<std::string, bool>> rno;          // receipt id -> ("Α-000012", void?)
@@ -4330,8 +4623,6 @@ static void DrawPaymentsTable(const std::vector<const Payment*>& rows) {
 
 static void DrawPaymentsScreen(int jointFilter = 0) {
     ImGui::TextDisabled("Προβολή πληρωμών. Για νέα χρέωση: Υπηρεσίες → Χρέωση, ή Πακέτα → Χρέωση πακέτου.");
-    ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) { g_paymentsPager.Reset(); }
     if (!g_paymentsTableView) { ImGui::SameLine(); DrawSortMenu("paysort", kPaymentSortNames, kPaymentSortCols, 9, g_paymentsSort, g_paymentsPager); }
 
     // Κάρτες / Λίστα toggle right-aligned on the same row as the toolbar above.
@@ -4419,8 +4710,13 @@ static void DrawPaymentsScreen(int jointFilter = 0) {
             g_app.conn->countPayments(g_payStartDate, g_payEndDate, g_payUserFilter, g_payServiceFilter, statusStr, dirStr,
                                       missingReceiptOnly, jointFilter));
     });
-    const std::vector<Payment>& page = pc.first;
+    std::vector<Payment> page = pc.first;
     g_paymentsPager.total = pc.second;
+    static std::map<int, ListModel<Payment>> payM; ListModel<Payment>& pm = payM[jointFilter]; g_paymentsModel = &pm;
+    DrawListSearch(pm.g);
+    pm.Override(g_paymentsPager, g_paymentsSort.keys, std::string(pk).substr(0, 0) + g_payStartDate + "|" + g_payEndDate + "|" + std::to_string(g_payUserFilter) + "|" + std::to_string(g_payServiceFilter) + "|" + statusStr + "|" + dirStr + "|" + std::to_string((int)missingReceiptOnly),
+        [&](const SortSpec& ss, int off, int lim) { return g_app.conn->pagePayments(g_payStartDate, g_payEndDate, g_payUserFilter, g_payServiceFilter, statusStr, dirStr, off, lim, ss, missingReceiptOnly, jointFilter); },
+        [](const Payment& p, int c) -> std::string { switch (c) { case 0: return std::to_string(p.id); case 1: return DateGr(p.year, p.month, p.day); case 2: return p.direction == "out" ? std::string() : g_app.userName(p.user_id); case 3: return ChargeLabel(p); case 4: return DirectionBadge(p.direction); case 5: return p.status; case 6: return Eur(p.amount_due); case 7: return Eur(p.amount_paid); case 8: return p.notes; case 12: return p.created_at; default: return ""; } }, 13, page, g_paymentsPager.total);
 
     std::vector<const Payment*> payRows;
     payRows.reserve(page.size());
@@ -4447,7 +4743,7 @@ static void DrawPaymentsScreen(int jointFilter = 0) {
         BeginCard("card", ImVec2(cardW, cardH));
         ImGui::TextColored(DirectionColor(p.direction), "%s", DirectionBadge(p.direction));
         ImGui::Text("%s / %s", g_app.userName(p.user_id).c_str(), ChargeLabel(p).c_str());
-        ImGui::TextUnformatted(DateGr(p.year, p.month, p.day).c_str());
+        CellText(DateGr(p.year, p.month, p.day).c_str());
         ImGui::TextColored(col, "%s", p.status.c_str());
         ImGui::Text("Οφειλή: %.2f  Πληρωμένο: %.2f", p.amount_due, p.amount_paid);
         if (showResDate) ImGui::TextDisabled("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
@@ -4550,7 +4846,7 @@ static void StatTile(const char* label, const std::string& value, ImVec4 accent,
         float scale = 1.35f;
         if (w * scale > availW && w > 0.0f) scale = availW / w;
         ImGui::SetWindowFontScale(scale);
-        ImGui::TextUnformatted(value.c_str());
+        CellText(value.c_str());
         ImGui::SetWindowFontScale(1.0f);
         ImGui::PopStyleColor();
     }
@@ -4608,9 +4904,9 @@ static bool DrawDateRange(const char* id, std::string& from, std::string& to) {
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(mode != 0);
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Από:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Από:"); ImGui::SameLine();
     if (DatePicker("from", from, ImVec2(0, 1))) { ch = true; mode = 0; }
-    ImGui::SameLine(); ImGui::TextUnformatted("Έως:"); ImGui::SameLine();
+    ImGui::SameLine(); CellText("Έως:"); ImGui::SameLine();
     if (DatePicker("to", to, ImVec2(0, 1))) { ch = true; mode = 0; }
     ImGui::EndDisabled();
     ImGui::PopID();
@@ -4660,7 +4956,7 @@ static void ProfilePaymentsTable(const char* id, const DataConn::PaymentFilter& 
             ImGui::PushID(r.id); ImGui::TableNextRow();
             ImGui::TableNextColumn();
             if (ImGui::Selectable(DateGr(r.year, r.month, r.day).c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) OpenPaymentView(r.id);
-            if (showService) { ImGui::TableNextColumn(); ImGui::TextUnformatted(ChargeLabel(r).c_str()); }
+            if (showService) { ImGui::TableNextColumn(); CellText(ChargeLabel(r).c_str()); }
             ImGui::TableNextColumn(); ImGui::TextColored(DirectionColor(r.direction), "%s", Eur(r.amount_due).c_str());
             ImGui::TableNextColumn();
             if (showService) ImGui::TextColored(kColOwed, "%s", Eur(r.balance).c_str()); else ImGui::Text("%s", Eur(r.amount_paid).c_str());
@@ -4689,22 +4985,24 @@ static void DrawSharesTable(const char* id, ListModel<JointShare>& m, int userId
     const bool byApt = aptId > 0;
     const ListColDef* cols = byApt ? kShareColsApt : kShareColsClient;
     m.Init(SH_COUNT, SortSpec{{SH_DATE, false}}, 10);
-    const auto& pg = m.Load(std::string(onlyOpen ? "o" : "h") + "|" + std::to_string(userId) + "|" + std::to_string(aptId) + "|" + from + "|" + to,
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadT(std::string(onlyOpen ? "o" : "h") + "|" + std::to_string(userId) + "|" + std::to_string(aptId) + "|" + from + "|" + to,
         [&](const SortSpec& s, int off, int lim) {
             return g_app.conn->pageShares(userId, aptId, from, to, onlyOpen, MapSort(s, {{SH_DATE, 0}, {SH_OP, 1}, {SH_WHO, 2}, {SH_TOTAL, 3}, {SH_SHARE, 4}, {SH_PAID, 5}, {SH_OWED, 6}}), off, lim); },
-        [&] { return g_app.conn->countShares(userId, aptId, from, to, onlyOpen); });
+        [&] { return g_app.conn->countShares(userId, aptId, from, to, onlyOpen); },
+        [byApt](const JointShare& s, int c) -> std::string { switch (c) { case SH_DATE: return DateGr(s.op_date); case SH_OP: return s.op_label; case SH_WHO: return byApt ? s.user_name : s.building_address + ", " + s.apartment_label; case SH_TOTAL: return Eur(s.op_total); case SH_SHARE: return Eur(s.amount); case SH_PAID: return Eur(std::min(s.paid, s.amount)); case SH_OWED: return Eur(MoneySub(s.amount, std::min(s.paid, s.amount))); case SH_WEOWE: return Eur(s.op_cost_owed); default: return ""; } }, SH_COUNT);
     if (pg.count == 0) { ImGui::TextDisabled(onlyOpen ? "Δεν εκκρεμεί τίποτα." : "Κανένα κοινόχρηστο."); return; }
     if (ImGui::BeginTable(id, SH_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
                           ImVec2(0, height))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(m.g.order, cols);
-        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager);
+        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager, &m.g.cf, &m.distinct);
         auto P = [&](int c) { return ListPos(m.g.order, c); };
         for (auto& s : pg.rows) {
             double owed = MoneySub(s.amount, std::min(s.paid, s.amount));
             ImGui::PushID(s.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(SH_DATE)); ImGui::TextUnformatted(DateGr(s.op_date).c_str());
-            ImGui::TableSetColumnIndex(P(SH_OP)); ImGui::TextUnformatted(s.op_label.c_str());
+            ImGui::TableSetColumnIndex(P(SH_DATE)); CellText(DateGr(s.op_date).c_str());
+            ImGui::TableSetColumnIndex(P(SH_OP)); CellText(s.op_label.c_str());
             ImGui::TableSetColumnIndex(P(SH_WHO));
             if (byApt) {
                 if (s.user_id <= 0) ImGui::TextDisabled("— κενό —");
@@ -4719,7 +5017,7 @@ static void DrawSharesTable(const char* id, ListModel<JointShare>& m, int userId
             }
             else ImGui::Text("%s, %s", s.building_address.c_str(), s.apartment_label.c_str());
             ImGui::TableSetColumnIndex(P(SH_TOTAL)); ImGui::TextDisabled("%s", Eur(s.op_total).c_str());
-            ImGui::TableSetColumnIndex(P(SH_SHARE)); ImGui::TextUnformatted(Eur(s.amount).c_str());
+            ImGui::TableSetColumnIndex(P(SH_SHARE)); CellText(Eur(s.amount).c_str());
             ImGui::TableSetColumnIndex(P(SH_PAID));
             { float fr = s.amount > 0.005 ? (float)std::min(1.0, s.paid / s.amount) : 1.0f; char b[40]; std::snprintf(b, sizeof(b), "%s (%.0f%%)", Eur(std::min(s.paid, s.amount)).c_str(), fr * 100.0f);
               ImGui::PushStyleColor(ImGuiCol_PlotHistogram, fr >= 0.9999f ? ImVec4(0.30f, 0.70f, 0.45f, 1) : ImVec4(0.85f, 0.60f, 0.25f, 1));
@@ -4796,17 +5094,20 @@ static void DrawUserProfileWindow() {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
                     ImGui::TextDisabled("%s:", k1); ImGui::SameLine();
-                    ImGui::TextUnformatted(v1.empty() ? "—" : v1.c_str());
+                    CellText(v1.empty() ? "—" : v1.c_str());
                     ImGui::TableNextColumn();
                     if (k2 && k2[0]) {
                         ImGui::TextDisabled("%s:", k2); ImGui::SameLine();
-                        ImGui::TextUnformatted(v2.empty() ? "—" : v2.c_str());
+                        CellText(v2.empty() ? "—" : v2.c_str());
                     }
                 };
-                Row("Τηλέφωνο",        u.phone,         "Περιοχή",         u.area);
-                Row("Διεύθυνση",       u.address,       "Διαμέρισμα",      u.apartment);
-                Row("Τ.Κ.",            u.postal_code,   "Ειδικός Κωδικός", u.special_code);
+                Row("Κωδικός",         u.code,          "Ειδικός Κωδικός", u.special_code);
+                Row("Τύπος",           KindLabel(u.kind), "DB ID",         std::to_string(u.id));
+                Row("Τηλέφωνο",        u.phone,         "Email",           u.email);
+                Row("ΑΦΜ",             u.afm,           "Περιοχή",         u.area);
+                if (u.kind == "building") Row("Διαχειριστής", u.manager_name, "Τ.Κ.", u.postal_code);
                 Row("Δημιουργήθηκε",   u.created_at,    "",                "");
+                for (auto& [xk, xv] : ExtraFromJson(u.extra_json)) Row(xk.c_str(), xv, "", "");
                 ImGui::EndTable();
             }
         }
@@ -4826,18 +5127,18 @@ static void DrawUserProfileWindow() {
         SectionTitle("Στατιστικά");
         DrawDateRange(("pst" + suid).c_str(), PS.sFrom, PS.sTo);
         {
-            DataConn::PaymentFilter fa; fa.userId = uid; fa.fromDate = PS.sFrom; fa.toDate = PS.sTo; fa.joint = 2;   // our services only, never κοινόχρηστα
-            static std::map<int, Cached<DataConn::MoneyTotals>> tc;
-            const auto& tt = tc[uid].get(PS.sFrom + "|" + PS.sTo, [&] { return g_app.conn->paymentTotals(fa); });
-            char buf[64];
-            if (ImGui::BeginTable("userstats", 4, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
+            DataConn::PaymentFilter fa; fa.userId = uid; fa.fromDate = PS.sFrom; fa.toDate = PS.sTo; fa.joint = 2; fa.status = 1;   // our business with him, what has come due
+            DataConn::PaymentFilter fi = fa, fo = fa; fi.direction = "in"; fo.direction = "out";
+            struct Tt { DataConn::MoneyTotals in, out; };
+            static std::map<int, Cached<Tt>> tc;
+            const Tt& tt = tc[uid].get(PS.sFrom + "|" + PS.sTo, [&] { Tt x; x.in = g_app.conn->paymentTotals(fi); x.out = g_app.conn->paymentTotals(fo); return x; });
+            if (ImGui::BeginTable("userstats", 6, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
                 ImGui::TableNextRow();
                 struct Tl { const char* l; double v; ImVec4 c; };
-                Tl tl[4] = { {"Εισπράξεις", tt.collected, kColIn}, {"Οφειλές", tt.owedIn, kColOwed},
-                             {"Πληρωμές", tt.paidOut, kColOut}, {"Οφειλόμενα", tt.owedOut, kColWeOwe} };
-                for (int k = 0; k < 4; k++) { ImGui::TableNextColumn(); ImGui::PushID(k);
-                    std::snprintf(buf, sizeof(buf), "%s", Eur(tl[k].v).c_str());
-                    StatTile(tl[k].l, buf, tl[k].c, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 76)); ImGui::PopID(); }
+                const double profit = MoneySub(tt.in.dueAll, tt.out.dueAll);
+                Tl tl[6] = { {"Χρεώσαμε", tt.in.dueAll, ImVec4(0.55f, 0.80f, 1.0f, 1)}, {"Εισπράξεις", tt.in.collected, kColIn}, {"Οφειλές", tt.in.owedIn, kColOwed},
+                             {"Κόστος μας", tt.out.dueAll, kColOut}, {"Οφειλόμενα μας", tt.out.owedOut, kColWeOwe}, {"Κέρδος", profit, profit >= 0 ? kColIn : kColOut} };
+                for (int k = 0; k < 6; k++) { ImGui::TableNextColumn(); ImGui::PushID(k); StatTile(tl[k].l, Eur(tl[k].v), tl[k].c, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 76)); ImGui::PopID(); }
                 ImGui::EndTable();
             }
         }
@@ -4872,10 +5173,10 @@ static void DrawUserProfileWindow() {
                     ImGui::TableHeadersRow();
                     for (int i = op.offset; i < std::min(op.total, op.offset + op.pageSize); i++) {
                         const Offer& o = offers[i]; ImGui::TableNextRow();
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(o.name.c_str());
+                        ImGui::TableNextColumn(); CellText(o.name.c_str());
                         if (o.user_id < 0) { ImGui::SameLine(); ImGui::TextDisabled("(για όλους)"); }
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(OfferValueText(o).c_str());
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(OfferTargetText(o).c_str());
+                        ImGui::TableNextColumn(); CellText(OfferValueText(o).c_str());
+                        ImGui::TableNextColumn(); CellText(OfferTargetText(o).c_str());
                         ImGui::TableNextColumn(); ImVec4 c; std::string st = OfferStateText(o, c); ImGui::TextColored(c, "%s", st.c_str());
                     }
                     ImGui::EndTable();
@@ -4893,10 +5194,12 @@ static void DrawUserProfileWindow() {
         if (DrawDateRange(("pts" + suid).c_str(), PS.from, PS.to)) { PS.charges.g.pager.Reset(); PS.selCharge = -1; }
         ImGui::TextDisabled("Αριστερό κλικ σε γραμμή: άνοιγμα της χρέωσης · δεξί κλικ: οι πληρωμές και το κόστος της εδώ δίπλα.");
         {
-            const auto& pg = PS.charges.Load(suid + "|" + PS.from + "|" + PS.to,
+            DrawListSearch(PS.charges.g);
+            const auto& pg = PS.charges.LoadT(suid + "|" + PS.from + "|" + PS.to,
                 [&](const SortSpec& s, int off, int lim) {
                     return g_app.conn->pageClientCharges(uid, PS.from, PS.to, MapSort(s, {{CC_DATE, 0}, {CC_SVC, 1}, {CC_DUE, 2}, {CC_PAID, 3}, {CC_OWED, 4}, {CC_COST, 5}, {CC_COSTPAID, 6}, {CC_PROFIT, 7}}), off, lim); },
-                [&] { return g_app.conn->countClientCharges(uid, PS.from, PS.to); });
+                [&] { return g_app.conn->countClientCharges(uid, PS.from, PS.to); },
+        [](const DataConn::ClientChargeRow& r, int c) -> std::string { switch (c) { case CC_DATE: return DateGr(r.date); case CC_SVC: return r.service; case CC_DUE: return Eur(r.due); case CC_PAID: return Eur(r.paid); case CC_OWED: return Eur(r.balance); case CC_COST: return Eur(r.cost); case CC_COSTPAID: return Eur(r.costPaid); case CC_PROFIT: return Eur(r.profit()); default: return ""; } }, CC_COUNT);
             const float H = 330.0f;
             const bool selOn = PS.selCharge > 0;
             const float availW = ImGui::GetContentRegionAvail().x;
@@ -4906,21 +5209,21 @@ static void DrawUserProfileWindow() {
             ImGui::BeginChild("pcL", ImVec2(selOn ? availW * 0.60f : 0.0f, selOn ? H : (pg.count == 0 ? ImGui::GetTextLineHeightWithSpacing() * 1.5f : tableH + pagerH + 6.0f)), false);
             if (pg.count == 0) ImGui::TextDisabled("Καμία υπηρεσία σε αυτό το διάστημα.");
             else {
-                if (ImGui::BeginTable("profcharges", CC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+                if (ImGui::BeginTable("profcharges", CC_COUNT, ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
                                       ImVec2(0, selOn ? H - pagerH : tableH))) {
                     ImGui::TableSetupScrollFreeze(0, 1);
                     ListSetupColumns(PS.charges.g.order, kClientChargeCols);
                     ImGui::TableSetColumnEnabled(ListPos(PS.charges.g.order, CC_PROFIT), false);      // no profit per service here: the figures are the columns
-                    ListHeaderRow(PS.charges.g.order, kClientChargeCols, PS.charges.g.sort, PS.charges.g.pager);
+                    ListHeaderRow(PS.charges.g.order, kClientChargeCols, PS.charges.g.sort, PS.charges.g.pager, &PS.charges.g.cf, &PS.charges.distinct);
                     auto P = [&](int c) { return ListPos(PS.charges.g.order, c); };
                     for (auto& r : pg.rows) {
                         ImGui::PushID(r.charge_id); ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(P(CC_DATE));
                         if (ImGui::Selectable(DateGr(r.date).c_str(), PS.selCharge == r.charge_id, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) OpenPaymentView(r.charge_id);
                         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) PS.selCharge = PS.selCharge == r.charge_id ? -1 : r.charge_id;
-                        ImGui::TableSetColumnIndex(P(CC_SVC)); ImGui::TextUnformatted(r.service.c_str());
+                        ImGui::TableSetColumnIndex(P(CC_SVC)); CellText(r.service.c_str());
                         if (!r.offerName.empty()) { ImGui::SameLine(); ImGui::TextColored(kColOwed, "[%s]", r.offerName.c_str()); }
-                        ImGui::TableSetColumnIndex(P(CC_DUE)); ImGui::TextUnformatted(Eur(r.due).c_str());
+                        ImGui::TableSetColumnIndex(P(CC_DUE)); CellText(Eur(r.due).c_str());
                         ImGui::TableSetColumnIndex(P(CC_PAID)); ImGui::TextColored(kColIn, "%s", Eur(r.paid).c_str());
                         ImGui::TableSetColumnIndex(P(CC_OWED)); if (r.balance > 0.005) { ImGui::TextColored(kColOwed, "%s", Eur(r.balance).c_str()); } else ImGui::TextDisabled("%s", Eur(0.0).c_str());
                         ImGui::TableSetColumnIndex(P(CC_COST)); if (r.cost > 0.005) ImGui::TextColored(kColOut, "%s", Eur(r.cost).c_str()); else ImGui::TextDisabled("%s", Eur(0.0).c_str());
@@ -4957,15 +5260,21 @@ static void DrawUserProfileWindow() {
             }
         }
 
-        // 8. a client is never a resident here: if the same person is also a resident, that is his own card in Διαχείριση
+        // 8. his contracts: click one to see how its year is going
         {
-            static std::map<int, Cached<int>> rc;
-            int resUser = rc[uid].get("", [&] { return g_app.conn->residentUserFor(uid); });
-            if (resUser > 0) {
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1), "Το ίδιο πρόσωπο είναι και ένοικος πολυκατοικίας που διαχειριζόμαστε.");
-                ImGui::SameLine(); ImGui::TextDisabled("Τα κοινόχρηστα, οι εισφορές και οι αποδείξεις του είναι στην καρτέλα ενοίκου, χωριστά.");
-                ImGui::SameLine(); if (ImGui::SmallButton("Καρτέλα ενοίκου ►")) g_resCardUser = resUser;
+            struct Cts { std::vector<DataConn::Contract> rows; DataConn::ContractTotals t; };
+            static std::map<int, Cached<Cts>> cc;
+            const Cts& ct = cc[uid].get("", [&] { Cts x; x.t = g_app.conn->contractTotals(uid, 1, ""); x.rows = g_app.conn->pageContracts(uid, 0, "", {}, 0, 100); return x; });
+            SectionTitle(("Συμβάσεις (" + std::to_string(ct.t.count) + " ανοιχτές)").c_str());
+            if (ct.rows.empty()) ImGui::TextDisabled("Καμία σύμβαση.");
+            else {
+                static std::map<int, GridState> gs; static const ListColDef cols[6] = { LC("Σύμβαση"), LC("Δημιουργία · ενεργή έως"), LC("Τιμή σύμβασης"), LC("Πληρώθηκαν"), LC("Οφείλονται"), LC("Μελλοντικές") };
+                auto text = [](const DataConn::Contract& r, int c) -> std::string { switch (c) { case 0: return r.label; case 1: return r.created_at.substr(0, 10) + " · " + DateGr(r.end_date); case 2: return Eur(r.total); case 3: return Eur(r.collected); case 4: return Eur(r.owedNow); default: return Eur(r.scheduled); } };
+                DrawMiniList("profct", gs[uid], cols, 6, ct.rows, text, [&](const DataConn::Contract& r, int c) {
+                    if (c == 0) { if (LinkCell(r.label)) OpenContractView(r.id); } else if (c == 3) ImGui::TextColored(kColIn, "%s", Eur(r.collected).c_str());
+                    else if (c == 4) { if (ToCents(r.owedNow) > 0) ImGui::TextColored(kColOwed, "%s", Eur(r.owedNow).c_str()); else ImGui::TextDisabled("—"); }
+                    else if (c == 5) { if (ToCents(r.scheduled) > 0) ImGui::TextColored(kColSched, "%s", Eur(r.scheduled).c_str()); else ImGui::TextDisabled("—"); }
+                    else CellText(text(r, c).c_str()); }, [](const DataConn::Contract&) {});
             }
         }
 
@@ -4973,13 +5282,13 @@ static void DrawUserProfileWindow() {
         ImGui::Spacing(); ImGui::Separator();
         {
             std::string gone = g_app.conn->userDeletedAt(uid);
-            if (!gone.empty()) ImGui::TextColored(kColMuted, "Ο πελάτης διαγράφηκε στις %s. Το ιστορικό του μένει όπως ήταν.", gone.c_str());
+            if (!gone.empty()) ImGui::TextColored(kColMuted, "Πρώην από %s. Το ιστορικό και ό,τι χρωστάει μένουν όπως ήταν.", gone.c_str());
             else {
-                ImGui::TextDisabled("Η διαγραφή βγάζει τον πελάτη από όλες τις λίστες και κλείνει τη διαμονή του στο διαμέρισμα. Οι χρεώσεις, οι πληρωμές και οι αποδείξεις του μένουν στο ιστορικό.");
+                ImGui::TextDisabled("Δεν διαγράφεται: πηγαίνει στους πρώην πελάτες ή ενοίκους. Χρεώσεις, πληρωμές, αποδείξεις και ό,τι χρωστάει μένουν.");
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.18f, 0.18f, 1.0f));
-                if (ImGui::Button("Διαγραφή πελάτη")) {
+                if (ImGui::Button("Μεταφορά στους πρώην")) {
                     int id = uid; std::string name = u.full_name;
-                    RequestConfirm("Διαγραφή πελάτη", { {"Όνομα", name, "(διαγραφή)"}, {"Διαμονή", u.apartment.empty() ? "-" : u.address + ", " + u.apartment, "τέλος σήμερα"} }, [id]() {
+                    RequestConfirm("Μεταφορά στους πρώην", { {"Όνομα", name, "πρώην"}, {"Διαμονή", u.apartment.empty() ? "-" : u.address + ", " + u.apartment, "τέλος σήμερα"} }, [id]() {
                         g_app.conn->removeUser(id);
                         g_app.reloadUsers();
                         g_profileUserIds.erase(std::remove(g_profileUserIds.begin(), g_profileUserIds.end(), id), g_profileUserIds.end());
@@ -5050,16 +5359,18 @@ static void DrawEntityViewer(const std::string& key, const std::vector<int>& svc
         const auto& f = fc[key].get(dk, [&] { return g_app.conn->entityFigures(svc, false, S.from, S.to); });
         ImGui::Spacing(); SectionTitle("Χρεώσεις σε μεμονωμένους πελάτες");
         DrawFigureLine("Μεμονωμένες:", f);
-        const auto& pg = S.clients.Load(dk, [&](const SortSpec& s, int off, int lim) {
+        DrawListSearch(S.clients.g);
+        const auto& pg = S.clients.LoadT(dk, [&](const SortSpec& s, int off, int lim) {
                 return g_app.conn->entityClients(svc, S.from, S.to, MapSort(s, {{EV_NAME, 0}, {EV_N, 1}, {EV_SVCS, 2}, {EV_DUE, 3}, {EV_PAID, 4}, {EV_OWED, 5}, {EV_COST, 6}, {EV_PROFIT, 7}}), off, lim); },
-            [&] { return g_app.conn->countEntityClients(svc, S.from, S.to); });
+            [&] { return g_app.conn->countEntityClients(svc, S.from, S.to); },
+        [](const DataConn::EntityClientRow& r, int c) -> std::string { switch (c) { case EV_NAME: return r.name; case EV_N: return std::to_string(r.charges); case EV_SVCS: return std::to_string(r.services); case EV_DUE: return Eur(r.due); case EV_PAID: return Eur(r.paid); case EV_OWED: return Eur(r.balance); case EV_COST: return Eur(r.cost); case EV_PROFIT: return Eur(r.profit()); default: return ""; } }, EV_COUNT);
         if (pg.count == 0) ImGui::TextDisabled("Καμία χρέωση σε μεμονωμένους πελάτες σε αυτό το διάστημα.");
         else {
             if (ImGui::BeginTable("entclients", EV_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
                                   ImVec2(0, std::min(300.0f, 66.0f + 26.0f * (float)pg.rows.size())))) {
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ListSetupColumns(S.clients.g.order, kEntityClientCols);
-                ListHeaderRow(S.clients.g.order, kEntityClientCols, S.clients.g.sort, S.clients.g.pager);
+                ListHeaderRow(S.clients.g.order, kEntityClientCols, S.clients.g.sort, S.clients.g.pager, &S.clients.g.cf, &S.clients.distinct);
                 auto P = [&](int c) { return ListPos(S.clients.g.order, c); };
                 for (auto& r : pg.rows) {
                     ImGui::PushID(r.user_id); ImGui::TableNextRow();
@@ -5067,7 +5378,7 @@ static void DrawEntityViewer(const std::string& key, const std::vector<int>& svc
                     if (ImGui::Selectable(r.name.c_str(), S.selClient == r.user_id, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) { S.selClient = S.selClient == r.user_id ? -1 : r.user_id; S.charges.g.pager.Reset(); }
                     ImGui::TableSetColumnIndex(P(EV_N)); ImGui::Text("%d", r.charges);
                     ImGui::TableSetColumnIndex(P(EV_SVCS)); ImGui::Text("%d", r.services);
-                    ImGui::TableSetColumnIndex(P(EV_DUE)); ImGui::TextUnformatted(Eur(r.due).c_str());
+                    ImGui::TableSetColumnIndex(P(EV_DUE)); CellText(Eur(r.due).c_str());
                     ImGui::TableSetColumnIndex(P(EV_PAID)); ImGui::TextColored(kColIn, "%s", Eur(r.paid).c_str());
                     ImGui::TableSetColumnIndex(P(EV_OWED)); if (r.balance > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(r.balance).c_str()); else ImGui::TextDisabled("—");
                     ImGui::TableSetColumnIndex(P(EV_COST)); if (r.cost > 0.005) ImGui::TextColored(kColOut, "%s", Eur(r.cost).c_str()); else ImGui::TextDisabled("—");
@@ -5082,21 +5393,23 @@ static void DrawEntityViewer(const std::string& key, const std::vector<int>& svc
         if (S.selClient > 0) {
             ImGui::TextColored(ImVec4(0.70f, 0.85f, 1.0f, 1.0f), "Χρεώσεις του: %s", g_app.userName(S.selClient).c_str());
             ImGui::SameLine(); if (ImGui::SmallButton("Προφίλ πελάτη")) OpenUserProfile(S.selClient);
-            const auto& cg = S.charges.Load(dk + "|" + std::to_string(S.selClient), [&](const SortSpec& s, int off, int lim) {
+            DrawListSearch(S.charges.g);
+            const auto& cg = S.charges.LoadT(dk + "|" + std::to_string(S.selClient), [&](const SortSpec& s, int off, int lim) {
                     return g_app.conn->pageClientCharges(S.selClient, S.from, S.to, MapSort(s, {{CC_DATE, 0}, {CC_SVC, 1}, {CC_DUE, 2}, {CC_PAID, 3}, {CC_OWED, 4}, {CC_COST, 5}, {CC_COSTPAID, 6}, {CC_PROFIT, 7}}), off, lim, svc); },
-                [&] { return g_app.conn->countClientCharges(S.selClient, S.from, S.to, svc); });
+                [&] { return g_app.conn->countClientCharges(S.selClient, S.from, S.to, svc); },
+        [](const DataConn::ClientChargeRow& r, int c) -> std::string { switch (c) { case CC_DATE: return DateGr(r.date); case CC_SVC: return r.service; case CC_DUE: return Eur(r.due); case CC_PAID: return Eur(r.paid); case CC_OWED: return Eur(r.balance); case CC_COST: return Eur(r.cost); case CC_COSTPAID: return Eur(r.costPaid); case CC_PROFIT: return Eur(r.profit()); default: return ""; } }, CC_COUNT);
             if (ImGui::BeginTable("entcharges", CC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
                                   ImVec2(0, std::min(280.0f, 66.0f + 26.0f * (float)cg.rows.size())))) {
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ListSetupColumns(S.charges.g.order, kClientChargeCols);
-                ListHeaderRow(S.charges.g.order, kClientChargeCols, S.charges.g.sort, S.charges.g.pager);
+                ListHeaderRow(S.charges.g.order, kClientChargeCols, S.charges.g.sort, S.charges.g.pager, &S.charges.g.cf, &S.charges.distinct);
                 auto P = [&](int c) { return ListPos(S.charges.g.order, c); };
                 for (auto& r : cg.rows) {
                     ImGui::PushID(r.charge_id); ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(P(CC_DATE));
                     if (ImGui::Selectable(DateGr(r.date).c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) OpenPaymentView(r.charge_id);
-                    ImGui::TableSetColumnIndex(P(CC_SVC)); ImGui::TextUnformatted(r.service.c_str());
-                    ImGui::TableSetColumnIndex(P(CC_DUE)); ImGui::TextUnformatted(Eur(r.due).c_str());
+                    ImGui::TableSetColumnIndex(P(CC_SVC)); CellText(r.service.c_str());
+                    ImGui::TableSetColumnIndex(P(CC_DUE)); CellText(Eur(r.due).c_str());
                     ImGui::TableSetColumnIndex(P(CC_PAID)); ImGui::TextColored(kColIn, "%s", Eur(r.paid).c_str());
                     ImGui::TableSetColumnIndex(P(CC_OWED)); if (r.balance > 0.005) { ImGui::TextColored(kColOwed, "%s", Eur(r.balance).c_str()); } else ImGui::TextDisabled("%s", Eur(0.0).c_str());
                     ImGui::TableSetColumnIndex(P(CC_COST)); if (r.cost > 0.005) ImGui::TextColored(kColOut, "%s", Eur(r.cost).c_str()); else ImGui::TextDisabled("%s", Eur(0.0).c_str());
@@ -5116,24 +5429,26 @@ static void DrawEntityViewer(const std::string& key, const std::vector<int>& svc
         const auto& f = fc[key].get(dk, [&] { return g_app.conn->entityFigures(svc, true, S.from, S.to); });
         ImGui::Spacing(); SectionTitle("Ως κοινόχρηστο (ανά πολυκατοικία)");
         DrawFigureLine("Κοινόχρηστα:", f);
-        const auto& og = S.ops.Load(dk, [&](const SortSpec& s, int off, int lim) {
+        DrawListSearch(S.ops.g);
+        const auto& og = S.ops.LoadT(dk, [&](const SortSpec& s, int off, int lim) {
                 return g_app.conn->pageJointOps(0, "", MapSort(s, {{EJ_BLD, 1}, {EJ_LABEL, 2}, {EJ_DATE, 0}, {EJ_TOTAL, 4}, {EJ_PCT, 7}}), off, lim, false, svc, S.from, S.to); },
-            [&] { return g_app.conn->countJointOps(0, "", nullptr, nullptr, false, svc, S.from, S.to); });
+            [&] { return g_app.conn->countJointOps(0, "", nullptr, nullptr, false, svc, S.from, S.to); },
+        [](const JointOp& o, int c) -> std::string { switch (c) { case EJ_BLD: return o.building_address; case EJ_LABEL: return o.label; case EJ_DATE: return DateGr(o.op_date); case EJ_TOTAL: return Eur(o.total); case EJ_PCT: return ListNum(o.total > 0.005 ? std::min(100.0, o.paid / o.total * 100.0) : 100.0) + "%"; default: return ""; } }, EJ_COUNT);
         if (og.count == 0) ImGui::TextDisabled("Δεν έχει χρεωθεί ως κοινόχρηστο σε αυτό το διάστημα.");
         else {
             if (ImGui::BeginTable("entops", EJ_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
                                   ImVec2(0, std::min(260.0f, 66.0f + 26.0f * (float)og.rows.size())))) {
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ListSetupColumns(S.ops.g.order, kEntityOpCols);
-                ListHeaderRow(S.ops.g.order, kEntityOpCols, S.ops.g.sort, S.ops.g.pager);
+                ListHeaderRow(S.ops.g.order, kEntityOpCols, S.ops.g.sort, S.ops.g.pager, &S.ops.g.cf, &S.ops.distinct);
                 auto P = [&](int c) { return ListPos(S.ops.g.order, c); };
                 for (auto& o : og.rows) {
                     ImGui::PushID(o.id); ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(P(EJ_BLD));
                     if (ImGui::Selectable(o.building_address.empty() ? "—" : o.building_address.c_str(), S.selOp == o.id, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) S.selOp = S.selOp == o.id ? -1 : o.id;
-                    ImGui::TableSetColumnIndex(P(EJ_LABEL)); ImGui::TextUnformatted(o.label.c_str());
-                    ImGui::TableSetColumnIndex(P(EJ_DATE)); ImGui::TextUnformatted(DateGr(o.op_date).c_str());
-                    ImGui::TableSetColumnIndex(P(EJ_TOTAL)); ImGui::TextUnformatted(Eur(o.total).c_str());
+                    ImGui::TableSetColumnIndex(P(EJ_LABEL)); CellText(o.label.c_str());
+                    ImGui::TableSetColumnIndex(P(EJ_DATE)); CellText(DateGr(o.op_date).c_str());
+                    ImGui::TableSetColumnIndex(P(EJ_TOTAL)); CellText(Eur(o.total).c_str());
                     ImGui::TableSetColumnIndex(P(EJ_PCT));
                     { double pct = o.total > 0.005 ? std::min(100.0, o.paid / o.total * 100.0) : 100.0; char b[32]; std::snprintf(b, sizeof(b), "%.0f%%", pct);
                       ImGui::PushStyleColor(ImGuiCol_PlotHistogram, pct >= 99.995 ? ImVec4(0.30f, 0.70f, 0.45f, 1) : ImVec4(0.85f, 0.60f, 0.25f, 1));
@@ -5161,9 +5476,9 @@ static void DrawEntityViewer(const std::string& key, const std::vector<int>& svc
                         if (!s.included) continue;
                         double left = MoneySub(s.amount, std::min(s.paid, s.amount));
                         ImGui::PushID(s.id); ImGui::TableNextRow();
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(s.apartment_label.c_str());
+                        ImGui::TableNextColumn(); CellText(s.apartment_label.c_str());
                         ImGui::TableNextColumn(); if (s.user_id > 0 && LinkCell(s.user_name)) OpenUserProfile(s.user_id);
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(s.amount).c_str());
+                        ImGui::TableNextColumn(); CellText(Eur(s.amount).c_str());
                         ImGui::TableNextColumn(); ImGui::TextColored(kColIn, "%s", Eur(std::min(s.paid, s.amount)).c_str());
                         ImGui::TableNextColumn(); if (left > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(left).c_str()); else ImGui::TextDisabled("—");
                         ImGui::PopID();
@@ -5180,21 +5495,13 @@ static void DrawEntityViewer(const std::string& key, const std::vector<int>& svc
         const auto& ps = pc[key].get(dk, [&] { return g_app.conn->entityPartners(svc, S.from, S.to); });
         ImGui::Spacing(); SectionTitle("Κόστος: σε ποιους πληρώσαμε");
         if (ps.empty()) ImGui::TextDisabled("Δεν υπάρχει καταχωρημένο κόστος.");
-        else if (ImGui::BeginTable("entpartners", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-            ImGui::TableSetupColumn("Συνεργάτης", ImGuiTableColumnFlags_WidthStretch, 2.0f); ImGui::TableSetupColumn("Δουλειές", ImGuiTableColumnFlags_WidthFixed, 80);
-            ImGui::TableSetupColumn("Κόστος", ImGuiTableColumnFlags_WidthFixed, 110); ImGui::TableSetupColumn("Πληρώθηκε", ImGuiTableColumnFlags_WidthFixed, 110);
-            ImGui::TableSetupColumn("Οφείλεται", ImGuiTableColumnFlags_WidthFixed, 110);
-            ImGui::TableHeadersRow();
-            for (auto& s : ps) {
-                ImGui::PushID(s.partner_id); ImGui::TableNextRow();
-                ImGui::TableNextColumn(); if (LinkCell(s.name)) OpenPartnerProfile(s.partner_id);
-                ImGui::TableNextColumn(); ImGui::Text("%d", s.jobs);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(s.cost).c_str());
-                ImGui::TableNextColumn(); ImGui::TextColored(kColOut, "%s", Eur(s.paid).c_str());
-                ImGui::TableNextColumn(); if (s.owedNow > 0.005) ImGui::TextColored(kColWeOwe, "%s", Eur(s.owedNow).c_str()); else ImGui::TextDisabled("—");
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
+        else {
+            static GridState g; static const ListColDef cols[5] = { LC("Συνεργάτης"), LC("Δουλειές"), LC("Κόστος"), LC("Πληρώθηκε"), LC("Οφείλεται") };
+            auto text = [](const DataConn::PartnerStat& x, int c) -> std::string { switch (c) { case 0: return x.name; case 1: return std::to_string(x.jobs); case 2: return Eur(x.cost); case 3: return Eur(x.paid); default: return Eur(x.owedNow); } };
+            DrawMiniList("entpartners", g, cols, 5, ps, text, [&](const DataConn::PartnerStat& x, int c) {
+                if (c == 0) { if (LinkCell(x.name)) OpenPartnerProfile(x.partner_id); } else if (c == 3) ImGui::TextColored(kColOut, "%s", Eur(x.paid).c_str());
+                else if (c == 4) { if (x.owedNow > 0.005) ImGui::TextColored(kColWeOwe, "%s", Eur(x.owedNow).c_str()); else ImGui::TextDisabled("—"); }
+                else CellText(text(x, c).c_str()); }, [](const DataConn::PartnerStat&) {});
         }
     }
     ImGui::PopID();
@@ -5270,8 +5577,8 @@ static void DrawPackageViewWindow() {
                 for (auto& c : comps) {
                     ImGui::TableNextRow(); ImGui::TableNextColumn();
                     if (LinkCell(c.label)) OpenServiceDetail(c.id);
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(c.suggested_price).c_str());
-                    ImGui::TableNextColumn(); double cs = g_app.conn->getServiceCost(c.id); if (cs > 0.005) ImGui::TextUnformatted(Eur(cs).c_str()); else ImGui::TextDisabled("—");
+                    ImGui::TableNextColumn(); CellText(Eur(c.suggested_price).c_str());
+                    ImGui::TableNextColumn(); double cs = g_app.conn->getServiceCost(c.id); if (cs > 0.005) CellText(Eur(cs).c_str()); else ImGui::TextDisabled("—");
                 }
                 ImGui::EndTable();
             }
@@ -5400,7 +5707,7 @@ static void DrawResidentLedgerWindow() {
                     const Row& x = rows[r]; ImGui::TableNextRow(); ImGui::TableNextColumn();
                     if (period == 2) ImGui::Text("%s %s", kMonths[(std::atoi(x.key.substr(5, 2).c_str()) + 11) % 12], x.key.substr(0, 4).c_str());
                     else if (period == 1) ImGui::Text("εβδ. από %s", DateGr(x.key).c_str());
-                    else ImGui::TextUnformatted(DateGr(x.key).c_str());
+                    else CellText(DateGr(x.key).c_str());
                     ImGui::TableNextColumn(); ImGui::Text("%s", Eur(x.due).c_str());
                     ImGui::TableNextColumn(); ImGui::TextColored(kColIn, "%s", Eur(x.paid).c_str());
                     ImGui::TableNextColumn(); ImGui::TextColored(x.owed > 0.005 ? kColOwed : kColMuted, "%s", Eur(x.owed).c_str());
@@ -5467,7 +5774,7 @@ static void DrawPaymentViewWindow() {
                 std::string s = "Πρόγραμμα δόσεων: " + pl.label + " · " + std::to_string(pl.paidInstallments) + "/" + std::to_string(pl.installments) +
                                 " εξοφλημένες · " + FormatMoney(pl.paid) + " / " + Eur(pl.total);
                 if (pl.receipt_id > 0) { if (ImGui::Selectable((s + " · απόδειξη εκδόθηκε").c_str())) OpenReceiptView(pl.receipt_id); }
-                else ImGui::TextUnformatted((s + (pl.receipt_mode == "end" ? " · απόδειξη με την τελευταία δόση" : " · απόδειξη ανά δόση")).c_str());
+                else CellText((s + (pl.receipt_mode == "end" ? " · απόδειξη με την τελευταία δόση" : " · απόδειξη ανά δόση")).c_str());
             }
         }
         ImGui::PopStyleColor();
@@ -5508,11 +5815,15 @@ static void DrawPaymentViewWindow() {
 
         ImGui::Separator();
         ImGui::Text("Ημερομηνία: %04d-%02d-%02d", p.year, p.month, p.day);
+        if (!p.created_at.empty()) ImGui::TextDisabled("Καταχωρήθηκε: %s", p.created_at.c_str());
         ImGui::Text("Οφειλόμενο: %s", Eur(p.amount_due).c_str());
         ImGui::Text("Πληρωμένο: %s", Eur(p.amount_paid).c_str());
         ImGui::Text("Κατάσταση: %s", p.status.c_str());
         if (p.status == "future" && !p.resolution_date.empty()) ImGui::Text("Ημ/νία επίλυσης: %s", p.resolution_date.c_str());
         if (!p.resolved_at.empty()) ImGui::TextDisabled("Επιλύθηκε στις: %s", p.resolved_at.c_str());
+        { std::vector<std::string> cc; std::vector<std::vector<std::string>> rr; std::string ee;
+          g_app.conn->executeRawQuery("SELECT completed_on FROM charges WHERE id = " + std::to_string(p.id), cc, rr, ee);
+          if (!rr.empty() && !rr[0][0].empty()) ImGui::Text("Ολοκληρώθηκε: %s", DateGr(rr[0][0]).c_str()); }
         if (!p.notes.empty()) ImGui::TextWrapped("Σημειώσεις: %s", p.notes.c_str());
         // the money behind this line (bills and payments are separate)
         auto money = g_app.conn->getMoneyForCharge(p.id);
@@ -5521,6 +5832,7 @@ static void DrawPaymentViewWindow() {
             for (auto& m : money) {
                 ImGui::Text("%s · %s (εδώ %s) · %s", m.pay_date.c_str(), Eur(m.amount).c_str(), Eur(m.allocated).c_str(),
                             m.method == "unspecified" ? "τρόπος —" : ReceiptMethodName(m.method).c_str());
+                if (!m.created_at.empty()) { ImGui::SameLine(); ImGui::TextDisabled("· καταχωρήθηκε %s", m.created_at.c_str()); }
                 if (m.receipt_id > 0) { ImGui::SameLine(); ImGui::PushID(m.id); if (ImGui::SmallButton("Απόδειξη")) OpenReceiptView(m.receipt_id); ImGui::PopID(); }
             }
         }
@@ -5613,7 +5925,7 @@ static const int kServicePickerPageSize = 20;
 // strip (jump to first letter), a name search, an A→Z / Z→A toggle, and paged
 // rows. Selecting a row sets `selectedUserId` and closes the popup.
 static void DrawUserFilterPicker(const char* label, int& selectedUserId, float width) {
-    ImGui::TextUnformatted(label);
+    CellText(label);
     ImGui::SameLine();
 
     std::string preview = (selectedUserId < 0) ? "Όλοι" : g_app.userName(selectedUserId);
@@ -5749,7 +6061,7 @@ static void DrawUserFilterPicker(const char* label, int& selectedUserId, float w
 // a name search and paged rows (no letter strip -- the user asked for a simple
 // searchable dropdown here).
 static void DrawServiceFilterPicker(const char* label, int& selectedServiceId, float width) {
-    ImGui::TextUnformatted(label);
+    CellText(label);
     ImGui::SameLine();
 
     std::string preview = (selectedServiceId < 0) ? "Όλες" : g_app.serviceLabel(selectedServiceId);
@@ -5870,7 +6182,7 @@ static void DrawDaySectionHeader(int year, int month, int day,
 
     ImGui::SetCursorPos(ImVec2(14, 8));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.91f, 0.98f, 1.0f));
-    ImGui::TextUnformatted(dateBuf);
+    CellText(dateBuf);
     ImGui::PopStyleColor();
 
     ImGui::SetCursorPos(ImVec2(std::max(200.0f, w - 170.0f), 8));
@@ -5907,7 +6219,7 @@ static void DrawTimelineRow(const Payment& p, bool faded) {
 
     // Middle, line 1: owner name
     ImGui::SetCursorPos(ImVec2(44, 8));
-    ImGui::TextUnformatted(g_app.userName(p.user_id).c_str());
+    CellText(g_app.userName(p.user_id).c_str());
 
     // Middle, line 2: service · direction · optional future marker · optional note
     ImGui::SetCursorPos(ImVec2(44, 30));
@@ -5917,7 +6229,7 @@ static void DrawTimelineRow(const Payment& p, bool faded) {
     sub += isOut ? "Πληρωμή" : "Είσπραξη";
     if (p.status == "future") sub += "  ·  ⏱ Μελλοντική";
     if (!p.notes.empty()) { sub += "  ·  "; sub += p.notes; }
-    ImGui::TextUnformatted(sub.c_str());
+    CellText(sub.c_str());
     ImGui::PopStyleColor();
 
     // Right: amount (paid if resolved, due if future)
@@ -5941,8 +6253,6 @@ static void DrawDashboardScreen() {
 
     // --- Header: reminders + refresh -----------------------------------
     if (ImGui::Button(("[!] Υπενθυμίσεις (" + std::to_string(future.size()) + ")").c_str())) g_showNotifPopup = true;
-    ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) { g_dashPageOffset = 0; g_dashScrollToBoundary = true; }
 
     static bool notifOpen = false;
     if (g_showNotifPopup) {
@@ -6078,7 +6388,7 @@ static void DrawDashboardScreen() {
             ImGui::EndTable();
         }
         const double cashNow = MoneySub(tot.collected, tot.paidOut), cashAll = FromCents(ToCents(cashNow) + ToCents(owedToUs) - ToCents(weOwe));
-        ImGui::Text("Ταμείο (εισπράξεις - πληρωμές):"); ImGui::SameLine(); ImGui::TextColored(cashNow >= 0 ? kColIn : kColOut, "%s", Eur(cashNow).c_str());
+        ImGui::Text("Αποθεματικό (εισπράξεις - πληρωμές):"); ImGui::SameLine(); ImGui::TextColored(cashNow >= 0 ? kColIn : kColOut, "%s", Eur(cashNow).c_str());
         ImGui::SameLine(0, 28); ImGui::Text("Όταν τακτοποιηθούν όλα (+ οφειλές - οφειλόμενα):"); ImGui::SameLine(); ImGui::TextColored(cashAll >= 0 ? kColIn : kColOut, "%s", Eur(cashAll).c_str());
         ImGui::TextDisabled("Με τα φίλτρα από πάνω (ημερομηνίες, πελάτης, υπηρεσία). Η λίστα από κάτω δείχνει τις πρόσφατες κινήσεις.");
     }
@@ -6400,7 +6710,7 @@ static bool SqHit(const std::string& hay, const std::string& needle) { return ne
 // Draws `text` with every part that matches one of `needles` lit in yellow. Matching is
 // done on the Greek-folded text; the fold keeps byte lengths, so the positions carry over.
 static void SqText(const std::string& text, const std::vector<std::string>& needles) {
-    if (text.empty()) { ImGui::TextUnformatted(""); return; }
+    if (text.empty()) { CellText(""); return; }
     std::string f = FoldGreek(text);
     std::vector<std::pair<size_t, size_t>> rng;
     for (auto& n0 : needles) {
@@ -6409,14 +6719,14 @@ static void SqText(const std::string& text, const std::vector<std::string>& need
         if (n.empty()) continue;
         for (size_t pos = 0; (pos = f.find(n, pos)) != std::string::npos; pos += n.size()) rng.push_back({ pos, pos + n.size() });
     }
-    if (rng.empty() || f.size() != text.size()) { ImGui::TextUnformatted(text.c_str()); return; }
+    if (rng.empty() || f.size() != text.size()) { CellText(text.c_str()); return; }
     std::sort(rng.begin(), rng.end());
     std::vector<std::pair<size_t, size_t>> merged;
     for (auto& r : rng) { if (!merged.empty() && r.first <= merged.back().second) merged.back().second = std::max(merged.back().second, r.second); else merged.push_back(r); }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float lineH = ImGui::GetTextLineHeight();
     size_t pos = 0; bool onLine = false;
-    auto plain = [&](size_t a, size_t b) { if (b <= a) return; if (onLine) ImGui::SameLine(0, 0); ImGui::TextUnformatted(text.substr(a, b - a).c_str()); onLine = true; };
+    auto plain = [&](size_t a, size_t b) { if (b <= a) return; if (onLine) ImGui::SameLine(0, 0); CellText(text.substr(a, b - a).c_str()); onLine = true; };
     for (auto& m : merged) {
         plain(pos, m.first);
         if (onLine) ImGui::SameLine(0, 0);
@@ -6424,7 +6734,7 @@ static void SqText(const std::string& text, const std::vector<std::string>& need
         ImVec2 p = ImGui::GetCursorScreenPos(), sz = ImGui::CalcTextSize(seg.c_str());
         dl->AddRectFilled(ImVec2(p.x - 1, p.y), ImVec2(p.x + sz.x + 1, p.y + lineH), IM_COL32(255, 214, 40, 235), 3.0f);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.08f, 0.10f, 1.0f));
-        ImGui::TextUnformatted(seg.c_str());
+        CellText(seg.c_str());
         ImGui::PopStyleColor();
         onLine = true; pos = m.second;
     }
@@ -6508,11 +6818,11 @@ static void SqCompute(int cat, bool form, const std::string& quick, SqResults& o
         }
         for (auto& u : g_app.users) {
             std::string blob = u.full_name + " " + u.phone + " " + u.special_code + " " + u.address + " " + u.area + " " + u.postal_code + " " + u.apartment +
-                               " " + u.email + " " + u.afm + " " + KindLabel(u.kind) + " " + std::to_string(u.id);
+                               " " + u.email + " " + u.afm + " " + KindLabel(u.kind) + " " + std::to_string(u.id) + " " + u.code + " " + u.manager_name + " " + ExtraText(u.extra_json);
             if (u.resident) continue;                      // residents are found in Διαχείριση, not among the clients
             if (!SqHit(blob, quick)) continue;
             if (form) {
-                if (!SqHit(u.full_name, sq_u_name) || !SqHit(u.phone, sq_u_phone) || !SqHit(u.special_code, sq_u_code) ||
+                if (!SqHit(u.full_name, sq_u_name) || !SqHit(u.phone, sq_u_phone) || !SqHit(u.special_code + " " + u.code, sq_u_code) ||
                     !SqHit(u.address, sq_u_addr) || !SqHit(u.area, sq_u_area) || !SqHit(u.postal_code, sq_u_postal) ||
                     !SqHit(u.apartment, sq_u_apt)) continue;
                 if (sq_u_hasApt == 1 && u.apartment_id < 0) continue;
@@ -7150,8 +7460,8 @@ static void DrawSearchScreen() {
                 ImGui::TableSetColumnIndex(1);
                 if (SqLinkCell(m.title, hl)) { if (m.kind == 0) OpenResident(m.user); else OpenMgmtAction(m.bid, m.key); }
                 ImGui::TableSetColumnIndex(2); SqCell(m.kind == 0 ? m.line2.substr(0, m.line2.find("  ·  ")) : m.building, hl);
-                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(m.date.empty() ? "—" : DateGr(m.date).c_str());
-                ImGui::TableSetColumnIndex(4); if (m.kind == 0) ImGui::TextDisabled("—"); else ImGui::TextUnformatted(Eur(m.amount).c_str());
+                ImGui::TableSetColumnIndex(3); CellText(m.date.empty() ? "—" : DateGr(m.date).c_str());
+                ImGui::TableSetColumnIndex(4); if (m.kind == 0) ImGui::TextDisabled("—"); else CellText(Eur(m.amount).c_str());
                 ImGui::TableSetColumnIndex(5); if (m.owed > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(m.owed).c_str()); else ImGui::TextDisabled("—");
                 ImGui::PopID();
             }
@@ -7283,8 +7593,8 @@ static void DrawSearchScreen() {
                 ImGui::TableSetColumnIndex(3); SqCell(uit != cx.userById.end() && !uit->second->address.empty() ? uit->second->address : "—", hl);
                 ImGui::TableSetColumnIndex(4); ImGui::TextColored(DirectionColor(p.direction), "%s", DirectionBadge(p.direction));
                 ImGui::TableSetColumnIndex(5); StatusCell(p);
-                ImGui::TableSetColumnIndex(6); ImGui::TextUnformatted(Eur(p.amount_due).c_str());
-                ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(Eur(p.amount_paid).c_str());
+                ImGui::TableSetColumnIndex(6); CellText(Eur(p.amount_due).c_str());
+                ImGui::TableSetColumnIndex(7); CellText(Eur(p.amount_paid).c_str());
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -7315,7 +7625,7 @@ static void DrawSearchScreen() {
                 ImGui::PushStyleColor(ImGuiCol_Text, link);
                 if (ImGui::Selectable(no, false, ImGuiSelectableFlags_SpanAllColumns)) OpenReceiptView(r.id);
                 ImGui::PopStyleColor();
-                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(DateGr(r.issue_date).c_str());
+                ImGui::TableSetColumnIndex(1); CellText(DateGr(r.issue_date).c_str());
                 ImGui::TableSetColumnIndex(2); SqCell(r.user_id > 0 ? g_app.userName(r.user_id) : "—", hl);
                 std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref;
                 if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
@@ -7370,8 +7680,8 @@ static void DrawSearchScreen() {
                 ImGui::TableSetColumnIndex(0); ImGui::PushStyleColor(ImGuiCol_Text, link);
                 if (ImGui::Selectable(o.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) OpenOffersPage();
                 ImGui::PopStyleColor();
-                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(OfferValueText(o).c_str());
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(o.user_id > 0 ? g_app.userName(o.user_id).c_str() : "Όλοι οι πελάτες");
+                ImGui::TableSetColumnIndex(1); CellText(OfferValueText(o).c_str());
+                ImGui::TableSetColumnIndex(2); CellText(o.user_id > 0 ? g_app.userName(o.user_id).c_str() : "Όλοι οι πελάτες");
                 ImGui::TableSetColumnIndex(3); ImGui::Text("%s - %s", DateGr(o.valid_from).c_str(), DateGr(o.valid_to).c_str());
                 ImGui::TableSetColumnIndex(4); { ImVec4 oc; std::string st = OfferStateText(o, oc); ImGui::TextColored(oc, "%s", st.c_str()); }
                 ImGui::PopID();
@@ -7394,7 +7704,7 @@ static void DrawSearchScreen() {
                 if (ImGui::Selectable(n.title.empty() ? "(χωρίς τίτλο)" : n.title.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) OpenNoteFromSearch(n);
                 ImGui::PopStyleColor();
                 ImGui::TableSetColumnIndex(1); SqCell(n.content.substr(0, 200), hl);
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(DateGr(n.created_at.substr(0, 10)).c_str());
+                ImGui::TableSetColumnIndex(2); CellText(DateGr(n.created_at.substr(0, 10)).c_str());
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -7406,8 +7716,6 @@ static void DrawSearchScreen() {
 
 static void DrawNotesScreen() {
     if (ImGui::Button("+ Νέα Σημείωση")) OpenAddNote();
-    ImGui::SameLine();
-    if (ImGui::Button("Ανανέωση")) g_app.reloadNotes();
     ImGui::Separator();
 
     ImGui::BeginChild("notecards", ImVec2(0, 0), false);
@@ -7924,7 +8232,7 @@ static void DrawNodeGraphOverlay() {
             return cur + "...";
         };
         float cellMaxW = kNodeSize.x - 40.0f;
-        ImGui::TextUnformatted((std::string("Στήλες: ") + std::to_string(n.cols.size()) + "   Σειρές: " + std::to_string(n.total)).c_str());
+        CellText((std::string("Στήλες: ") + std::to_string(n.cols.size()) + "   Σειρές: " + std::to_string(n.total)).c_str());
         {
             std::string header;
             for (size_t c = 0; c < n.cols.size(); c++) header += (c ? " | " : "") + n.cols[c];
@@ -8044,17 +8352,17 @@ static void DrawAuditLogWindow() {
     ImGui::BeginChild("auditScroll", ImVec2(0, 0), true);
     if (g_auditShowDb) {
         ImGui::TextDisabled("-- Βάση: όλες οι ενέργειες, χωρίς φίλτρο --");
-        for (auto& a : g_app.conn->getTimelineActions("", 0, 300, "", false)) ImGui::TextUnformatted(a.c_str());
+        for (auto& a : g_app.conn->getTimelineActions("", 0, 300, "", false)) CellText(a.c_str());
         ImGui::Spacing();
     }
     if (g_auditShowBusiness) {
         ImGui::TextDisabled("-- Επιχείρηση: αλλαγές σε χρήστες/υπηρεσίες/πληρωμές --");
-        for (auto& a : g_app.conn->getTimelineActions("", 0, 300, "business", false)) ImGui::TextUnformatted(a.c_str());
+        for (auto& a : g_app.conn->getTimelineActions("", 0, 300, "business", false)) CellText(a.c_str());
         ImGui::Spacing();
     }
     if (g_auditShowApp) {
         ImGui::TextDisabled("-- Ειδοποιήσεις: ίδιες ενέργειες, σε απλή γλώσσα --");
-        for (auto& a : g_app.conn->getTimelineActions("", 0, 300, "business", true)) ImGui::TextUnformatted(a.c_str());
+        for (auto& a : g_app.conn->getTimelineActions("", 0, 300, "business", true)) CellText(a.c_str());
     }
     if (!g_auditShowDb && !g_auditShowBusiness && !g_auditShowApp) {
         ImGui::TextDisabled("Επιλέξτε τουλάχιστον μία κατηγορία παραπάνω.");
@@ -8101,8 +8409,8 @@ static void DrawErrorLogWindow() {
                 auto& r = rows[i];
                 if (filter[0] && !SubstrCI(r.message, filter) && !SubstrCI(r.source, filter) && !SubstrCI(r.time, filter)) continue;
                 ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(r.time.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(r.source.c_str());
+                ImGui::TableNextColumn(); CellText(r.time.c_str());
+                ImGui::TableNextColumn(); CellText(r.source.c_str());
                 ImGui::TableNextColumn(); ImGui::TextWrapped("%s", r.message.c_str());
             }
             ImGui::EndTable();
@@ -8129,25 +8437,27 @@ static void DrawArchiveWindow() {
     ImGui::SetNextItemWidth(320);
     if (ImGui::InputTextWithHint("##arq", "Αναζήτηση σε τίτλο, είδος ή περιεχόμενο...", q, sizeof(q))) m.g.pager.Reset();
     if (!msg.empty()) { ImGui::SameLine(); ImGui::TextColored(kColIn, "%s", msg.c_str()); }
-    const auto& pg = m.Load(q, [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageDeletions(q, MapSort(s, { { AR_DATE, 0 }, { AR_KIND, 1 }, { AR_TITLE, 2 }, { AR_STATUS, 3 } }), off, lim); },
-                               [&] { return g_app.conn->countDeletions(q); });
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadT(q, [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageDeletions(q, MapSort(s, { { AR_DATE, 0 }, { AR_KIND, 1 }, { AR_TITLE, 2 }, { AR_STATUS, 3 } }), off, lim); },
+                               [&] { return g_app.conn->countDeletions(q); },
+        [](const DataConn::DeletionRow& r, int c) -> std::string { switch (c) { case AR_DATE: return r.deleted_at; case AR_KIND: return r.entity; case AR_TITLE: return r.label; case AR_STATUS: return !r.restored_at.empty() ? "επαναφέρθηκε" : r.hidden ? "κρυμμένο" : "αρχειοθετημένο"; default: return ""; } }, AR_COUNT);
     if (ImGui::BeginTable("archive", AR_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
                           ImVec2(0, std::max(120.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.2f)))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(m.g.order, cols);
-        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager);
+        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager, &m.g.cf, &m.distinct);
         auto P = [&](int c) { return ListPos(m.g.order, c); };
         for (auto& r : pg.rows) {
             ImGui::PushID(r.id); ImGui::TableNextRow();
             const char* kind = r.entity == "service" ? "Υπηρεσία" : r.entity == "partner" ? "Συνεργάτης" : r.entity == "note" ? "Σημείωση" :
                                r.entity == "charge" ? "Χρέωση" : r.entity == "building" ? "Πολυκατοικία" : r.entity == "apartment" ? "Διαμέρισμα" :
                                r.entity == "payment" ? "Πληρωμή" : r.entity == "user" ? "Πελάτης" : r.entity.c_str();
-            ImGui::TableSetColumnIndex(P(AR_DATE)); ImGui::TextUnformatted(r.deleted_at.c_str());
-            ImGui::TableSetColumnIndex(P(AR_KIND)); ImGui::TextUnformatted(kind);
-            ImGui::TableSetColumnIndex(P(AR_TITLE)); ImGui::TextUnformatted(r.label.c_str());
+            ImGui::TableSetColumnIndex(P(AR_DATE)); CellText(r.deleted_at.c_str());
+            ImGui::TableSetColumnIndex(P(AR_KIND)); CellText(kind);
+            ImGui::TableSetColumnIndex(P(AR_TITLE)); CellText(r.label.c_str());
             if (ImGui::IsItemHovered() && !r.snapshot.empty()) {
                 ImGui::BeginTooltip(); ImGui::PushTextWrapPos(560);
-                ImGui::TextUnformatted(r.snapshot.size() > 1500 ? (r.snapshot.substr(0, 1500) + "…").c_str() : r.snapshot.c_str());
+                CellText(r.snapshot.size() > 1500 ? (r.snapshot.substr(0, 1500) + "…").c_str() : r.snapshot.c_str());
                 ImGui::PopTextWrapPos(); ImGui::EndTooltip();
             }
             ImGui::TableSetColumnIndex(P(AR_STATUS));
@@ -8190,6 +8500,17 @@ static void DrawSettingsScreen() {
             "Αποθηκεύτηκε. Κλείστε και ανοίξτε ξανά την εφαρμογή για να εφαρμοστεί.");
     }
     ImGui::Separator();
+    // on its own line: at the end of the row below it ran off the window
+    {
+        const bool onEmpty = g_app.dbPath.size() >= 8 && g_app.dbPath.compare(g_app.dbPath.size() - 8, 8, "empty.db") == 0;
+        if (ImGui::Button(onEmpty ? "Επιστροφή στην πλήρη βάση" : "Χρήση βάσης 2 (κενή)"))
+            RequestConfirm("Αλλαγή βάσης", { {"Βάση", onEmpty ? "κενή (empty.db)" : "πλήρης", onEmpty ? "πλήρης" : "κενή (empty.db)"} }, []() {
+                if (SwitchDatabaseAndRelaunch(g_app.dbPath) && g_glfwWindow) glfwSetWindowShouldClose(g_glfwWindow, GLFW_TRUE);
+            });
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Κλείνει το πρόγραμμα και το ανοίγει ξανά με την άλλη βάση.\nΗ βάση 2 έχει την ίδια δομή αλλά είναι κενή: ξεκινάτε από το μηδέν.\nΗ πλήρης βάση δεν αλλάζει.");
+        ImGui::SameLine(); ImGui::TextColored(onEmpty ? kColOwed : kColMuted, "%s", onEmpty ? "(τώρα: κενή βάση 2)" : "(τώρα: πλήρης βάση)");
+    }
+    ImGui::Separator();
     if (ImGui::Button("Αντίγραφο ασφαλείας (CSV)")) {
 #ifdef _WIN32
         std::string folder = PickFolderDialogWin32();
@@ -8207,16 +8528,6 @@ static void DrawSettingsScreen() {
     if (ImGui::Button("Χρονολόγιο Ενεργειών")) g_showAuditWindow = true;
     ImGui::SameLine();
     if (ImGui::Button("Αρχείο διαγραφών")) g_showArchive = true;
-    ImGui::SameLine();
-    {
-        const bool onEmpty = g_app.dbPath.size() >= 8 && g_app.dbPath.compare(g_app.dbPath.size() - 8, 8, "empty.db") == 0;
-        if (ImGui::Button(onEmpty ? "Επιστροφή στην πλήρη βάση" : "Χρήση βάσης 2 (κενή)"))
-            RequestConfirm("Αλλαγή βάσης", { {"Βάση", onEmpty ? "κενή (empty.db)" : "πλήρης", onEmpty ? "πλήρης" : "κενή (empty.db)"} }, []() {
-                if (SwitchDatabaseAndRelaunch(g_app.dbPath) && g_glfwWindow) glfwSetWindowShouldClose(g_glfwWindow, GLFW_TRUE);
-            });
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Κλείνει το πρόγραμμα και το ανοίγει ξανά με την άλλη βάση.\nΗ βάση 2 έχει την ίδια δομή αλλά είναι κενή: ξεκινάτε από το μηδέν.\nΗ πλήρης βάση δεν αλλάζει.");
-        ImGui::SameLine(); ImGui::TextColored(onEmpty ? kColOwed : kColMuted, "%s", onEmpty ? "(τώρα: κενή βάση 2)" : "(τώρα: πλήρης βάση)");
-    }
     ImGui::SameLine();
     if (ImGui::Button("Αρχείο σφαλμάτων")) { g_showErrorLog = true; g_errorLogStamp = -1; }
 
@@ -8277,7 +8588,7 @@ static void DrawSettingsScreen() {
                 ImGui::TableHeadersRow();
                 for (auto& row : g_sqlRows) {
                     ImGui::TableNextRow();
-                    for (size_t i = 0; i < row.size(); i++) { ImGui::TableSetColumnIndex((int)i); ImGui::TextUnformatted(row[i].c_str()); }
+                    for (size_t i = 0; i < row.size(); i++) { ImGui::TableSetColumnIndex((int)i); CellText(row[i].c_str()); }
                 }
                 ImGui::EndTable();
             }
@@ -8378,7 +8689,7 @@ static void DrawErrorBanner() {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.45f, 0.10f, 0.12f, 0.96f));
     if (ImGui::Begin("##dberror", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing)) {
-        ImGui::TextUnformatted("Σφάλμα βάσης δεδομένων:");
+        CellText("Σφάλμα βάσης δεδομένων:");
         ImGui::SameLine(); ImGui::TextWrapped("%s", g_errorText.c_str());
         ImGui::SameLine(); if (ImGui::SmallButton("Κλείσιμο")) g_errorText.clear();
     }
@@ -8456,8 +8767,8 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
     if (g_rcPackage > 0)  cond(DataConn::ReceiptCond::Field::Package, g_rcPackage);
     if (g_rcBuilding > 0) cond(DataConn::ReceiptCond::Field::Building, g_rcBuilding);
     if (g_rcMethod >= 0)  cond(DataConn::ReceiptCond::Field::Method, -1, kReceiptMethodCodes[g_rcMethod]);
-    static GridState rcGrid;l
-    if (rcGrid.order.empty()) rcGrid.order = { 0, 1, 2, 7, 3, 4, 5, 6, 8 };
+    static GridState rcGrid;
+    if (rcGrid.order.empty()) rcGrid.order = { 0, 1, 9, 2, 7, 3, 4, 5, 6, 8 };
     q.sort = rcGrid.sort.keys;
     std::string key = std::string(kindFilter) + "#" + SortKeyStr(q.sort) + "#" + g_rcFrom + "|" + g_rcTo + "|" + std::to_string(g_rcStatus) + "|" + q.number + "|" +
                       std::to_string(g_rcClient) + "|" + std::to_string(g_rcService) + "|" + std::to_string(g_rcPackage) + "|" +
@@ -8473,13 +8784,33 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
         return r;
     });
 
-    ImGui::Text("%lld αποδείξεις", pg.count);
+    static std::map<std::string, ListModel<Receipt>> rcM; ListModel<Receipt>& rm = rcM[kindFilter];
+    std::vector<Receipt> rcRows = pg.rows; int rcTotal = (int)pg.count;
+    DrawListSearch(rm.g);
+    { Pager rcP; rcP.offset = g_rcOffset; rcP.pageSize = kRcPage;
+      rm.Override(rcP, q.sort, key, [&](const SortSpec& ss, int off, int lim) { DataConn::ReceiptQuery qq = q; qq.sort = ss; return g_app.conn->searchReceipts(qq, off, lim); },
+        [managedView](const Receipt& r, int c) -> std::string {
+            const std::string status = r.status == "void" ? "ΑΚΥΡΩΜΕΝΗ" : "σε ισχύ", who = r.user_id > 0 ? g_app.userName(r.user_id) : std::string();
+            std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref; if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
+            if (c == 0) return ReceiptNo(r);
+            if (c == 1) return DateGr(r.issue_date);
+            if (c == 9) return r.created_at;
+            if (managedView) {
+                if (c == 2) { static std::map<int, std::string> bld; auto it = bld.find(r.id);          // a receipt never changes its building
+                              if (it == bld.end()) { std::string addr; for (auto& l : g_app.conn->getReceiptLines(r.id)) if (l.charge.joint_op_id > 0) { addr = g_app.conn->getJointOpById(l.charge.joint_op_id).building_address; break; } it = bld.emplace(r.id, addr).first; }
+                              return it->second; }
+                switch (c) { case 3: return who; case 4: return ReceiptMethodName(r.method); case 5: return refs; case 6: return Eur(r.total); case 7: return status; default: return ""; }
+            }
+            switch (c) { case 2: return who; case 3: return ReceiptMethodName(r.method); case 4: return refs; case 5: return Eur(r.total); case 6: return status; case 7: return r.kind == "joint" ? "Κοινόχρηστα" : "Προσωπική χρήση"; default: return ""; } },
+        10, rcRows, rcTotal);
+      g_rcOffset = rcP.offset; }
+    ImGui::Text("%d αποδείξεις", rcTotal);
     ImGui::SameLine(); ImGui::TextDisabled("·  σύνολο σε ισχύ: %s", Eur(pg.total).c_str());
     ImGui::SameLine(0, 30);
     if (ImGui::SmallButton("◄") && g_rcOffset > 0) g_rcOffset = std::max(0, g_rcOffset - kRcPage);
-    ImGui::SameLine(); ImGui::Text("%d-%d", pg.count ? g_rcOffset + 1 : 0, (int)std::min<long long>(pg.count, g_rcOffset + kRcPage));
+    ImGui::SameLine(); ImGui::Text("%d-%d", rcTotal ? g_rcOffset + 1 : 0, std::min(rcTotal, g_rcOffset + kRcPage));
     ImGui::SameLine();
-    if (ImGui::SmallButton("►") && g_rcOffset + kRcPage < pg.count) g_rcOffset += kRcPage;
+    if (ImGui::SmallButton("►") && g_rcOffset + kRcPage < rcTotal) g_rcOffset += kRcPage;
 
     
     
@@ -8497,10 +8828,10 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
     if (managedView) {
         static Cached<std::map<int, RecInfo>> recInfoCache;
         std::string infoKey;
-        for (auto& r : pg.rows) infoKey += std::to_string(r.id) + ",";
+        for (auto& r : rcRows) infoKey += std::to_string(r.id) + ",";
         recInfo = recInfoCache.get(infoKey, [&] {
             std::map<int, RecInfo> m;
-            for (auto& r : pg.rows) {
+            for (auto& r : rcRows) {
                 RecInfo x;
                 for (auto& l : g_app.conn->getReceiptLines(r.id)) {
                     const Payment& ch = l.charge;
@@ -8536,7 +8867,7 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
         });
     }
 
-    static const ListColDef rcColsManaged[9] = {
+    static const ListColDef rcColsManaged[10] = {
         { "Αριθμός",       ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
         { "Ημ/νία",        ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
         { "Πολυκατοικία",  ImGuiTableColumnFlags_WidthStretch, 1.8f,   true },
@@ -8545,8 +8876,9 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
         { "Αναφορές",      ImGuiTableColumnFlags_WidthStretch, 1.4f,   true },
         { "Σύνολο",        ImGuiTableColumnFlags_WidthFixed,   100.0f, true },
         { "Κατάσταση",     ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
-        { "",              ImGuiTableColumnFlags_WidthFixed,    80.0f, false } };
-    static const ListColDef rcColsClients[9] = {
+        { "",              ImGuiTableColumnFlags_WidthFixed,    80.0f, false },
+        { "Καταχωρήθηκε",  ImGuiTableColumnFlags_WidthFixed,   150.0f, true } };
+    static const ListColDef rcColsClients[10] = {
         { "Αριθμός",   ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
         { "Ημ/νία",    ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
         { "Πελάτης",   ImGuiTableColumnFlags_WidthStretch, 1.8f,   true },
@@ -8555,48 +8887,50 @@ static void DrawReceiptsScreen(const char* kindFilter = "") {
         { "Σύνολο",    ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
         { "Κατάσταση", ImGuiTableColumnFlags_WidthFixed,   130.0f, true },
         { "Για",       ImGuiTableColumnFlags_WidthFixed,   160.0f, true },
-        { "",          ImGuiTableColumnFlags_WidthFixed,    90.0f, false } };
+        { "",          ImGuiTableColumnFlags_WidthFixed,    90.0f, false },
+        { "Καταχωρήθηκε", ImGuiTableColumnFlags_WidthFixed, 150.0f, true } };
     const ListColDef* rcCols = managedView ? rcColsManaged : rcColsClients;
-    if (ImGui::BeginTable("rctable", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable)) {
+    if (ImGui::BeginTable("rctable", 10, ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(rcGrid.order, rcCols);
         if (!managedView) ImGui::TableSetColumnEnabled(ListPos(rcGrid.order, 7), kindFilter[0] == 0);   // "Για" only when unfiltered
-        ListHeaderRow(rcGrid.order, rcCols, rcGrid.sort, rcGrid.pager);
+        ListHeaderRow(rcGrid.order, rcCols, rcGrid.sort, rcGrid.pager, &rm.g.cf, &rm.distinct);
         if (rcGrid.pager.offset != 0) { rcGrid.pager.Reset(); g_rcOffset = 0; }
         auto P = [&](int c) { return ListPos(rcGrid.order, c); };
-        for (auto& r : pg.rows) {
+        for (auto& r : rcRows) {
             bool isVoid = r.status == "void";
             ImGui::PushID(r.id); ImGui::TableNextRow();
             if (isVoid) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.58f, 1));
             ImGui::TableSetColumnIndex(P(0));
             if (ImGui::Selectable(ReceiptNo(r).c_str(), g_receiptViewId == r.id, ImGuiSelectableFlags_SpanAllColumns)) OpenReceiptView(r.id);
-            ImGui::TableSetColumnIndex(P(1)); ImGui::TextUnformatted(DateGr(r.issue_date).c_str());
+            ImGui::TableSetColumnIndex(P(1)); CellText(DateGr(r.issue_date).c_str());
+            ImGui::TableSetColumnIndex(P(9)); CellText(r.created_at.c_str());
             if (managedView) {
                 const auto& x = recInfo[r.id];
-                ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(x.building.empty() ? "—" : x.building.c_str());
-                ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(x.recipient.empty() ? "—" : x.recipient.c_str());
-                ImGui::TableSetColumnIndex(P(4)); ImGui::TextUnformatted(ReceiptMethodName(r.method).c_str());
+                ImGui::TableSetColumnIndex(P(2)); CellText(x.building.empty() ? "—" : x.building.c_str());
+                ImGui::TableSetColumnIndex(P(3)); CellText(x.recipient.empty() ? "—" : x.recipient.c_str());
+                ImGui::TableSetColumnIndex(P(4)); CellText(ReceiptMethodName(r.method).c_str());
                 ImGui::TableSetColumnIndex(P(5));
                 std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref;
                 if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
-                ImGui::TextUnformatted(refs.c_str());
+                CellText(refs.c_str());
                 ImGui::TableSetColumnIndex(P(6)); ImGui::Text("%s", Eur(r.total).c_str());
                 ImGui::TableSetColumnIndex(P(7));
                 if (isVoid) ImGui::TextColored(kColOut, "ΑΚΥΡΩΜΕΝΗ");
                 else ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.50f, 1), "σε ισχύ");
                 ImGui::TableSetColumnIndex(P(8)); if (ImGui::SmallButton("Προβολή")) OpenReceiptView(r.id);
             } else {
-                ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(r.user_id > 0 ? g_app.userName(r.user_id).c_str() : "—");
-                ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(ReceiptMethodName(r.method).c_str());
+                ImGui::TableSetColumnIndex(P(2)); CellText(r.user_id > 0 ? g_app.userName(r.user_id).c_str() : "—");
+                ImGui::TableSetColumnIndex(P(3)); CellText(ReceiptMethodName(r.method).c_str());
                 ImGui::TableSetColumnIndex(P(4));
                 std::string refs = r.paper_ref.empty() ? "" : "χειρ. " + r.paper_ref;
                 if (!r.bank_ref.empty()) refs += (refs.empty() ? "" : " · ") + r.bank_ref;
-                ImGui::TextUnformatted(refs.c_str());
+                CellText(refs.c_str());
                 ImGui::TableSetColumnIndex(P(5)); ImGui::Text("%s", Eur(r.total).c_str());
                 ImGui::TableSetColumnIndex(P(6));
                 if (isVoid) ImGui::TextColored(kColOut, "ΑΚΥΡΩΜΕΝΗ");
                 else ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.50f, 1), "σε ισχύ");
-                if (ImGui::TableSetColumnIndex(P(7))) ImGui::TextUnformatted(r.kind == "joint" ? "Κοινόχρηστα" : "Προσωπική χρήση");
+                if (ImGui::TableSetColumnIndex(P(7))) CellText(r.kind == "joint" ? "Κοινόχρηστα" : "Προσωπική χρήση");
                 ImGui::TableSetColumnIndex(P(8)); if (ImGui::SmallButton("Προβολή")) OpenReceiptView(r.id);
             }
             if (isVoid) ImGui::PopStyleColor();
@@ -8622,6 +8956,23 @@ static void DrawReceiptViewWindow() {
     const auto& money = std::get<2>(data);
     if (r.id < 0) { g_showReceiptView = false; return; }
 
+    // what each line was for and who gets the money: a client's money is ours; a resident's goes to the fund, a fee to us
+    static Cached<std::vector<std::string>> whatCache;
+    const auto& whatFor = whatCache.get(std::to_string(g_receiptViewId), [&] {
+        std::vector<std::string> v;
+        for (auto& l : lines) {
+            std::string what = ChargeLabel(l.charge), to = "προς εμάς";
+            if (l.charge.notes.rfind("Πακέτο:", 0) == 0) what += "  (" + l.charge.notes + ")";
+            if (l.charge.joint_op_id > 0) {
+                JointOp op = g_app.conn->getJointOpById(l.charge.joint_op_id);
+                if (!op.label.empty()) what = op.label;
+                if (!op.building_address.empty()) what += "  · " + op.building_address;
+                to = op.kind == "fee" ? "προς εμάς (αμοιβή διαχείρισης)" : op.kind == "monthly" ? "για τα έξοδα της πολυκατοικίας" : "προς το αποθεματικό της πολυκατοικίας";
+            }
+            v.push_back(what + "  → " + to);
+        }
+        return v; });
+
     ImGui::SetNextWindowSize(ImVec2(720, 560), ImGuiCond_FirstUseEver);
     std::string title = "Απόδειξη " + ReceiptNo(r) + "###receiptview";
     if (!ImGui::Begin(title.c_str(), &g_showReceiptView, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
@@ -8634,6 +8985,7 @@ static void DrawReceiptViewWindow() {
     if (isVoid) ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1), "[ ΑΚΥΡΩΜΕΝΗ ]");
     else ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.50f, 1), "[ σε ισχύ ]");
     ImGui::Text("%s  ·  %s", r.issue_date.c_str(), r.user_id > 0 ? g_app.userName(r.user_id).c_str() : "—");
+    if (!r.created_at.empty()) { ImGui::SameLine(); ImGui::TextDisabled("· καταχωρήθηκε %s", r.created_at.c_str()); }
     ImGui::TextColored(r.kind == "joint" ? ImVec4(0.95f, 0.75f, 0.30f, 1) : ImVec4(0.55f, 0.80f, 0.95f, 1), "Είδος: %s", r.kind == "joint" ? "κοινόχρηστα (μερίδια πολυκατοικίας)" : "προσωπική χρήση (δικές του υπηρεσίες)");
     ImGui::Text("Τρόπος: %s", ReceiptMethodName(r.method).c_str());
     if (!r.bank_ref.empty()) { ImGui::SameLine(); ImGui::TextDisabled("·  Αναφορά: %s", r.bank_ref.c_str()); }
@@ -8653,11 +9005,12 @@ static void DrawReceiptViewWindow() {
             ImGui::TableSetupColumn("Περιγραφή", ImGuiTableColumnFlags_WidthStretch, 3.0f);
             ImGui::TableSetupColumn("Ποσό", ImGuiTableColumnFlags_WidthFixed, 100);
             ImGui::TableHeadersRow();
-            for (auto& l : lines) {
+            for (size_t li = 0; li < lines.size(); li++) {
+                const auto& l = lines[li];
                 ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(l.charge.year, l.charge.month, l.charge.day).c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(ChargeLabel(l.charge).c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(l.amount).c_str());
+                ImGui::TableNextColumn(); CellText(DateGr(l.charge.year, l.charge.month, l.charge.day).c_str());
+                ImGui::TableNextColumn(); CellText(whatFor[li].c_str());
+                ImGui::TableNextColumn(); CellText(Eur(l.amount).c_str());
             }
             ImGui::EndTable();
         }
@@ -8744,7 +9097,7 @@ static void DrawRecordPaymentDialog() {
     static int lastUser = -2;
     if (lastUser != g_rpUser) { g_rpAlloc.clear(); lastUser = g_rpUser; }
     if (!g_rpPreset.empty()) { for (auto& [cid, v] : g_rpPreset) g_rpAlloc[cid].set(FormatMoney(v)); g_rpPreset.clear(); }
-    ImGui::TextUnformatted("Ημερομηνία:"); ImGui::SameLine(); DatePicker("rpdate", g_rpDate, ImVec2(0, 1));
+    CellText("Ημερομηνία:"); ImGui::SameLine(); DatePicker("rpdate", g_rpDate, ImVec2(0, 1));
     ImGui::SetNextItemWidth(160);
     ImGui::InputTextWithHint("Ποσό που εισπράχθηκε (€)", "π.χ. 120,50", g_rpAmount.data, sizeof(g_rpAmount.data));
     bool ok = g_rpAmount.str().empty() ? false : MoneyFieldHint(g_rpAmount);   // empty: just not ready yet, no red text
@@ -8784,8 +9137,8 @@ static void DrawRecordPaymentDialog() {
         ImGui::TableHeadersRow();
         for (auto& c : open) {
             ImGui::PushID(c.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(DateGr(c.year, c.month, c.day).c_str());
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(ChargeLabel(c).c_str());
+            ImGui::TableSetColumnIndex(0); CellText(DateGr(c.year, c.month, c.day).c_str());
+            ImGui::TableSetColumnIndex(1); CellText(ChargeLabel(c).c_str());
             ImGui::TableSetColumnIndex(2); ImGui::Text("%s", FormatMoney(c.amount_due).c_str());
             ImGui::TableSetColumnIndex(3); ImGui::Text("%s", FormatMoney(c.balance).c_str());
             ImGui::TableSetColumnIndex(4);
@@ -8823,6 +9176,7 @@ static void DrawRecordPaymentDialog() {
         if (endOnly) ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1), "Δόσεις προγράμματος με μία απόδειξη στο τέλος: η απόδειξη εκδίδεται αυτόματα με την τελευταία δόση.");
     }
     ok = DrawReceiptForm("rprec", g_rpReceipt, amount, 1) && ok;
+    if (g_rpReceipt.issue && rest > 0) { ImGui::TextColored(kInvalidMoneyCol, "Η απόδειξη καλύπτει μόνο ό,τι εξοφλεί χρεώσεις: μοιράστε όλο το ποσό ή καταχωρίστε χωρίς απόδειξη."); ok = false; }
 
     ImGui::BeginDisabled(!ok);
     if (ImGui::Button("Καταχώριση", ImVec2(150, 0))) {
@@ -8849,17 +9203,17 @@ static void DrawRecordPaymentDialog() {
 }
 
 // =====================================================================================================
-// NAVIGATION -- a thin bar of icons on the left that widens over the page while the mouse is on it.
+// NAVIGATION -- a thin bar of icons along the top; hovering an icon says what it is.
 // Icons are drawn as shapes (no icon font needed), so they look the same on every machine.
 // =====================================================================================================
 enum Page { PAGE_HOME, PAGE_CLIENTS, PAGE_BUILDINGS, PAGE_APARTMENTS, PAGE_SERVICES, PAGE_JOINT, PAGE_PACKAGES,
-            PAGE_LEDGER, PAGE_OFFERS, PAGE_SEARCH, PAGE_NOTES, PAGE_PARTNERS, PAGE_SETTINGS, PAGE_DASHBOARD, PAGE_CASH, PAGE_SCORING };
+            PAGE_LEDGER, PAGE_OFFERS, PAGE_SEARCH, PAGE_NOTES, PAGE_PARTNERS, PAGE_SETTINGS, PAGE_DASHBOARD, PAGE_CASH, PAGE_SCORING, PAGE_CONTRACTS };
 static int g_page = PAGE_HOME;
 static int g_scoringTab = -1;
 static int g_ledgerTab = 0;   // 0 = Χρεώσεις, 1 = Πληρωμές, 2 = Αποδείξεις
-static const float kNavCollapsed = 56.0f, kNavExpanded = 236.0f;
+static const float kNavBarH = 50.0f;
 enum NavIcon { IC_HOME, IC_PERSON, IC_BUILDING, IC_DOOR, IC_TAG, IC_PIE, IC_BOX, IC_COINS, IC_RECEIPT, IC_PERCENT,
-               IC_SEARCH, IC_NOTE, IC_CHART, IC_GEAR, IC_PEOPLE };
+               IC_SEARCH, IC_NOTE, IC_CHART, IC_GEAR, IC_PEOPLE, IC_CONTRACT };
 
 static void DrawNavIcon(ImDrawList* dl, ImVec2 c, float s, int icon, ImU32 col) {
     const float t = std::max(1.6f, s * 0.08f);          // stroke
@@ -8945,76 +9299,318 @@ static void DrawNavIcon(ImDrawList* dl, ImVec2 c, float s, int icon, ImU32 col) 
         dl->AddCircle(c, h * 0.6f, col, 24, t * 1.4f);
         dl->AddCircle(c, h * 0.22f, col, 16, t);
         break; }
+    case IC_CONTRACT: {                                  // a signed page with a seal
+        const float w = s * 0.34f, hh = s * 0.46f;
+        dl->AddRect(ImVec2(c.x - w, c.y - hh), ImVec2(c.x + w, c.y + hh), col, 2.0f, 0, t);
+        dl->AddLine(ImVec2(c.x - w * 0.55f, c.y - hh * 0.5f), ImVec2(c.x + w * 0.55f, c.y - hh * 0.5f), col, t);
+        dl->AddLine(ImVec2(c.x - w * 0.55f, c.y - hh * 0.1f), ImVec2(c.x + w * 0.55f, c.y - hh * 0.1f), col, t);
+        dl->AddCircleFilled(ImVec2(c.x + w * 0.3f, c.y + hh * 0.5f), s * 0.11f, col);
+        break; }
     }
 }
 
 struct NavItem { int page; int icon; const char* label; };
 static const NavItem kNavItems[] = {
-    { PAGE_HOME, IC_HOME, "Αρχική" },             { PAGE_CLIENTS, IC_PERSON, "Πελάτες" },
-
-    { PAGE_SERVICES, IC_TAG, "Υπηρεσίες" },        { PAGE_JOINT, IC_PIE, "Διαχείριση" },
-    { PAGE_PACKAGES, IC_BOX, "Πακέτα Υπηρεσιών" }, { PAGE_LEDGER, IC_RECEIPT, "Χρεώσεις Πληρωμές Αποδείξεις" },
-    { PAGE_OFFERS, IC_PERCENT, "Προσφορές" },
-    { PAGE_SCORING, IC_CHART, "Αξιολόγηση" },
-    { PAGE_SEARCH, IC_SEARCH, "Αναζήτηση" },       { PAGE_NOTES, IC_NOTE, "Σημειώσεις" },
-    { PAGE_PARTNERS, IC_PEOPLE, "Συνεργάτες" },
+    { PAGE_HOME, IC_HOME, "Αρχική" },              { PAGE_CLIENTS, IC_PERSON, "Πελάτες" },
+    { PAGE_JOINT, IC_PIE, "Διαχείριση" },          { PAGE_SERVICES, IC_TAG, "Υπηρεσίες" },
+    { PAGE_PACKAGES, IC_BOX, "Πακέτα Υπηρεσιών" }, { PAGE_CONTRACTS, IC_CONTRACT, "Συμβάσεις" },
+    { PAGE_LEDGER, IC_RECEIPT, "Χρεώσεις Πληρωμές Αποδείξεις" },
+    { PAGE_SCORING, IC_CHART, "Αξιολόγηση" },      { PAGE_PARTNERS, IC_PEOPLE, "Συνεργάτες" },
+    { PAGE_OFFERS, IC_PERCENT, "Προσφορές" },      { PAGE_SEARCH, IC_SEARCH, "Αναζήτηση" },
+    { PAGE_NOTES, IC_NOTE, "Σημειώσεις" },
 };
 
 static void DrawNavBar() {
-    static float width = kNavCollapsed;
-    static bool hovered = false;
-    float target = hovered ? kNavExpanded : kNavCollapsed;
-    width += (target - width) * std::min(1.0f, ImGui::GetIO().DeltaTime * 14.0f);
-    if (std::fabs(width - target) < 0.5f) width = target;
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(ImVec2(width, vp->WorkSize.y));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 10));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, kNavBarH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 0));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.12f, 0.16f, 0.98f));
     ImGui::Begin("##nav", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float kMinRowH = 44.0f;
-    // Auto-grow: a row whose label wraps to multiple lines grows to fit them; every
-    // other row stays at kMinRowH. Collapsed state is unaffected (labels aren't
-    // drawn at all, so every row is uniform).
+    const float itemW = 52.0f;
     auto item = [&](int page, int icon, const char* label) {
         ImGui::PushID(page);
         ImVec2 p = ImGui::GetCursorScreenPos();
-        bool sel = g_page == page;
-        const bool willDrawLabel = (width > kNavCollapsed + 40.0f);
-        float wrapW = 0.0f;
-        float rowH = kMinRowH;
-        if (willDrawLabel) {
-            wrapW = std::max(40.0f, width - kNavCollapsed - 8.0f);
-            ImVec2 ts = ImGui::CalcTextSize(label, nullptr, false, wrapW);
-            rowH = std::max(rowH, ts.y + 16.0f);
-        }
-        if (ImGui::InvisibleButton("nav", ImVec2(width, rowH))) g_page = page;
-        bool hov = ImGui::IsItemHovered();
-        if (sel) dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rowH), ImGui::GetColorU32(ImVec4(0.20f, 0.42f, 0.62f, 0.55f)));
-        else if (hov) dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rowH), ImGui::GetColorU32(ImVec4(1, 1, 1, 0.06f)));
-        if (sel) dl->AddRectFilled(p, ImVec2(p.x + 3, p.y + rowH), ImGui::GetColorU32(kColLink));
+        const bool sel = g_page == page;
+        if (ImGui::InvisibleButton("nav", ImVec2(itemW, kNavBarH))) g_page = page;
+        const bool hov = ImGui::IsItemHovered();
+        if (hov) ImGui::SetTooltip("%s", label);
+        if (sel) dl->AddRectFilled(p, ImVec2(p.x + itemW, p.y + kNavBarH), ImGui::GetColorU32(ImVec4(0.20f, 0.42f, 0.62f, 0.55f)));
+        else if (hov) dl->AddRectFilled(p, ImVec2(p.x + itemW, p.y + kNavBarH), ImGui::GetColorU32(ImVec4(1, 1, 1, 0.06f)));
+        if (sel) dl->AddRectFilled(ImVec2(p.x, p.y + kNavBarH - 3), ImVec2(p.x + itemW, p.y + kNavBarH), ImGui::GetColorU32(kColLink));
         ImU32 col = ImGui::GetColorU32(sel ? ImVec4(0.92f, 0.96f, 1.0f, 1) : ImVec4(0.70f, 0.75f, 0.82f, 1));
-        DrawNavIcon(dl, ImVec2(p.x + kNavCollapsed * 0.5f, p.y + rowH * 0.5f), 22.0f, icon, col);
-        if (willDrawLabel) {
-            float a = std::min(1.0f, (width - kNavCollapsed - 40.0f) / 80.0f);
-            ImVec4 tc = sel ? ImVec4(0.92f, 0.96f, 1.0f, a) : ImVec4(0.78f, 0.82f, 0.88f, a);
-            ImVec2 ts = ImGui::CalcTextSize(label, nullptr, false, wrapW);
-            float ty = p.y + (rowH - ts.y) * 0.5f;
-            dl->AddText(nullptr, 0.0f, ImVec2(p.x + kNavCollapsed, ty), ImGui::GetColorU32(tc), label, nullptr, wrapW);
-        }
+        DrawNavIcon(dl, ImVec2(p.x + itemW * 0.5f, p.y + kNavBarH * 0.5f), 22.0f, icon, col);
         ImGui::PopID();
     };
-    for (auto& it : kNavItems) item(it.page, it.icon, it.label);
-    // settings at the bottom (a developer page; it will not stay in the final product)
-    ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - kMinRowH - 14.0f));
+    for (auto& it : kNavItems) { item(it.page, it.icon, it.label); ImGui::SameLine(); }
+    // settings at the far end (a developer page; it will not stay in the final product)
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - itemW - 6.0f));
     item(PAGE_SETTINGS, IC_GEAR, "Ρυθμίσεις");
-    hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(3);
+}
+
+// =====================================================================================================
+// ΣΥΜΒΑΣΕΙΣ -- a client's fixed yearly price for a service or package, paid in installments. The list of contracts, a new
+// one, and one window per contract showing how its year is going: paid, owed, still to come, and collecting or paying early.
+// =====================================================================================================
+static void CollectInstallments(int userId, const std::vector<DataConn::ContractInstallment>& parts) {
+    OpenRecordPayment(userId);
+    double sum = 0;
+    for (auto& in : parts) for (int cid : in.charges) {
+        Payment ch = g_app.conn->getPaymentById(cid);
+        const double left = MoneySub(ch.amount_due, ch.amount_paid);
+        if (ToCents(left) <= 0) continue;
+        g_rpPreset[cid] = left; sum = FromCents(ToCents(sum) + ToCents(left));
+        if (ch.status == "future") g_rpExtra.insert(cid);
+    }
+    g_rpAmount.set(FormatMoney(sum));
+}
+
+static void DrawContractViewWindows() {
+    std::vector<int> ids = g_contractViewIds;
+    for (size_t w = 0; w < ids.size(); w++) {
+        const int id = ids[w];
+        struct V { DataConn::Contract c; std::vector<DataConn::ContractItem> items; std::vector<DataConn::ContractInstallment> inst; std::vector<Receipt> rc; };
+        static std::map<int, Cached<V>> cache;
+        const V& v = cache[id].get("", [&] { V x; x.c = g_app.conn->getContract(id); x.items = g_app.conn->getContractItems(id); x.inst = g_app.conn->getContractInstallments(id); x.rc = g_app.conn->getContractReceipts(id); return x; });
+        bool open = true;
+        ImGui::SetNextWindowSize(ImVec2(760, 620), ImGuiCond_FirstUseEver);
+        std::string title = "Σύμβαση: " + v.c.label + " · " + v.c.user_name + "###contract_" + std::to_string(id);
+        ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse);
+        if (LinkCell(v.c.user_name)) OpenUserProfile(v.c.user_id);
+        ImGui::SameLine(); ImGui::TextDisabled("%s – %s · %d δόσεις · %s", DateGr(v.c.start_date).c_str(), DateGr(v.c.end_date).c_str(), v.c.installments, v.c.cancelled ? (v.c.open ? "ακυρωμένη, εκκρεμεί οφειλή" : "ακυρωμένη, ολοκληρώθηκε") : v.c.open ? "σε ισχύ" : "παλιά: ολοκληρώθηκε και εξοφλήθηκε");
+        ImGui::TextDisabled("Δημιουργήθηκε: %s · ενεργή έως %s", v.c.created_at.c_str(), DateGr(v.c.end_date).c_str());
+        if (v.c.cancelled) ImGui::TextColored(kColOut, "Ακυρώθηκε: πληρώθηκαν %s, %s", Eur(v.c.collected).c_str(), ToCents(v.c.owedNow) > 0 ? ("οφείλονται " + Eur(v.c.owedNow)).c_str() : "δεν οφείλεται τίποτα.");
+        else if (v.c.open) {
+            ImGui::SameLine(); if (ImGui::SmallButton("Ακύρωση σύμβασης…")) ImGui::OpenPopup("Ακύρωση σύμβασης");
+            if (ImGui::BeginPopupModal("Ακύρωση σύμβασης", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                static TextBuf why; static std::string err;
+                if (ImGui::IsWindowAppearing()) { why.set(""); err.clear(); }
+                ImGui::TextWrapped("Οι απλήρωτες μελλοντικές δόσεις αφαιρούνται. Ό,τι έχει ήδη περάσει η ημερομηνία του μένει οφειλή.");
+                ImGui::InputText("Αιτία", why.data, sizeof(why.data));
+                if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
+                ImGui::BeginDisabled(why.str().empty());
+                if (ImGui::Button("Ακύρωση σύμβασης", ImVec2(180, 0))) { if (g_app.conn->cancelContract(id, why.str())) ImGui::CloseCurrentPopup(); else err = g_app.conn->takeLastError(); }
+                ImGui::EndDisabled();
+                ImGui::SameLine(); if (ImGui::Button("Πίσω", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
+        if (!v.c.notes.empty()) ImGui::TextWrapped("%s", v.c.notes.c_str());
+        if (ImGui::BeginTable("cttiles", 4, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextRow();
+            auto tile = [](const char* t, double x, ImVec4 col) { ImGui::TableNextColumn(); StatTile(t, Eur(x), col, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 76)); };
+            tile("Τιμή σύμβασης", v.c.total, ImVec4(0.55f, 0.80f, 1.0f, 1)); tile("Πληρώθηκαν", v.c.collected, kColIn); tile("Οφείλονται τώρα", v.c.owedNow, kColOwed); tile("Μελλοντικές", v.c.scheduled, kColSched);
+            ImGui::EndTable();
+        }
+        if (ToCents(v.c.cost) > 0) ImGui::TextDisabled("Κόστος για εμάς %s · κέρδος %s", Eur(v.c.cost).c_str(), Eur(MoneySub(v.c.total, v.c.cost)).c_str());
+        std::string svc; for (auto& i : v.items) svc += (svc.empty() ? "" : ", ") + i.label + " " + Eur(i.amount);
+        ImGui::TextWrapped("Περιλαμβάνει: %s", svc.c_str());
+        ImGui::Separator();
+        std::vector<DataConn::ContractInstallment> due;
+        for (auto& in : v.inst) if (!in.future && ToCents(in.balance) > 0) due.push_back(in);
+        ImGui::BeginDisabled(due.empty());
+        if (ImGui::Button("Είσπραξη όλων των οφειλών")) CollectInstallments(v.c.user_id, due);
+        ImGui::EndDisabled();
+        {
+            static std::map<int, GridState> gs; static const ListColDef cols[6] = { LC("Ημ/νία"), LC("Δόση"), LC("Πληρώθηκε"), LC("Μένει"), LC("Κατάσταση"), LCA };
+            auto state = [](const DataConn::ContractInstallment& in) -> std::string { return ToCents(in.balance) <= 0 ? "Εξοφλήθηκε" : in.future ? "Μελλοντική" : ToCents(in.paid) > 0 ? "Μερικώς · οφείλεται" : "Οφείλεται"; };
+            auto text = [state](const DataConn::ContractInstallment& in, int c) -> std::string { switch (c) { case 0: return in.date; case 1: return Eur(in.due); case 2: return Eur(in.paid); case 3: return Eur(in.balance); case 4: return state(in); default: return ""; } };
+            const int uid0 = v.c.user_id;
+            DrawMiniList("ctinst", gs[id], cols, 6, v.inst, text, [&](const DataConn::ContractInstallment& in, int c) {
+                const bool settled = ToCents(in.balance) <= 0;
+                if (c == 0) CellText(DateGr(in.date).c_str());
+                else if (c == 1) CellText(Eur(in.due).c_str());
+                else if (c == 2) { if (ToCents(in.paid) > 0) ImGui::TextColored(kColIn, "%s", Eur(in.paid).c_str()); else ImGui::TextDisabled("—"); }
+                else if (c == 3) { if (!settled) CellText(Eur(in.balance).c_str()); else ImGui::TextDisabled("—"); }
+                else if (c == 4) ImGui::TextColored(settled ? kColIn : in.future ? kColSched : kColOwed, "%s", state(in).c_str());
+                else if (!settled && ImGui::SmallButton(in.future ? "Επίλυση νωρίς" : "Είσπραξη")) CollectInstallments(uid0, {in}); }, [](const DataConn::ContractInstallment&) {});
+        }
+        SectionTitle(("Αποδείξεις (" + std::to_string(v.rc.size()) + ")").c_str());
+        if (v.rc.empty()) ImGui::TextDisabled("Καμία απόδειξη ακόμα.");
+        for (auto& r : v.rc) {
+            ImGui::PushID(r.id);
+            if (LinkCell(ReceiptNo(r))) OpenReceiptView(r.id);
+            ImGui::SameLine(); ImGui::TextDisabled("%s · %s · καταχωρήθηκε %s%s", DateGr(r.issue_date).c_str(), Eur(r.total).c_str(), r.created_at.c_str(), r.status == "void" ? " · ΑΚΥΡΩΜΕΝΗ" : "");
+            ImGui::PopID();
+        }
+        ImGui::End();
+        if (!open) g_contractViewIds.erase(std::remove(g_contractViewIds.begin(), g_contractViewIds.end(), id), g_contractViewIds.end());
+    }
+}
+
+static void DrawContractsList() {
+    static int state = 1; static char text[128] = "";
+    enum { CT_WHO, CT_LABEL, CT_START, CT_END, CT_TOTAL, CT_COLL, CT_OWED, CT_SCHED, CT_NEXT, CT_ACT, CT_CREATED, CT_COUNT };
+    static const ListColDef cols[CT_COUNT] = {
+        { "Πελάτης", ImGuiTableColumnFlags_WidthFixed, 220.0f, true },     { "Σύμβαση", ImGuiTableColumnFlags_WidthFixed, 240.0f, true },
+        { "Έναρξη", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },       { "Ενεργή έως", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
+        { "Τιμή σύμβασης", ImGuiTableColumnFlags_WidthFixed, 100.0f, true }, { "Πληρώθηκαν", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
+        { "Οφείλονται", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },  { "Μελλοντικές", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
+        { "Επόμενη δόση", ImGuiTableColumnFlags_WidthFixed, 110.0f, true }, { "", ImGuiTableColumnFlags_WidthFixed, 80.0f, false },
+        { "Δημιουργήθηκε", ImGuiTableColumnFlags_WidthFixed, 150.0f, true } };
+    static ListModel<DataConn::Contract> m;
+    m.Init(CT_COUNT, {{CT_START, false}}, 20);
+    if (m.g.order.back() == CT_CREATED) m.g.order = { CT_WHO, CT_LABEL, CT_CREATED, CT_START, CT_END, CT_TOTAL, CT_COLL, CT_OWED, CT_SCHED, CT_NEXT, CT_ACT };
+    bool ch = false;
+    ImGui::SetNextItemWidth(120); ch |= ImGui::Combo("##ctstate", &state, "Όλες\0Τρέχουσες\0Παλιές\0");
+    ImGui::SameLine(); 
+    if (ch) m.g.pager.Reset();
+    const std::string key = std::to_string(state) + "|" + text;
+    static Cached<DataConn::ContractTotals> tc;
+    const auto& t = tc.get(key, [&] { return g_app.conn->contractTotals(0, state, text); });
+    ImGui::Text("%d συμβάσεις · ", t.count); ImGui::SameLine(0, 0);
+    ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1), "αξία %s", Eur(t.total).c_str()); ImGui::SameLine();
+    ImGui::TextColored(kColIn, "· πληρώθηκαν %s", Eur(t.collected).c_str()); ImGui::SameLine();
+    ImGui::TextColored(kColOwed, "· οφείλονται %s", Eur(t.owedNow).c_str()); ImGui::SameLine();
+    ImGui::TextColored(kColSched, "· μελλοντικές %s", Eur(t.scheduled).c_str());
+    auto ctFetch = [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageContracts(0, state, text, MapSort(s, {{CT_WHO, 0}, {CT_LABEL, 1}, {CT_START, 2}, {CT_END, 3}, {CT_TOTAL, 4}, {CT_COLL, 5}, {CT_OWED, 6}, {CT_SCHED, 7}, {CT_NEXT, 8}}), off, lim); };
+    auto ctText = [](const DataConn::Contract& r, int c) -> std::string {
+        switch (c) { case CT_CREATED: return r.created_at; case CT_WHO: return r.user_name; case CT_LABEL: return r.label; case CT_START: return DateGr(r.start_date); case CT_END: return DateGr(r.end_date); case CT_TOTAL: return Eur(r.total);
+                     case CT_COLL: return Eur(r.collected); case CT_OWED: return Eur(r.owedNow); case CT_SCHED: return Eur(r.scheduled); case CT_NEXT: return r.next_date.empty() ? std::string() : DateGr(r.next_date); default: return ""; } };
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadF(key, ctFetch, [&] { return t.count; }, ctText, CT_COUNT);
+    const DistinctFn ctDistinct = [&](int col, const std::string& q) { return ListDistinct(m.All(key, ctFetch), m.g, ctText, CT_COUNT, col, q); };
+    float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
+    if (ImGui::BeginTable("cttable", CT_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ListSetupColumns(m.g.order, cols);
+        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager, &m.g.cf, &ctDistinct);
+        auto P = [&](int col) { return ListPos(m.g.order, col); };
+        for (auto& r : pg.rows) {
+            ImGui::PushID(r.id); ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(P(CT_WHO)); if (LinkCell(r.user_name)) OpenUserProfile(r.user_id);
+            ImGui::TableSetColumnIndex(P(CT_LABEL)); if (LinkCell(r.cancelled ? r.label + (ToCents(r.owedNow) > 0 ? " (ακυρωμένη, οφείλει)" : " (ακυρωμένη, ολοκληρώθηκε)") : r.label)) OpenContractView(r.id);
+            ImGui::TableSetColumnIndex(P(CT_CREATED)); ImGui::TextDisabled("%s", r.created_at.c_str());
+            ImGui::TableSetColumnIndex(P(CT_START)); CellText(DateGr(r.start_date).c_str());
+            ImGui::TableSetColumnIndex(P(CT_END)); CellText(DateGr(r.end_date).c_str());
+            ImGui::TableSetColumnIndex(P(CT_TOTAL)); CellText(Eur(r.total).c_str());
+            ImGui::TableSetColumnIndex(P(CT_COLL)); ImGui::TextColored(kColIn, "%s", Eur(r.collected).c_str());
+            ImGui::TableSetColumnIndex(P(CT_OWED)); if (ToCents(r.owedNow) > 0) ImGui::TextColored(kColOwed, "%s", Eur(r.owedNow).c_str()); else ImGui::TextDisabled("—");
+            ImGui::TableSetColumnIndex(P(CT_SCHED)); if (ToCents(r.scheduled) > 0) ImGui::TextColored(kColSched, "%s", Eur(r.scheduled).c_str()); else ImGui::TextDisabled("—");
+            ImGui::TableSetColumnIndex(P(CT_NEXT)); if (!r.next_date.empty()) CellText(DateGr(r.next_date).c_str()); else ImGui::TextDisabled("—");
+            ImGui::TableSetColumnIndex(P(CT_ACT)); if (ImGui::SmallButton("Άνοιγμα")) OpenContractView(r.id);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    DrawPager(m.g.pager, "ctpg");
+}
+
+static void DrawNewContract() {
+    static int client = -1, kind = 0, pkg = -1, svc = -1, lastKind = -1, lastSrc = -2, partner = -1, months = 12, nPay = 12; static bool ownDates = false; static std::vector<std::string> dates;
+    static std::string start = CurrentDateString(), msg;
+    static TextBuf notes;
+    struct Row { int id; std::string label; TextBuf price, cost; };
+    static std::vector<Row> rows;
+    ImGui::TextDisabled("Σταθερή τιμή για όλη τη διάρκεια, σε δόσεις. Οι επόμενες δόσεις μένουν μελλοντικές και οφείλονται μόλις περάσει η ημερομηνία τους.");
+    {   // the contracts made so far, without their client: one click fills in the same services, prices and installments
+        static Cached<std::vector<DataConn::Contract>> tpl;
+        const auto& t = tpl.get("", [] { return g_app.conn->contractTemplates(12); });
+        if (!t.empty()) {
+            ImGui::TextDisabled("Προηγούμενες συμβάσεις:");
+            for (auto& x : t) {
+                const std::string lbl = x.label + " · " + Eur(x.total) + " · " + std::to_string(x.installments) + " δόσεις";
+                if (ImGui::GetContentRegionAvail().x > ImGui::CalcTextSize(lbl.c_str()).x + 40) ImGui::SameLine();
+                ImGui::PushID(x.id);
+                if (ImGui::SmallButton(lbl.c_str())) {
+                    kind = x.source_type == "service" ? 1 : 0; (kind == 0 ? pkg : svc) = x.source_id; lastKind = kind; lastSrc = x.source_id;
+                    partner = x.partner_id; months = x.months; nPay = x.installments; ownDates = false;
+                    rows.clear();
+                    for (auto& it : g_app.conn->getContractItems(x.id)) { Row r; r.id = it.service_id; r.label = it.label; r.price.set(FormatMoney(it.amount)); r.cost.set(FormatMoney(it.cost)); rows.push_back(r); }
+                }
+                ImGui::PopID();
+            }
+            ImGui::Separator();
+        }
+    }
+    ImGui::AlignTextToFramePadding(); CellText("Πελάτης:"); ImGui::SameLine(110); PickClient("ctcli", client, 360);
+    ImGui::AlignTextToFramePadding(); CellText("Για:"); ImGui::SameLine(110);
+    ImGui::RadioButton("Πακέτο", &kind, 0); ImGui::SameLine(); ImGui::RadioButton("Υπηρεσία", &kind, 1); ImGui::SameLine();
+    if (kind == 0) PickPackage("ctpkg", pkg, 320); else PickService("ctsvc", svc, 320);
+    if (kind == 0) {
+        static Cached<std::vector<std::pair<int, std::string>>> top;
+        const auto& t = top.get("", [] { return g_app.conn->topContractPackages(6); });
+        if (!t.empty()) { ImGui::TextDisabled("Συχνά πακέτα:"); for (auto& [id, label] : t) { ImGui::SameLine(); ImGui::PushID(id); if (ImGui::SmallButton(label.c_str())) pkg = id; ImGui::PopID(); } }
+    }
+    const int src = kind == 0 ? pkg : svc;
+    if (kind != lastKind || src != lastSrc) {                  // the services are copied here; prices can be changed for this contract
+        lastKind = kind; lastSrc = src; rows.clear();
+        std::vector<Service> list;
+        if (kind == 0 && pkg > 0) list = g_app.conn->getMasterServiceComponents(pkg);
+        if (kind == 1 && svc > 0) list.push_back(g_app.conn->getServiceById(svc));
+        for (auto& x : list) { Row r; r.id = x.id; r.label = x.label; r.price.set(FormatMoney(x.suggested_price)); r.cost.set(FormatMoney(g_app.conn->getServiceCost(x.id))); rows.push_back(r); }
+    }
+    ImGui::AlignTextToFramePadding(); CellText("Έναρξη:"); ImGui::SameLine(110); DatePicker("ctstart", start, ImVec2(0, 1));
+    ImGui::AlignTextToFramePadding(); CellText("Διάρκεια:"); ImGui::SameLine(110); ImGui::SetNextItemWidth(120); if (ImGui::InputInt("μήνες##ctmonths", &months)) months = std::max(1, std::min(months, 600));
+    ImGui::AlignTextToFramePadding(); CellText("Πληρωμές:"); ImGui::SameLine(110); ImGui::SetNextItemWidth(120); if (ImGui::InputInt("δόσεις##ctpay", &nPay)) nPay = std::max(1, std::min(nPay, 600));
+    ImGui::SameLine(); ImGui::Checkbox("Δικές μου ημερομηνίες", &ownDates);
+    {   // evenly over the duration by default; with own dates every payment gets its own day
+        const auto even = g_app.conn->contractDefaultDates(start, months, nPay);
+        static std::string lastPlan; const std::string plan = start + "|" + std::to_string(months) + "|" + std::to_string(nPay);
+        if (!ownDates || plan != lastPlan) dates = even;
+        lastPlan = plan;
+        if (ownDates) {
+            ImGui::BeginChild("##ctdates", ImVec2(0, std::min(220.0f, 34.0f * (float)nPay + 8.0f)), ImGuiChildFlags_Border);
+            for (int i = 0; i < nPay; i++) { ImGui::PushID(i); ImGui::AlignTextToFramePadding(); ImGui::Text("Δόση %d:", i + 1); ImGui::SameLine(90); DatePicker("ctd", dates[i], ImVec2(0, 1)); ImGui::PopID(); }
+            ImGui::EndChild();
+        } else if (!dates.empty()) ImGui::TextDisabled("Δόσεις: %s, %s%s έως %s", DateGr(dates.front()).c_str(), dates.size() > 1 ? DateGr(dates[1]).c_str() : "", dates.size() > 2 ? ", ..." : "", DateGr(dates.back()).c_str());
+    }
+    long long total = 0, cost = 0; bool ok = true;
+    if (rows.empty()) ImGui::TextDisabled("Διαλέξτε πακέτο ή υπηρεσία.");
+    else if (ImGui::BeginTable("ctnewrows", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Υπηρεσία", ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn("Τιμή σύμβασης", ImGuiTableColumnFlags_WidthFixed, 120); ImGui::TableSetupColumn("Κόστος μας", ImGuiTableColumnFlags_WidthFixed, 130);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < rows.size(); i++) {
+            ImGui::PushID((int)i); ImGui::TableNextRow();
+            ImGui::TableNextColumn(); CellText(rows[i].label.c_str());
+            double p = 0, q = 0;
+            ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); ImGui::InputText("##p", rows[i].price.data, sizeof(rows[i].price.data));
+            if (!ParseMoney(rows[i].price.str(), p) || ToCents(p) < 0) ok = false;
+            ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); ImGui::InputText("##c", rows[i].cost.data, sizeof(rows[i].cost.data));
+            if (!rows[i].cost.str().empty() && (!ParseMoney(rows[i].cost.str(), q) || ToCents(q) < 0)) ok = false;
+            total += ToCents(p); cost += ToCents(q);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (cost > 0) { ImGui::AlignTextToFramePadding(); CellText("Συνεργάτης:"); ImGui::SameLine(110); { bool none = false; PickPartner("ctpart", partner, 300, &none); if (none) for (auto& r : rows) r.cost.set(""); } }
+    const int n = nPay;
+    if (total > 0) ImGui::TextColored(kColIn, "Σύνολο %s · %d δόσεις των περίπου %s%s", Eur(FromCents(total)).c_str(), n, Eur(FromCents(total / n)).c_str(),
+                                      cost > 0 ? (" · κέρδος " + Eur(FromCents(total - cost))).c_str() : "");
+    if (!ok) ImGui::TextColored(kColOut, "Κάποιο ποσό δεν είναι έγκυρο.");
+    ImGui::InputText("Σημειώσεις", notes.data, sizeof(notes.data));
+    if (!msg.empty()) ImGui::TextColored(kColOut, "%s", msg.c_str());
+    ImGui::BeginDisabled(!ok || client <= 0 || total <= 0 || start.empty());
+    if (ImGui::Button("Δημιουργία σύμβασης", ImVec2(200, 0))) {
+        DataConn::Contract c; c.user_id = client; c.source_type = kind == 0 ? "package" : "service"; c.source_id = src; c.start_date = start; c.installments = n; c.months = months; if (ownDates) c.dates = dates; c.notes = notes.str(); c.partner_id = partner;
+        std::vector<DataConn::ContractItem> items;
+        for (auto& r : rows) { DataConn::ContractItem it; it.service_id = r.id; it.label = r.label; ParseMoney(r.price.str(), it.amount); if (!r.cost.str().empty()) ParseMoney(r.cost.str(), it.cost); items.push_back(it); }
+        if (kind == 0) for (auto& mp : g_app.conn->getMasterServices()) if (mp.id == pkg) c.label = mp.label;
+        std::vector<FieldDiff> d = { {"Πελάτης", "-", g_app.userName(client)}, {"Σύμβαση", "-", c.label.empty() ? items.front().label : c.label}, {"Έναρξη", "-", DateGr(start)},
+                                     {"Τιμή σύμβασης", "-", Eur(FromCents(total))}, {"Διάρκεια", "-", std::to_string(months) + " μήνες"}, {"Δόσεις", "-", std::to_string(n)} };
+        RequestConfirm("Νέα σύμβαση", d, [c, items]() {
+            int id = g_app.conn->addContract(c, items);
+            if (id > 0) { OpenContractView(id); msg.clear(); rows.clear(); lastSrc = -2; pkg = svc = -1; notes.set(""); g_app.reloadAll(); }
+            else msg = g_app.conn->takeLastError();
+        });
+    }
+    ImGui::EndDisabled();
+}
+
+static void DrawContractsScreen() {
+    ImGui::SetWindowFontScale(1.2f); CellText("Συμβάσεις"); ImGui::SetWindowFontScale(1.0f);
+    if (ImGui::BeginTabBar("contracttabs")) {
+        if (ImGui::BeginTabItem("Τρέχουσες συμβάσεις")) { DrawContractsList(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Νέα σύμβαση")) { DrawNewContract(); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
 }
 
 // =====================================================================================================
@@ -9077,21 +9673,21 @@ static void DrawOfferDialog() {
     if (!BeginGuardedModal(title, g_showOffer, ImGuiWindowFlags_AlwaysAutoResize)) return;
     ImGui::TextColored(kColLink, "%s", g_of.id > 0 ? "Επεξεργασία προσφοράς" : "Νέα προσφορά");
     ImGui::SetNextItemWidth(420); ImGui::InputTextWithHint("Όνομα", "π.χ. Φθινοπωρινή έκπτωση απεντόμωσης", of_name.data, sizeof(of_name.data));
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Έκπτωση:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Έκπτωση:"); ImGui::SameLine();
     ImGui::RadioButton("Ποσοστό %", &of_kind, 0); ImGui::SameLine(); ImGui::RadioButton("Ποσό €", &of_kind, 1); ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
     if (of_kind == 0) { ImGui::InputDouble("##ofv", &of_value, 0, 0, "%.0f %%"); of_value = std::max(0.0, std::min(of_value, 100.0)); }
     else InputMoney("##ofm", &of_value);
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Για:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Για:"); ImGui::SameLine();
     ImGui::RadioButton("Όλους τους πελάτες", &of_who, 0); ImGui::SameLine(); ImGui::RadioButton("Συγκεκριμένο πελάτη", &of_who, 1);
     if (of_who == 1) { ImGui::SameLine(); PickClient("ofcli", of_user, 220); }
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Σε:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Σε:"); ImGui::SameLine();
     ImGui::RadioButton("Όλες τις υπηρεσίες", &of_target, 0); ImGui::SameLine();
     ImGui::RadioButton("Μία υπηρεσία", &of_target, 1); ImGui::SameLine(); ImGui::RadioButton("Ένα πακέτο", &of_target, 2);
     if (of_target == 1) PickService("ofsvc", of_svc, 420);
     if (of_target == 2) PickPackage("ofpkg", of_pkg, 420);
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Ισχύει από:"); ImGui::SameLine(); DatePicker("offrom", of_from, ImVec2(0, 1));
-    ImGui::SameLine(); ImGui::TextUnformatted("έως:"); ImGui::SameLine(); DatePicker("ofto", of_to, ImVec2(0, 1));
+    ImGui::AlignTextToFramePadding(); CellText("Ισχύει από:"); ImGui::SameLine(); DatePicker("offrom", of_from, ImVec2(0, 1));
+    ImGui::SameLine(); CellText("έως:"); ImGui::SameLine(); DatePicker("ofto", of_to, ImVec2(0, 1));
     if (!of_from.empty() && !of_to.empty() && of_to >= of_from)
         ImGui::TextDisabled("Διάρκεια %d ημέρες · λήγει αυτόματα στις %s", DaysBetween(of_from, of_to) + 1, DateGr(of_to).c_str());
     ImGui::SetNextItemWidth(420); ImGui::InputTextWithHint("Σημείωση", "προαιρετικά", of_note.data, sizeof(of_note.data));
@@ -9150,6 +9746,10 @@ static void DrawOffersListTab() {
         bool live = o.status == "active" && o.valid_to >= today;
         if (show == 1 || (show == 0 && live) || (show == 2 && !live)) rows.push_back(&o);
     }
+    auto ofText = [](const Offer& o, int c) -> std::string { ImVec4 col; switch (c) { case OC_NAME: return o.name; case OC_VAL: return OfferValueText(o); case OC_WHO: return o.user_id > 0 ? g_app.userName(o.user_id) : "Όλοι οι πελάτες"; case OC_TARGET: return OfferTargetText(o); case OC_FROM: return DateGr(o.valid_from); case OC_TO: return DateGr(o.valid_to); case OC_STATE: return OfferStateText(o, col); case OC_USES: return std::to_string(o.uses); case OC_GIVEN: return Eur(o.given); default: return ""; } };
+    DrawListSearch(g);
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const Offer* o) { return !ListRowMatches(*o, g, ofText, OC_COUNT); }), rows.end());
+    const DistinctFn ofDistinct = [&](int col, const std::string& q) { return ListDistinct(all, g, ofText, OC_COUNT, col, q); };
     GridSort(rows, g.sort, [](int c, const Offer& a, const Offer& b) {
         switch (c) {
             case OC_NAME: return CmpText(a.name, b.name);   case OC_VAL: return Cmp3(a.value, b.value);
@@ -9168,22 +9768,22 @@ static void DrawOffersListTab() {
                                            ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, std::max(160.0f, h)))) {
         ImGui::TableSetupScrollFreeze(1, 1);
         ListSetupColumns(g.order, cols);
-        ListHeaderRow(g.order, cols, g.sort, g.pager);
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &ofDistinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
         for (int i = g.pager.offset; i < g.pager.ShowingTo(); i++) {
             const Offer& o = *rows[i];
             ImGui::PushID(o.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(OC_NAME)); ImGui::TextUnformatted(o.name.c_str());
+            ImGui::TableSetColumnIndex(P(OC_NAME)); CellText(o.name.c_str());
             if (!o.note.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", o.note.c_str());
             ImGui::TableSetColumnIndex(P(OC_VAL)); ImGui::TextColored(kColOwed, "%s", OfferValueText(o).c_str());
-            ImGui::TableSetColumnIndex(P(OC_WHO)); ImGui::TextUnformatted(o.user_id > 0 ? g_app.userName(o.user_id).c_str() : "Όλοι οι πελάτες");
-            ImGui::TableSetColumnIndex(P(OC_TARGET)); ImGui::TextUnformatted(OfferTargetText(o).c_str());
-            ImGui::TableSetColumnIndex(P(OC_FROM)); ImGui::TextUnformatted(DateGr(o.valid_from).c_str());
-            ImGui::TableSetColumnIndex(P(OC_TO)); ImGui::TextUnformatted(DateGr(o.valid_to).c_str());
+            ImGui::TableSetColumnIndex(P(OC_WHO)); CellText(o.user_id > 0 ? g_app.userName(o.user_id).c_str() : "Όλοι οι πελάτες");
+            ImGui::TableSetColumnIndex(P(OC_TARGET)); CellText(OfferTargetText(o).c_str());
+            ImGui::TableSetColumnIndex(P(OC_FROM)); CellText(DateGr(o.valid_from).c_str());
+            ImGui::TableSetColumnIndex(P(OC_TO)); CellText(DateGr(o.valid_to).c_str());
             ImGui::TableSetColumnIndex(P(OC_STATE)); { ImVec4 c; std::string s = OfferStateText(o, c); ImGui::TextColored(c, "%s", s.c_str());
                 if (o.status == "cancelled" && ImGui::IsItemHovered()) ImGui::SetTooltip("Αιτία: %s", o.cancel_reason.c_str()); }
             ImGui::TableSetColumnIndex(P(OC_USES)); ImGui::Text("%d", o.uses);
-            ImGui::TableSetColumnIndex(P(OC_GIVEN)); ImGui::TextUnformatted(Eur(o.given).c_str());
+            ImGui::TableSetColumnIndex(P(OC_GIVEN)); CellText(Eur(o.given).c_str());
             ImGui::TableSetColumnIndex(P(OC_ACT));
             bool editable = o.status == "active";
             ImGui::BeginDisabled(!editable);
@@ -9250,7 +9850,7 @@ static void DrawQuality(const char* id, QualityView& v, int onlyUser, float heig
     ImGui::Checkbox("Περισσότερες στήλες", &v.more);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Κέρδος σε €, μέρες πληρωμής, οφειλές, και τα ίδια για τα κοινόχρηστα");
     if (v.more) {
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("  Ομάδες:"); ImGui::SameLine();
+        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); CellText("  Ομάδες:"); ImGui::SameLine();
         ImGui::Checkbox("Μεμονωμένες υπηρεσίες", &v.blkS); ImGui::SameLine();
         ImGui::Checkbox("Κοινόχρηστα", &v.blkJ);
     } else { v.blkS = true; v.blkJ = false; }
@@ -9299,6 +9899,15 @@ static void DrawQuality(const char* id, QualityView& v, int onlyUser, float heig
     auto incOf = [](const Blk& b) { return b.any ? ToCents(b.inc) : (long long)INT64_MIN / 2; };
     auto daysCmp = [](const Blk& a, const Blk& b) { return a.hasDays != b.hasDays ? (a.hasDays ? -1 : 1) : Cmp3(a.days, b.days); };
     auto idxCmp = [](const Blk& a, const Blk& b) { return Cmp3(a.idx, b.idx); };           // "nothing to rate" (-1) sorts lowest
+    auto qcText = [](const Row& r, int c) -> std::string {
+        auto days = [](const Blk& b) { return b.any && b.hasDays ? ListNum(b.days) : std::string(); };
+        auto idx = [](const Blk& b) { return b.any ? ListNum(b.idx) : std::string(); };
+        auto eur = [](const Blk& b, double v) { return b.any ? Eur(v) : std::string(); };
+        switch (c) { case QC_NAME: return r.name; case S_INC: return eur(r.s, r.s.inc); case S_PSC: return r.s.any ? ListNum(r.s.psc) : std::string(); case S_DAYS: return days(r.s); case S_IDX: return idx(r.s); case S_WORTH: return r.s.any ? ListNum(r.s.worth) : std::string(); case S_OWE: return eur(r.s, r.s.owe);
+                     case J_INC: return eur(r.j, r.j.inc); case J_DAYS: return days(r.j); case J_IDX: return idx(r.j); case J_OWE: return eur(r.j, r.j.owe);
+                     case T_INC: return eur(r.t, r.t.inc); case T_DAYS: return days(r.t); case T_IDX: return idx(r.t); case T_OWE: return eur(r.t, r.t.owe); default: return ""; } };
+    if (onlyUser == 0) { DrawListSearch(g, 240); rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const Row* r) { return !ListRowMatches(*r, g, qcText, QC_COUNT); }), rows.end()); }
+    const DistinctFn qcDistinct = [&](int col, const std::string& q) { return ListDistinct(built, g, qcText, QC_COUNT, col, q); };
     GridSort(rows, g.sort, [&](int c, const Row& a, const Row& b) {
         switch (c) {
             case QC_NAME: return CmpText(a.name, b.name);
@@ -9317,7 +9926,7 @@ static void DrawQuality(const char* id, QualityView& v, int onlyUser, float heig
     if (ImGui::BeginTable("payerq", QC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | (onlyUser ? 0 : ImGuiTableFlags_ScrollY) | ImGuiTableFlags_Hideable |
                                               ImGuiTableFlags_Resizable, onlyUser ? ImVec2(0, 0) : ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(onlyUser ? 0 : 1, 1);
-        g_listCompact = true;
+        
         for (int l : g.order)       // stretch columns: they always share exactly the page width
             ImGui::TableSetupColumn(cols[l].name, ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoReorder | ImGuiTableColumnFlags_NoSort, l == QC_NAME ? 1.6f : (l == QC_ACT ? 0.8f : (l == S_IDX || l == J_IDX || l == T_IDX || l == S_PSC ? 1.25f : 1.0f)));
         if (onlyUser) ImGui::TableSetColumnEnabled(ListPos(g.order, QC_NAME), false);      // one client: his name is the window
@@ -9325,7 +9934,7 @@ static void DrawQuality(const char* id, QualityView& v, int onlyUser, float heig
         for (int c = S_INC; c <= S_OWE; c++) ImGui::TableSetColumnEnabled(ListPos(g.order, c), v.blkS && (v.more || c == S_PSC || c == S_IDX || c == S_WORTH));
         for (int c = J_INC; c <= J_OWE; c++) ImGui::TableSetColumnEnabled(ListPos(g.order, c), v.blkJ);
         for (int c = T_INC; c <= T_OWE; c++) ImGui::TableSetColumnEnabled(ListPos(g.order, c), v.blkT);
-        ListHeaderRow(g.order, cols, g.sort, g.pager);
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &qcDistinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
         auto inc = [&](int col, const Blk& b) { ImGui::TableSetColumnIndex(P(col)); if (b.any) ImGui::TextColored(b.inc >= 0 ? kColIn : kColOut, "%s", Eur(b.inc).c_str()); else ImGui::TextDisabled("—"); };
         auto days = [&](int col, const Blk& b) {
@@ -9402,12 +10011,12 @@ static void DrawClientRanking() {
         ImGui::TextWrapped("Ένας αριθμός 0-100 για το πόσο γρήγορα (και πόσο πλήρως) πληρώνει ένας πελάτης. 100 = πληρώνει πάντα αμέσως. Όσο πιο χαμηλά, τόσο πιο αργά ή πιο λίγο πληρώνει. Χρησιμεύει για να συγκρίνετε πελάτες μεταξύ τους και να δείτε ποιοι θέλουν παρακολούθηση.");
         ImGui::Spacing(); ImGui::TextColored(hd, "Πώς υπολογίζεται");
         ImGui::TextWrapped("Κάθε χρέωση και κάθε πληρωμή της μετράει ξεχωριστά. Για κάθε πληρωμή βρίσκουμε πόσες μέρες πέρασαν από την ημερομηνία της χρέωσης και της δίνουμε ένα βάρος:");
-        ImGui::TextUnformatted("      βάρος = 2 ^ ( - μέρες / 30 )");
-        ImGui::TextUnformatted("      βαθμός = 100 × Σ ( ποσό × βάρος ) / Σ ( ποσό )");
+        CellText("      βάρος = 2 ^ ( - μέρες / 30 )");
+        CellText("      βαθμός = 100 × Σ ( ποσό × βάρος ) / Σ ( ποσό )");
         ImGui::TextWrapped("Δηλαδή ο βαθμός είναι ο μέσος όρος των βαρών, με βάση το ποσό: ένα μεγάλο ποσό που πληρώθηκε αργά ρίχνει τον βαθμό περισσότερο από ένα μικρό.");
         ImGui::Spacing(); ImGui::TextColored(hd, "Τα βάρη");
-        ImGui::TextUnformatted("      αυθημερόν = 1,00   ·   σε 15 μέρες = 0,71   ·   σε 30 = 0,50");
-        ImGui::TextUnformatted("      σε 60 = 0,25   ·   σε 90 = 0,125   ·   σε 180 = 0,016");
+        CellText("      αυθημερόν = 1,00   ·   σε 15 μέρες = 0,71   ·   σε 30 = 0,50");
+        CellText("      σε 60 = 0,25   ·   σε 90 = 0,125   ·   σε 180 = 0,016");
         ImGui::Spacing(); ImGui::TextColored(hd, "Ό,τι δεν έχει πληρωθεί ακόμα");
         ImGui::TextWrapped("Το απλήρωτο ποσό μετράει σαν να πληρωνόταν 30 μέρες από σήμερα. Άρα μια παλιά απλήρωτη χρέωση (π.χ. 100 μέρες) έχει ήδη πολύ μικρό βάρος και ρίχνει τον βαθμό. Μια χρέωση του χθες δεν τον πειράζει σχεδόν καθόλου.");
         ImGui::Spacing(); ImGui::TextColored(hd, "Παραδείγματα");
@@ -9478,8 +10087,11 @@ static Partner g_partnerEdit;
 static TextBuf pe_name, pe_trade, pe_phone, pe_email, pe_afm, pe_notes;
 static int g_partnerRemoveId = -1; static std::string g_partnerRemoveName;
 
+static TextBuf pe_iban; static std::vector<ExtraRow> pe_extra;
 static void OpenPartnerEdit(const Partner* p) {
-    g_partnerEdit = p ? *p : Partner{};
+    g_partnerEdit = p ? g_app.conn->getPartner(p->id) : Partner{};       // all its details, whatever list it was opened from
+    pe_iban.set(g_partnerEdit.iban); pe_extra.clear();
+    for (auto& [k, x] : ExtraFromJson(g_partnerEdit.extra_json)) { pe_extra.emplace_back(); pe_extra.back().k.set(k); pe_extra.back().v.set(x); }
     pe_name.set(g_partnerEdit.name); pe_trade.set(g_partnerEdit.trade); pe_phone.set(g_partnerEdit.phone);
     pe_email.set(g_partnerEdit.email); pe_afm.set(g_partnerEdit.afm); pe_notes.set(g_partnerEdit.notes);
     g_partnerEditOpen = true;
@@ -9489,18 +10101,29 @@ static void DrawPartnerDialogs() {
     if (g_partnerEditOpen) { ImGui::OpenPopup("Συνεργάτης"); g_partnerEditOpen = false; }
     if (ImGui::BeginPopupModal("Συνεργάτης", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         auto field = [&](const char* label, const char* id, TextBuf& b, float w = 360.0f) {
-            ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(label); ImGui::SameLine(110);
+            ImGui::AlignTextToFramePadding(); CellText(label); ImGui::SameLine(110);
             ImGui::SetNextItemWidth(w); ImGui::InputText(id, b.data, sizeof(b.data));
         };
         field("Όνομα:", "##pn", pe_name); field("Ειδικότητα:", "##pt", pe_trade); field("Τηλέφωνο:", "##pp", pe_phone);
-        field("Email:", "##pe", pe_email); field("ΑΦΜ:", "##pa", pe_afm, 160.0f);
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Σημειώσεις:"); ImGui::SameLine(110);
+        field("Email:", "##pe", pe_email); field("ΑΦΜ:", "##pa", pe_afm, 160.0f); field("IBAN:", "##pib", pe_iban);
+        ImGui::AlignTextToFramePadding(); CellText("Σημειώσεις:"); ImGui::SameLine(110);
         ImGui::InputTextMultiline("##pno", pe_notes.data, sizeof(pe_notes.data), ImVec2(360, 70));
+        ImGui::TextDisabled("Επιπλέον στοιχεία");
+        for (size_t i = 0; i < pe_extra.size(); ) {
+            ImGui::PushID((int)i);
+            ImGui::SetNextItemWidth(150); ImGui::InputTextWithHint("##xk", "όνομα", pe_extra[i].k.data, sizeof(pe_extra[i].k.data)); ImGui::SameLine();
+            ImGui::SetNextItemWidth(220); ImGui::InputTextWithHint("##xv", "τιμή", pe_extra[i].v.data, sizeof(pe_extra[i].v.data)); ImGui::SameLine();
+            const bool gone = ImGui::SmallButton("x");
+            ImGui::PopID();
+            if (gone) pe_extra.erase(pe_extra.begin() + i); else i++;
+        }
+        if (ImGui::SmallButton("+ Προσθήκη στοιχείου")) pe_extra.emplace_back();
         bool ok = pe_name.str().find_first_not_of(" \t") != std::string::npos;
         ImGui::BeginDisabled(!ok);
         if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) {
             Partner p = g_partnerEdit; p.name = pe_name.str(); p.trade = pe_trade.str(); p.phone = pe_phone.str();
-            p.email = pe_email.str(); p.afm = pe_afm.str(); p.notes = pe_notes.str();
+            p.email = pe_email.str(); p.afm = pe_afm.str(); p.notes = pe_notes.str(); p.iban = pe_iban.str();
+            { ExtraList xl; for (auto& r : pe_extra) xl.push_back({r.k.str(), r.v.str()}); p.extra_json = ExtraToJson(xl); }
             if (g_app.conn->savePartner(p) > 0) { g_app.reloadGen++; ImGui::CloseCurrentPopup(); }
         }
         ImGui::EndDisabled();
@@ -9519,6 +10142,9 @@ static void DrawPartnerDialogs() {
     }
 }
 
+static const char* PartnerJobKind(const DataConn::PartnerJob& j) {
+    return j.kind == "joint" ? "Κοινόχρηστο" : j.kind == "package" ? "Πακέτο · χρέωση" : j.kind == "contract_package" ? "Πακέτο · σύμβαση" : j.kind == "contract_service" ? "Υπηρεσία · σύμβαση" : "Υπηρεσία · χρέωση";
+}
 static std::string PartnerJobStatus(const DataConn::PartnerJob& j, ImVec4& col) {
     if (j.balance > 0.005) { col = kColWeOwe; return "Οφειλούμενο " + Eur(j.balance); }
     col = kColOut; return "Πληρώθηκε";
@@ -9535,19 +10161,29 @@ static void DrawPayOutDialog() {
     if (g_poCharge < 0) return;
     ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Πληρωμή προς συνεργάτη", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted(g_poTitle.c_str());
+        CellText(g_poTitle.c_str());
         ImGui::TextColored(kColWeOwe, "Οφειλούμενο: %s", Eur(g_poBalance).c_str());
         ImGui::Spacing();
         ImGui::SetNextItemWidth(160); ImGui::InputText("Ποσό που πληρώνουμε (€)", g_poAmount.data, sizeof(g_poAmount.data));
         double amt = 0.0; bool ok = MoneyFieldHint(g_poAmount) && ParseMoney(g_poAmount.str(), amt) && ToCents(amt) > 0 && ToCents(amt) <= ToCents(g_poBalance);
         if (!ok) ImGui::TextColored(kColOut, "Ποσό από 0,01 έως το οφειλούμενο.");
         else if (ToCents(amt) < ToCents(g_poBalance)) ImGui::TextColored(kColWeOwe, "Θα μείνει οφειλούμενο: %s", Eur(MoneySub(g_poBalance, amt)).c_str());
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Ημερομηνία πληρωμής:"); ImGui::SameLine(); DatePicker("podate", g_poDate, ImVec2(0, 1));
+        ImGui::AlignTextToFramePadding(); CellText("Ημερομηνία πληρωμής:"); ImGui::SameLine(); DatePicker("podate", g_poDate, ImVec2(0, 1));
+        static int poMethod = 0, poDoc = 0; static TextBuf poNumber, poNotes; static std::string poDocDate;
+        ImGui::SetNextItemWidth(220); ImGui::Combo("Τρόπος πληρωμής", &poMethod, kReceiptMethodNames, IM_ARRAYSIZE(kReceiptMethodNames));
+        SectionTitle("Παραστατικό συνεργάτη");
+        ImGui::RadioButton("Τιμολόγιο", &poDoc, 0); ImGui::SameLine(); ImGui::RadioButton("Απόδειξη", &poDoc, 1); ImGui::SameLine(); ImGui::RadioButton("Χωρίς", &poDoc, 2);
+        if (poDoc != 2) {
+            ImGui::SetNextItemWidth(220); ImGui::InputTextWithHint("Αριθμός", poDoc == 0 ? "αρ. τιμολογίου" : "αρ. απόδειξης", poNumber.data, sizeof(poNumber.data));
+            ImGui::AlignTextToFramePadding(); CellText("Ημερομηνία παραστατικού:"); ImGui::SameLine(); DatePicker("podocdate", poDocDate, ImVec2(0, 1));
+            if (poDocDate.size() != 10) { ImGui::SameLine(); ImGui::TextColored(kColOut, "ορίστε την"); ok = false; }
+            ImGui::SetNextItemWidth(320); ImGui::InputTextWithHint("Σημείωση", "προαιρετικά", poNotes.data, sizeof(poNotes.data));
+        }
         if (!g_poError.empty()) ImGui::TextColored(kColOut, "%s", g_poError.c_str());
         ImGui::Spacing();
         ImGui::BeginDisabled(!ok);
         if (ImGui::Button("Πληρωμή", ImVec2(150, 0))) {
-            if (g_app.conn->payOutCharge(g_poCharge, amt, g_poDate)) { g_app.reloadAll(); g_poCharge = -1; ImGui::CloseCurrentPopup(); }
+            if (g_app.conn->payOutWithDoc(g_poCharge, amt, g_poDate, kReceiptMethodCodes[poMethod], poDoc == 0 ? "invoice" : poDoc == 1 ? "receipt" : "", poNumber.str(), poDocDate, poNotes.str())) { g_app.reloadAll(); g_poCharge = -1; poNumber.set(""); poNotes.set(""); poDocDate.clear(); ImGui::CloseCurrentPopup(); }
             else g_poError = g_app.conn->takeLastError();
         }
         ImGui::EndDisabled();
@@ -9556,6 +10192,23 @@ static void DrawPayOutDialog() {
         ImGui::EndPopup();
     }
 }
+// Τιμολόγια: what partners gave us for what we paid them. partnerId 0 = everybody. Files attach to the payment.
+static void DrawPartnerDocs(int partnerId) {
+    static std::map<int, std::pair<std::string, std::string>> ranges; auto& rg = ranges[partnerId];
+    DrawDateRange(("pdoc" + std::to_string(partnerId)).c_str(), rg.first, rg.second);
+    static std::map<int, Cached<std::vector<DataConn::PartnerDoc>>> cache;
+    const auto& rows = cache[partnerId].get(rg.first + "|" + rg.second, [&] { return g_app.conn->getPartnerDocs(partnerId, rg.first, rg.second); });
+    using D = DataConn::PartnerDoc;
+    long long inv = 0, rec = 0; for (auto& d : rows) (d.type == "invoice" ? inv : rec) += ToCents(d.amount);
+    ImGui::Text("Τιμολόγια %s", Eur(FromCents(inv)).c_str()); ImGui::SameLine(); ImGui::Text("· Αποδείξεις %s", Eur(FromCents(rec)).c_str());
+    if (rows.empty()) { ImGui::TextDisabled("Κανένα παραστατικό. Καταχωρίζεται όταν πληρώνετε συνεργάτη («Πληρωμή» στα κόστη μας)."); return; }
+    static std::map<int, GridState> gs; static const ListColDef cols[8] = { LC("Τύπος"), LC("Αριθμός"), LC("Ημ/νία"), LC("Συνεργάτης"), LC("Για"), LC("Ποσό"), LC("Πληρώθηκε"), LC("Τρόπος") };
+    auto text = [](const D& d, int c) -> std::string { switch (c) { case 0: return d.type == "invoice" ? "Τιμολόγιο" : "Απόδειξη"; case 1: return d.number; case 2: return DateGr(d.date); case 3: return d.partner; case 4: return d.what; case 5: return Eur(d.amount); case 6: return DateGr(d.pay_date); default: return ReceiptMethodName(d.method); } };
+    static int openPay = -1;
+    DrawMiniList("pdocs", gs[partnerId], cols, 8, rows, text, [&](const D& d, int c) { CellText(text(d, c).c_str()); }, [](const D& d) { openPay = d.payment_id; });
+    if (openPay > 0) { SectionTitle("Αρχεία παραστατικού"); DrawAttachmentsPanel("payment", openPay); }
+}
+
 // The cost lines paid to one partner, with the payments of a line shown while hovering it.
 enum { PJ_DATE, PJ_PARTNER, PJ_SERVICE, PJ_FOR, PJ_AMOUNT, PJ_PAID, PJ_STATUS, PJ_KIND, PJ_ACT, PJ_COUNT };
 static const ListColDef kPartnerJobCols[PJ_COUNT] = {
@@ -9570,14 +10223,14 @@ static SortSpec PartnerJobSort(const SortSpec& s) {           // the SQL's own c
 
 // The cost lines paid to partners, with the payments of a line shown while hovering it. showPartner: the recent-actions
 // table (all partners) shows who was paid; the profile of one partner hides that column and shows how much was paid.
-static void DrawPartnerJobsTable(const char* id, const std::vector<DataConn::PartnerJob>& jobs, bool showPartner, float height, GridState& g) {
+static void DrawPartnerJobsTable(const char* id, const std::vector<DataConn::PartnerJob>& jobs, bool showPartner, float height, GridState& g, const DistinctFn* distinct = nullptr) {
     if (g.order.empty()) { for (int i = 0; i < PJ_COUNT; i++) g.order.push_back(i); }
     if (!ImGui::BeginTable(id, PJ_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
                                          ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ListSetupColumns(g.order, kPartnerJobCols);
     ImGui::TableSetColumnEnabled(ListPos(g.order, showPartner ? PJ_PAID : PJ_PARTNER), false);
-    ListHeaderRow(g.order, kPartnerJobCols, g.sort, g.pager);
+    ListHeaderRow(g.order, kPartnerJobCols, g.sort, g.pager, distinct ? &g.cf : nullptr, distinct);
     auto P = [&](int c) { return ListPos(g.order, c); };
     for (auto& j : jobs) {
         ImGui::PushID(j.charge_id); ImGui::TableNextRow();
@@ -9585,7 +10238,7 @@ static void DrawPartnerJobsTable(const char* id, const std::vector<DataConn::Par
             if (!ImGui::IsItemHovered()) return;
             auto money = g_app.conn->getMoneyForCharge(j.charge_id);
             ImGui::BeginTooltip();
-            ImGui::TextUnformatted(j.service.c_str());
+            CellText(j.service.c_str());
             if (!j.notes.empty()) ImGui::TextDisabled("%s", j.notes.c_str());
             ImGui::Separator();
             if (money.empty()) ImGui::TextDisabled("Καμία πληρωμή ακόμα.");
@@ -9593,17 +10246,15 @@ static void DrawPartnerJobsTable(const char* id, const std::vector<DataConn::Par
             ImGui::EndTooltip();
         };
         std::string who = j.jointOpId > 0 ? "Κοινόχρηστο: " + j.jointLabel : (j.client.empty() ? std::string("—") : j.client);
-        ImGui::TableSetColumnIndex(P(PJ_DATE)); ImGui::TextUnformatted(DateGr(j.date).c_str()); tip();
-        if (showPartner) { ImGui::TableSetColumnIndex(P(PJ_PARTNER)); ImGui::TextUnformatted(j.partner.c_str()); tip(); }
-        ImGui::TableSetColumnIndex(P(PJ_SERVICE)); ImGui::TextUnformatted(j.service.c_str()); tip();
-        ImGui::TableSetColumnIndex(P(PJ_FOR)); ImGui::TextUnformatted(who.c_str()); tip();
-        ImGui::TableSetColumnIndex(P(PJ_AMOUNT)); ImGui::TextUnformatted(Eur(j.amount).c_str());
+        ImGui::TableSetColumnIndex(P(PJ_DATE)); CellText(DateGr(j.date).c_str()); tip();
+        if (showPartner) { ImGui::TableSetColumnIndex(P(PJ_PARTNER)); CellText(j.partner.c_str()); tip(); }
+        ImGui::TableSetColumnIndex(P(PJ_SERVICE)); CellText(j.service.c_str()); tip();
+        ImGui::TableSetColumnIndex(P(PJ_FOR)); CellText(who.c_str()); tip();
+        ImGui::TableSetColumnIndex(P(PJ_AMOUNT)); CellText(Eur(j.amount).c_str());
         if (!showPartner) { ImGui::TableSetColumnIndex(P(PJ_PAID)); ImGui::TextColored(kColOut, "%s", Eur(j.paid).c_str()); }
         ImGui::TableSetColumnIndex(P(PJ_STATUS)); { ImVec4 c; std::string s = PartnerJobStatus(j, c); ImGui::TextColored(c, "%s", s.c_str()); }
         ImGui::TableSetColumnIndex(P(PJ_KIND));
-        if (j.kind == "joint") ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1), "Κοινόχρηστο");
-        else if (j.kind == "package") ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1), "Πακέτο");
-        else ImGui::TextUnformatted("Κανονική");
+        ImGui::TextColored(j.kind == "joint" ? ImVec4(0.95f, 0.75f, 0.30f, 1) : j.kind.rfind("contract", 0) == 0 ? ImVec4(0.75f, 0.65f, 1.0f, 1) : ImVec4(0.55f, 0.80f, 0.95f, 1), "%s", PartnerJobKind(j));
         ImGui::TableSetColumnIndex(P(PJ_ACT));
         // the window of that specific charge (joint, normal or package) with its owings and the payment resolution
         if (ImGui::SmallButton("Άνοιγμα")) { if (j.jointOpId > 0) OpenJointView(j.jointOpId); else OpenPaymentView(j.charge_id); }
@@ -9617,11 +10268,13 @@ static void DrawPartnerJobsTable(const char* id, const std::vector<DataConn::Par
 // every sort key and page change fetches that page again. partnerId 0 = every partner.
 static void DrawPartnerJobsModel(const char* id, int partnerId, int kind, const std::string& from, const std::string& to, ListModel<DataConn::PartnerJob>& m, bool showPartner, float height) {
     m.Init(PJ_COUNT, {{PJ_DATE, false}}, 20);
-    const auto& pg = m.Load(std::to_string(partnerId) + "|" + std::to_string(kind) + "|" + from + "|" + to,
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadT(std::to_string(partnerId) + "|" + std::to_string(kind) + "|" + from + "|" + to,
         [&](const SortSpec& s, int off, int lim) { return g_app.conn->partnerJobs(partnerId, from, to, PartnerJobSort(s), off, lim, kind); },
-        [&] { return g_app.conn->countPartnerJobs(partnerId, from, to, kind); });
+        [&] { return g_app.conn->countPartnerJobs(partnerId, from, to, kind); },
+        [](const DataConn::PartnerJob& j, int c) -> std::string { ImVec4 col; switch (c) { case PJ_DATE: return DateGr(j.date); case PJ_PARTNER: return j.partner; case PJ_SERVICE: return j.service; case PJ_FOR: return j.jointOpId > 0 ? "Κοινόχρηστο: " + j.jointLabel : j.client; case PJ_AMOUNT: return Eur(j.amount); case PJ_PAID: return Eur(j.paid); case PJ_STATUS: return PartnerJobStatus(j, col); case PJ_KIND: return PartnerJobKind(j); default: return ""; } }, PJ_COUNT);
     if (pg.count == 0) { ImGui::TextDisabled(kind == 2 ? "Καμία δουλειά σε κοινόχρηστα σε αυτή την περίοδο." : "Καμία δουλειά σε υπηρεσίες πελατών σε αυτή την περίοδο."); return; }
-    DrawPartnerJobsTable(id, pg.rows, showPartner, height, m.g);
+    DrawPartnerJobsTable(id, pg.rows, showPartner, height, m.g, &m.distinct);
     DrawPager(m.g.pager, (std::string(id) + "pg").c_str());
 }
 
@@ -9635,7 +10288,7 @@ static void DrawPartnerProfile() {
     const Prof& pf = cache.get(key, [&] {
         Prof r;
         if (g_partnerProfileId > 0) { r.p = g_app.conn->getPartner(g_partnerProfileId); r.found = r.p.id > 0; }
-        if (g_partnerProfileId == -1) { r.p.id = -1; r.p.name = "#-1 Χωρίς συνεργάτη"; r.p.trade = "Πληρωμές χωρίς καταχωρημένο συνεργάτη"; r.found = true; }
+        if (g_partnerProfileId == -1) { r.p.id = -1; r.p.name = "#-1 Κόστος χωρίς όνομα συνεργάτη"; r.p.trade = "Πληρωμές χωρίς καταχωρημένο συνεργάτη"; r.found = true; }
         for (auto& s : g_app.conn->partnerStats(from, to)) if (s.partner_id == g_partnerProfileId) r.st = s;
         r.lastJob = r.st.lastJob;
         return r; });
@@ -9689,49 +10342,64 @@ static void OpenOffersPage() { g_page = PAGE_OFFERS; }
 static void OpenNoteFromSearch(const Note& n) { g_page = PAGE_NOTES; OpenEditNote(n); }
 
 static void DrawPartnersScreen() {
-    enum { PT_NAME, PT_TRADE, PT_PHONE, PT_EMAIL, PT_JOBS, PT_OWED, PT_LAST, PT_COUNT };
+    enum { PT_NAME, PT_TRADE, PT_PHONE, PT_EMAIL, PT_JOBS, PT_OWED, PT_LAST, PT_IBAN, PT_EXTRA, PT_COUNT };
     static const ListColDef cols[PT_COUNT] = {
         { "Όνομα", ImGuiTableColumnFlags_WidthFixed, 230.0f, true },       { "Ειδικότητα", ImGuiTableColumnFlags_WidthFixed, 190.0f, true },
         { "Τηλέφωνο", ImGuiTableColumnFlags_WidthFixed, 140.0f, true },    { "Email", ImGuiTableColumnFlags_WidthFixed, 220.0f, true },
         { "Δουλειές", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },    { "Οφειλόμενα", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },
-        { "Τελευταία δουλειά", ImGuiTableColumnFlags_WidthFixed, 150.0f, true } };
+        { "Τελευταία δουλειά", ImGuiTableColumnFlags_WidthFixed, 150.0f, true },
+        { "IBAN", ImGuiTableColumnFlags_WidthFixed, 150.0f, true }, { "Επιπλέον", ImGuiTableColumnFlags_WidthFixed, 150.0f, true } };
     static ListModel<DataConn::PartnerRow> pm; static char q[128] = "";
     static std::string rfrom, rto; static GridState rg; Pager& rpager = rg.pager;
     pm.Init(PT_COUNT, { { PT_NAME, true } }, 20);
+    if (pm.g.order[4] == PT_JOBS) pm.g.order = { PT_NAME, PT_TRADE, PT_PHONE, PT_EMAIL, PT_IBAN, PT_JOBS, PT_OWED, PT_LAST, PT_EXTRA };      // who, how to reach and pay them, their work, then notes
     if (rg.pager.pageSize == 10 || rg.pager.pageSize == 0) rg.pager.pageSize = 20;
     GridState& g = pm.g;
 
     if (ImGui::Button("+ Νέος συνεργάτης")) OpenPartnerEdit(nullptr);
-    ImGui::SameLine(); ImGui::SetNextItemWidth(300);
-    if (ImGui::InputTextWithHint("##ptq", "Αναζήτηση: όνομα, ειδικότητα, τηλέφωνο...", q, sizeof(q))) g.pager.Reset();
+    ImGui::SameLine(); 
 
     // the page comes from the database: every sort click / page change / search asks it again
-    const auto& data = pm.Load(q, [&](const SortSpec& s, int off, int lim) { return g_app.conn->pagePartnerRows(q, s, off, lim); },
-                                  [&] { return g_app.conn->countPartnerRows(q); });
+    auto ptFetch = [&](const SortSpec& s, int off, int lim) { auto v = g_app.conn->pagePartnerRows(q, s, off, lim);
+        for (auto& r : v) { const Partner full = g_app.conn->getPartner(r.p.id); r.p.iban = full.iban; r.p.extra_json = full.extra_json; } return v; };
+    auto ptText = [](const DataConn::PartnerRow& r, int c) -> std::string {
+        switch (c) { case PT_NAME: return r.p.name; case PT_TRADE: return r.p.trade; case PT_PHONE: return r.p.phone; case PT_EMAIL: return r.p.email;
+                     case PT_JOBS: return std::to_string(r.jobs); case PT_OWED: return Eur(r.owed); case PT_LAST: return r.last.empty() ? std::string() : DateGr(r.last); case PT_IBAN: return r.p.iban; case PT_EXTRA: return ExtraText(r.p.extra_json); default: return ""; } };
+    ImGui::SameLine(); DrawListSearch(g, 240);
+    const auto& data = pm.LoadF(q, ptFetch, [&] { return g_app.conn->countPartnerRows(q); }, ptText, PT_COUNT);
+    const DistinctFn ptDistinct = [&](int col, const std::string& s) { return ListDistinct(pm.All(q, ptFetch), g, ptText, PT_COUNT, col, s); };
     const auto& rows = data.rows;
     ImGui::SameLine(); ImGui::TextDisabled("%d συνεργάτες", g.pager.total);
     ImGui::TextDisabled("Κλικ στο όνομα ενός συνεργάτη: το προφίλ του με όλες τις δουλειές (εκεί και η επεξεργασία / διαγραφή). Το «Κόστος για εμάς» κάθε χρέωσης μπορεί να συνδεθεί με συνεργάτη.");
     float avail = ImGui::GetContentRegionAvail().y;
     ImGui::BeginChild("partnerlist", ImVec2(0, std::max(180.0f, avail * 0.45f)), false);
-    if (rows.empty()) ImGui::TextDisabled(q[0] ? "Κανένας συνεργάτης με αυτή την αναζήτηση." : "Δεν έχετε καταχωρήσει συνεργάτες ακόμα. Πατήστε «+ Νέος συνεργάτης».");
+    if (rows.empty() && g.cf.any()) ImGui::TextDisabled("Κανένας συνεργάτης με αυτά τα φίλτρα.");
     else {
         float h = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
         if (ImGui::BeginTable("partners", PT_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
                                                     ImGuiTableFlags_Resizable, ImVec2(0, std::max(100.0f, h)))) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ListSetupColumns(g.order, cols);
-            ListHeaderRow(g.order, cols, g.sort, g.pager);
+            ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &ptDistinct);
             auto P = [&](int c) { return ListPos(g.order, c); };
+            if (g.pager.offset == 0 && !g.cf.any()) {      // always there: no cost at all, and a cost with no partner named
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(P(PT_NAME)); ImGui::TextDisabled("#0 Χωρίς κόστος");
+                ImGui::TableSetColumnIndex(P(PT_TRADE)); ImGui::TextDisabled("Δεν υπάρχει κόστος, δεν χρειάζεται συνεργάτης");
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(P(PT_NAME)); if (ImGui::Selectable("#-1 Κόστος χωρίς όνομα", false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) g_partnerProfileId = -1;
+                ImGui::TableSetColumnIndex(P(PT_TRADE)); ImGui::TextDisabled("Υπάρχει κόστος, αλλά δεν καταγράφεται συνεργάτης");
+            }
             for (const auto& r : rows) {
                 const Partner& p = r.p;
                 ImGui::PushID(p.id); ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(P(PT_NAME)); if (LinkCell(p.name)) g_partnerProfileId = p.id;
-                ImGui::TableSetColumnIndex(P(PT_TRADE)); ImGui::TextUnformatted(p.trade.c_str());
-                ImGui::TableSetColumnIndex(P(PT_PHONE)); ImGui::TextUnformatted(p.phone.c_str());
-                ImGui::TableSetColumnIndex(P(PT_EMAIL)); ImGui::TextUnformatted(p.email.c_str());
+                ImGui::TableSetColumnIndex(P(PT_NAME)); if (ImGui::Selectable(p.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) g_partnerProfileId = p.id;
+                ImGui::TableSetColumnIndex(P(PT_TRADE)); CellText(p.trade.c_str());
+                ImGui::TableSetColumnIndex(P(PT_PHONE)); CellText(p.phone.c_str());
+                ImGui::TableSetColumnIndex(P(PT_EMAIL)); CellText(p.email.c_str());
                 ImGui::TableSetColumnIndex(P(PT_JOBS)); ImGui::Text("%d", r.jobs);
                 ImGui::TableSetColumnIndex(P(PT_OWED)); if (r.owed > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(r.owed).c_str()); else ImGui::TextDisabled("—");
-                ImGui::TableSetColumnIndex(P(PT_LAST)); if (r.last.empty()) ImGui::TextDisabled("—"); else ImGui::TextUnformatted(DateGr(r.last).c_str());
+                ImGui::TableSetColumnIndex(P(PT_LAST)); if (r.last.empty()) ImGui::TextDisabled("—"); else CellText(DateGr(r.last).c_str());
+                ImGui::TableSetColumnIndex(P(PT_IBAN)); CellText(p.iban.c_str());
+                ImGui::TableSetColumnIndex(P(PT_EXTRA)); CellText(ExtraText(p.extra_json).c_str());
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -9815,8 +10483,7 @@ static void DrawHomeOwings(const char* id, bool joint, float height) {
     GridState& g = s.g;
     if (g.order.empty()) { for (int i = 0; i < HC_COUNT; i++) g.order.push_back(i); g.sort.keys = { { HC_OWING, false } }; g.pager.pageSize = 10; }
     ImGui::PushID(id);
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputTextWithHint("##q", joint ? "Αναζήτηση ενοίκου..." : "Αναζήτηση πελάτη...", s.q, sizeof(s.q))) g.pager.Reset();
+    
     std::string sk;
     for (auto& k : g.sort.keys) sk += std::to_string(k.first) + (k.second ? "a" : "d");
     struct Pg { std::vector<DataConn::ClientOwing> rows; int count = 0; };
@@ -9825,14 +10492,18 @@ static void DrawHomeOwings(const char* id, bool joint, float height) {
         Pg p; p.count = g_app.conn->countClientOwings(s.q, nullptr, joint);
         p.rows = g_app.conn->pageClientOwings(s.q, g.sort.keys, g.pager.offset, g.pager.pageSize, joint); return p; });
     g.pager.total = pg.count;
+    static ListModel<DataConn::ClientOwing> owM[2]; ListModel<DataConn::ClientOwing>& om = owM[joint ? 1 : 0]; std::vector<DataConn::ClientOwing> owRows = pg.rows;
+    DrawListSearch(om.g);
+    { const std::string qs = s.q; om.Override(g.pager, g.sort.keys, qs, [=](const SortSpec& ss, int off, int lim) { return g_app.conn->pageClientOwings(qs, ss, off, lim, joint); },
+        [](const DataConn::ClientOwing& r, int c) -> std::string { switch (c) { case HC_NAME: return r.name; case HC_OWING: return Eur(r.owing); case HC_N: return std::to_string(r.openCharges); case HC_OLDEST: return DateGr(r.oldest); default: return ""; } }, HC_COUNT, owRows, g.pager.total); }
     if (pg.count == 0) ImGui::TextColored(kColIn, joint ? "Κανένας ένοικος δεν οφείλει κοινόχρηστα." : "Κανένας πελάτης δεν οφείλει.");
     else {
         ImGui::BeginChild("##list", ImVec2(0, height), ImGuiChildFlags_None);
         if (ImGui::BeginTable("##t", HC_COUNT, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
             ListSetupColumns(g.order, cols);
-            ListHeaderRow(g.order, cols, g.sort, g.pager);
+            ListHeaderRow(g.order, cols, g.sort, g.pager, &om.g.cf, &om.distinct);
             auto P = [&](int c) { return ListPos(g.order, c); };
-            for (auto& r : pg.rows) {
+            for (auto& r : owRows) {
                 ImGui::PushID(r.user_id); ImGui::TableNextRow();
                 bool isOpen = s.open.count(r.user_id) > 0;
                 ImGui::TableSetColumnIndex(P(HC_NAME));
@@ -9842,7 +10513,7 @@ static void DrawHomeOwings(const char* id, bool joint, float height) {
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) OpenUserProfile(r.user_id);
                 ImGui::TableSetColumnIndex(P(HC_OWING)); ImGui::TextColored(kColOwed, "%s", Eur(r.owing).c_str());
                 ImGui::TableSetColumnIndex(P(HC_N)); ImGui::Text("%d", r.openCharges);
-                ImGui::TableSetColumnIndex(P(HC_OLDEST)); ImGui::TextUnformatted(DateGr(r.oldest).c_str());
+                ImGui::TableSetColumnIndex(P(HC_OLDEST)); CellText(DateGr(r.oldest).c_str());
                 ImGui::TableSetColumnIndex(P(HC_ACT)); if (ImGui::SmallButton("Είσπραξη")) OpenRecordPayment(r.user_id);
                 if (isOpen) {
                     ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
@@ -9852,7 +10523,7 @@ static void DrawHomeOwings(const char* id, bool joint, float height) {
                         if ((p.joint_op_id > 0) != joint) continue;
                         ImGui::PushID(p.id);
                         ImGui::TextDisabled("%s", DateGr(p.year, p.month, p.day).c_str()); ImGui::SameLine();
-                        ImGui::TextUnformatted(ChargeLabel(p).c_str());
+                        CellText(ChargeLabel(p).c_str());
                         ImGui::SameLine(); ImGui::TextColored(kColOwed, "%s", Eur(p.balance).c_str());
                         ImGui::SameLine(); if (ImGui::SmallButton("Προβολή")) { if (joint) OpenJointView(p.joint_op_id); else OpenPaymentView(p.id); }
                         ImGui::PopID();
@@ -9870,38 +10541,18 @@ static void DrawHomeOwings(const char* id, bool joint, float height) {
 }
 
 // What we owe our partners, biggest first, with «Πληρωμή» on each line.
-static void DrawHomeWeOwe(float height) {
-    static Pager pager; static bool init = false; if (!init) { pager.pageSize = 10; init = true; }
-    struct Pg { std::vector<DataConn::PartnerJob> rows; int count = 0; };
-    static Cached<Pg> pc;
-    const Pg& pg = pc.get(std::to_string(pager.offset) + "|" + std::to_string(pager.pageSize), [&] {
-        Pg p; p.count = g_app.conn->countPartnerJobs(0, "", "", 1, true);
-        p.rows = g_app.conn->partnerJobs(0, "", "", {{6, false}}, pager.offset, pager.pageSize, 1, true); return p; });
-    pager.total = pg.count;
-    if (pg.count == 0) { ImGui::TextColored(kColIn, "Δεν χρωστάμε τίποτα σε κανέναν."); return; }
-    ImGui::BeginChild("##weowe", ImVec2(0, height), ImGuiChildFlags_None);
-    if (ImGui::BeginTable("##wo", 4, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Σε ποιον", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Για", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Οφείλουμε", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 68.0f);
-        ImGui::TableHeadersRow();
-        for (auto& j : pg.rows) {
-            ImGui::PushID(j.charge_id); ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            if (ImGui::Selectable(j.partner.empty() ? "(χωρίς συνεργάτη)" : j.partner.c_str(), false, ImGuiSelectableFlags_AllowOverlap) && j.partner_id > 0) OpenPartnerProfile(j.partner_id);
-            ImGui::TableNextColumn();
-            std::string what = j.service + (j.jointLabel.empty() ? (j.client.empty() ? "" : " · " + j.client) : " · " + j.jointLabel);
-            ImGui::TextUnformatted(what.c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s · %s", DateGr(j.date).c_str(), what.c_str());
-            ImGui::TableNextColumn(); ImGui::TextColored(kColWeOwe, "%s", Eur(j.balance).c_str());
-            ImGui::TableNextColumn(); if (ImGui::SmallButton("Πληρωμή")) OpenPayOut(j);
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-    ImGui::EndChild();
-    DrawPager(pager, "wopg");
+static void DrawHomeWeOwe(float) {
+    static Cached<std::vector<DataConn::PartnerJob>> pc;
+    const auto& rows = pc.get("", [] { return g_app.conn->partnerJobs(0, "", "", {{6, false}}, 0, 1000000, 1, true); });
+    if (rows.empty()) { ImGui::TextColored(kColIn, "Δεν χρωστάμε τίποτα σε κανέναν."); return; }
+    static GridState g; static const ListColDef cols[4] = { LC("Σε ποιον"), LC("Για"), LC("Οφείλουμε"), LCA };
+    auto what = [](const DataConn::PartnerJob& j) { return j.service + (j.jointLabel.empty() ? (j.client.empty() ? "" : " · " + j.client) : " · " + j.jointLabel); };
+    auto text = [what](const DataConn::PartnerJob& j, int c) -> std::string { switch (c) { case 0: return j.partner.empty() ? "(χωρίς συνεργάτη)" : j.partner; case 1: return what(j); case 2: return Eur(j.balance); default: return ""; } };
+    DrawMiniList("homewo", g, cols, 4, rows, text, [&](const DataConn::PartnerJob& j, int c) {
+        if (c == 0) { if (j.partner_id > 0) { if (LinkCell(j.partner)) OpenPartnerProfile(j.partner_id); } else ImGui::TextDisabled("(χωρίς συνεργάτη)"); }
+        else if (c == 2) ImGui::TextColored(kColWeOwe, "%s", Eur(j.balance).c_str());
+        else if (c == 3) { if (ImGui::SmallButton("Πληρωμή")) OpenPayOut(j); }
+        else CellText(what(j).c_str()); }, [](const DataConn::PartnerJob&) {});
 }
 
 // Home only: a slim tab on the right edge of the window. Hovering it slides a board in from the right, up to half
@@ -9995,11 +10646,29 @@ static void DrawNotesDrawer() {
 
 
 
+// What residents owe today, from which month and towards what. Not our money, except our fees.
+static int g_mgSel = -1;                  // the building open on the right
+static void DrawHomeResidentOwings() {
+    static Cached<std::vector<DataConn::ResidentOwing>> cache;
+    const auto& rows = cache.get("", [] { return g_app.conn->residentOwingsByMonth(); });
+    long long total = 0; std::set<int> who; for (auto& r : rows) { total += ToCents(r.owed); who.insert(r.user_id); }
+    HomeSection("Οφειλές ενοίκων", rows.empty() ? "κανείς δεν χρωστάει" : (std::to_string(who.size()) + " ένοικοι · " + Eur(FromCents(total))).c_str());
+    if (rows.empty()) return;
+    ImGui::TextDisabled("Χρήματα των πολυκατοικιών, όχι δικά μας. Οι παλαιότερες πρώτες.");
+    {
+        static GridState g; static const ListColDef cols[6] = { LC("Μήνας"), LC("Πολυκατοικία"), LC("Διαμ."), LC("Ένοικος"), LC("Οφειλή"), LC("Προς") };
+        auto text = [](const DataConn::ResidentOwing& r, int c) -> std::string { switch (c) { case 0: return r.ym; case 1: return r.building; case 2: return r.apartment; case 3: return r.name; case 4: return Eur(r.owed); default: return r.to == "cost" ? "Ενεργό κόστος μήνα" : r.to == "deposit" ? "Αποθεματικό" : "Παλιό αποθεματικό"; } };
+        DrawMiniList("homeresow", g, cols, 6, rows, text, [&](const DataConn::ResidentOwing& r, int c) {
+            if (c == 1) { if (LinkCell(r.building)) { g_mgSel = r.building_id; g_page = PAGE_JOINT; } } else if (c == 3) { if (LinkCell(r.name)) OpenResident(r.user_id); }
+            else if (c == 4) ImGui::TextColored(kColOwed, "%s", Eur(r.owed).c_str()); else CellText(text(r, c).c_str()); }, [](const DataConn::ResidentOwing&) {});
+    }
+}
+
 static void DrawHomeScoringPreview() {
     static int mainTab = 0;   // 0 = Πελάτες, 1 = Πολυκατοικίες
     static int subTab  = 0;   // 0 = Χρωστάνε τώρα, 1 = Καθυστερήσεις (30+ ημέρες)
 
-    static const char*  kLevelName[]  = { "Εντάξει", "Χρωστάει τώρα", "Καθυστερεί", "Πρόβλημα" };
+    static const char*  kLevelName[]  = { "Εντάξει", "Χρωστάει", "Χρωστάει", "Πρόβλημα" };
     static const ImVec4 kLevelColor[] = {
         ImVec4(0.35f, 0.80f, 0.45f, 1.0f),
         ImVec4(0.45f, 0.70f, 1.00f, 1.0f),
@@ -10010,13 +10679,13 @@ static void DrawHomeScoringPreview() {
     auto verdict = [](bool loss, const char* lossWhy, double pay, double late) -> Verdict {
         if (loss)                 return { 3, std::string(lossWhy) };
         if (pay >= 0 && pay < 40) return { 3, std::string("Πληρώνει στην ώρα του σπάνια") };
-        if (late > 0.005)         return { 2, "Καθυστερεί " + Eur(late) };
+        if (late > 0.005)         return { 2, std::string() };
         return { 0, std::string("Εντάξει") };
     };
 
     struct Row {
         int  id = -1, building_id = -1;
-        bool isBuilding = false;
+        int kind = 0;                // 0 a client's services, 1 a client's contracts, 2 a building's resident
         std::string name;
         double owes = 0, late = 0;
         int  level = 0;
@@ -10027,96 +10696,87 @@ static void DrawHomeScoringPreview() {
         std::vector<Row> out;
         auto qs = g_app.conn->clientQuality(0, "", "");
 
-        std::map<int, int> clientToBid;
-        std::map<int, size_t> rowOf;
-        for (int b : g_app.conn->getManagedBuildings()) {
-            int cid = BuildingClientId(b);
-            if (cid > 0) clientToBid[cid] = b;
-            Row r; r.isBuilding = true; r.building_id = b;
-            r.name = g_app.conn->getBuildingById(b).address;
-            rowOf[b] = out.size(); out.push_back(r);
-        }
-        for (auto& q : qs) {
-            if (clientToBid.count(q.user_id)) continue;
+        std::map<int, DataConn::ContractOwing> ct;
+        for (auto& o : g_app.conn->contractOwings()) ct[o.user_id] = o;
+        for (auto& q : qs) {                                  // a building we bill counts here too, as a client
             if (q.chargesClient == 0) continue;
-            Row r; r.id = q.user_id; r.name = q.name;
-            r.owes = q.openClient; r.late = q.overdueClient;
+            const auto cit = ct.find(q.user_id);
+            Row r; r.kind = 0; r.id = q.user_id; r.name = q.name;
+            r.owes = cit == ct.end() ? q.openClient : MoneySub(q.openClient, cit->second.owed);
+            r.late = cit == ct.end() ? q.overdueClient : MoneySub(q.overdueClient, cit->second.late);
             double pay = DataConn::QualityRow::OnTime(q.onTimeClient, q.dueClient);
             bool loss = MoneySub(q.income, q.cost) < -0.005;
-            auto v = verdict(loss, "Ζημιά ακόμα κι όταν εισπραχθούν όλα", pay, q.overdueClient);
+            auto v = verdict(loss, "Ζημιά ακόμα κι όταν εισπραχθούν όλα", pay, r.owes);
             r.level = v.lv; r.why = v.why;
             out.push_back(r);
         }
-        for (auto& q : qs) {
-            auto it = clientToBid.find(q.user_id);
-            if (it == clientToBid.end()) continue;
-            Row& r = out[rowOf[it->second]];
-            r.id = q.user_id;
-            r.owes = q.openClient; r.late = q.overdueClient;
+        for (auto& [uid, o] : ct) {
+            Row r; r.kind = 1; r.id = uid; r.name = o.name; r.owes = o.owed; r.late = o.late;
+            auto v = verdict(false, "", -1, o.owed); r.level = v.lv; r.why = v.why;
+            out.push_back(r);
         }
         for (auto& rq : g_app.conn->residentQuality("", "")) {
-            auto it = rowOf.find(rq.building_id);
-            if (it == rowOf.end()) continue;
-            Row& r = out[it->second];
-            r.owes = FromCents(ToCents(r.owes) + ToCents(rq.fundOpen) + ToCents(rq.feeOpen));
-            r.late = FromCents(ToCents(r.late) + ToCents(rq.fundOverdue) + ToCents(rq.feeOverdue));
-        }
-        for (auto& [bid, idx] : rowOf) {
-            Row& r = out[idx];
-            const DataConn::QualityRow* q = nullptr;
-            for (auto& cq : qs) if (cq.user_id == r.id) { q = &cq; break; }
-            bool fundLoss   = g_app.conn->getFundBalance(bid) < -0.005;
-            bool clientLoss = q && MoneySub(q->income, q->cost) < -0.005;
-            const char* why = fundLoss ? "Αρνητικό ταμείο" : "Ζημιά ακόμα κι όταν εισπραχθούν όλα";
-            double pay = q ? DataConn::QualityRow::OnTime(q->onTimeClient, q->dueClient) : -1;
-            auto v = verdict(fundLoss || clientLoss, why, pay, r.late);
-            r.level = v.lv; r.why = v.why;
+            Row r; r.kind = 2; r.id = rq.user_id; r.building_id = rq.building_id; r.name = rq.name + " · " + rq.building + (rq.apartment.empty() ? "" : " " + rq.apartment);
+            r.owes = FromCents(ToCents(rq.fundOpen) + ToCents(rq.feeOpen)); r.late = FromCents(ToCents(rq.fundOverdue) + ToCents(rq.feeOverdue));
+            auto v = verdict(false, "", DataConn::QualityRow::OnTime(rq.onTime, rq.due), r.owes); r.level = v.lv; r.why = v.why;
+            out.push_back(r);
         }
         return out;
     });
 
-    ImGui::BeginChild("scoring_preview", ImVec2(0, 420), ImGuiChildFlags_Border);
+    ImGui::BeginChild("scoring_preview", ImVec2(0, 480), ImGuiChildFlags_Border);
     ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1), "Γρήγορη Εικόνα Οφειλών");
     ImGui::SameLine(ImGui::GetContentRegionMax().x - 150);
     if (ImGui::Button("Αξιολόγηση ►", ImVec2(150, 0))) {
         g_page = PAGE_SCORING;
-        g_scoringTab = mainTab;
+        g_scoringTab = mainTab == 2 ? 2 : 0;
     }
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("preview_main")) {
-        if (ImGui::BeginTabItem("Πελάτες"))       { mainTab = 0; ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Πολυκατοικίες")) { mainTab = 1; ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Πελάτες με υπηρεσίες")) { mainTab = 0; ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Πελάτες με συμβάσεις")) { mainTab = 1; ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Ένοικοι πολυκατοικιών")) { mainTab = 2; ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Οφειλές μας")) { mainTab = 3; ImGui::EndTabItem(); }
+        {   static Cached<std::vector<DataConn::ManageScore>> lowC;
+            const auto& low = lowC.get("", [] { std::vector<DataConn::ManageScore> v; for (auto& m : g_app.conn->manageScores("", "")) if (ToCents(m.deposit) < 0 || (ToCents(m.depositMin) > 0 && ToCents(m.deposit) < ToCents(m.depositMin))) v.push_back(m); return v; });
+            const std::string lbl = "Χαμηλά αποθεματικά (" + std::to_string(low.size()) + ")###lowdep";
+            ImGui::PushStyleColor(ImGuiCol_Text, low.empty() ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : kColOut);
+            const bool on = ImGui::BeginTabItem(lbl.c_str());
+            ImGui::PopStyleColor();
+            if (on) {
+                mainTab = 4; ImGui::EndTabItem(); ImGui::EndTabBar();
+                if (low.empty()) ImGui::TextColored(kColIn, "Όλα τα αποθεματικά είναι πάνω από το όριό τους.");
+                else {
+                    static GridState g; static const ListColDef cols[4] = { LC("Πολυκατοικία"), LC("Αποθεματικό"), LC("Όριο"), LC("Λείπουν") };
+                    auto text = [](const DataConn::ManageScore& m, int c) -> std::string { switch (c) { case 0: return m.address; case 1: return Eur(m.deposit); case 2: return Eur(m.depositMin); default: return Eur(MoneySub(m.depositMin, m.deposit)); } };
+                    DrawMiniList("lowdeps", g, cols, 4, low, text, [&](const DataConn::ManageScore& m, int c) {
+                        if (c == 0) { if (LinkCell(m.address)) { g_mgSel = m.building_id; g_page = PAGE_JOINT; } } else if (c == 2) CellText(text(m, c).c_str()); else ImGui::TextColored(kColOut, "%s", text(m, c).c_str()); }, [](const DataConn::ManageScore&) {});
+                }
+                ImGui::EndChild(); return;
+            }
+        }
         ImGui::EndTabBar();
     }
     // Counts on the labels: the only honest way for the user to see the filter working,
     // because "owes now" and "late" are usually the same people at different depths.
-    int nOwe = 0, nLate = 0;
-    for (auto& r : allRows) {
-        if (r.isBuilding != (mainTab == 1)) continue;
-        if (r.owes > 0.005) nOwe++;
-        if (r.late > 0.005) nLate++;
+    if (mainTab == 3) {                                                             // what we owe partners, one line per cost
+        if (ImGui::SmallButton("Συνεργάτες ►")) g_page = PAGE_PARTNERS;
+        DrawHomeWeOwe(std::max(180.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f));
+        ImGui::EndChild(); return;
     }
-    char tOwe[64], tLate[80];
-    std::snprintf(tOwe,  sizeof(tOwe),  "Χρωστάνε τώρα (%d)", nOwe);
-    std::snprintf(tLate, sizeof(tLate), "Καθυστερήσεις 30+ ημ. (%d)", nLate);
-    if (ImGui::BeginTabBar("preview_sub")) {
-        if (ImGui::BeginTabItem(tOwe))  { subTab = 0; ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(tLate)) { subTab = 1; ImGui::EndTabItem(); }
-        ImGui::EndTabBar();
-    }
-
+    if (mainTab == 2) { DrawHomeResidentOwings(); ImGui::EndChild(); return; }      // residents: who owes, from which month, towards what
     std::vector<const Row*> shown;
     for (auto& r : allRows) {
-        if (r.isBuilding != (mainTab == 1)) continue;
+        if (r.kind != mainTab) continue;
         if (subTab == 0 ? r.owes > 0.005 : r.late > 0.005) shown.push_back(&r);
     }
 
     if (shown.empty()) {
         ImGui::Spacing();
         ImGui::TextDisabled(subTab == 0
-            ? (mainTab == 0 ? "Κανένας πελάτης δεν χρωστάει." : "Καμία πολυκατοικία δεν χρωστάει.")
-            : (mainTab == 0 ? "Καμία καθυστέρηση σε πελάτες." : "Καμία καθυστέρηση σε πολυκατοικίες."));
+            ? (mainTab == 2 ? "Κανένας ένοικος δεν χρωστάει." : "Κανένας πελάτης δεν χρωστάει.")
+            : (mainTab == 2 ? "Καμία καθυστέρηση σε ενοίκους." : "Καμία καθυστέρηση σε πελάτες."));
         ImGui::EndChild();
         return;
     }
@@ -10125,14 +10785,12 @@ static void DrawHomeScoringPreview() {
     // sort AND gets the right default sort:
     //   "owes now"  → sorted by "Χρωστάει τώρα" (col 1), biggest total owed first
     //   "late"      → sorted by "Καθυστερεί"    (col 2), biggest overdue amount first
-    static GridState gClientOwe, gClientLate, gBldOwe, gBldLate;
-    GridState& g = mainTab == 0
-        ? (subTab == 0 ? gClientOwe  : gClientLate)
-        : (subTab == 0 ? gBldOwe     : gBldLate);
+    static GridState grids[3][2];
+    GridState& g = grids[mainTab][subTab];
     static const ListColDef cols[4] = {
         { "Όνομα",         ImGuiTableColumnFlags_WidthStretch, 3.0f,   true },
-        { "Χρωστάει τώρα", ImGuiTableColumnFlags_WidthFixed,   120.0f, true },
-        { "Καθυστερεί",    ImGuiTableColumnFlags_WidthFixed,   110.0f, true },
+        { "Χρωστάει",      ImGuiTableColumnFlags_WidthFixed,   120.0f, true },
+        { "",              ImGuiTableColumnFlags_WidthFixed,   110.0f, false },
         { "Κατάσταση",     ImGuiTableColumnFlags_WidthStretch, 2.5f,   true },
     };
     if (g.order.empty()) {
@@ -10156,30 +10814,36 @@ static void DrawHomeScoringPreview() {
         return false;
     });
 
+    auto pvText = [](const Row& r, int c) -> std::string { return c == 0 ? r.name : c == 1 ? Eur(r.owes) : c == 3 ? std::string(kLevelName[r.level]) + " " + r.why : std::string(); };
+    DrawListSearch(g, 240);
+    shown.erase(std::remove_if(shown.begin(), shown.end(), [&](const Row* r) { return !ListRowMatches(*r, g, pvText, 4); }), shown.end());
+    const DistinctFn pvDistinct = [&](int col, const std::string& q) {
+        std::vector<Row> rs; for (auto& r : allRows) if (r.kind == mainTab && (subTab == 0 ? r.owes > 0.005 : r.late > 0.005)) rs.push_back(r);
+        return ListDistinct(rs, g, pvText, 4, col, q); };
     g.pager.total = (int)shown.size();
     if (g.pager.offset >= g.pager.total) g.pager.Reset();
 
     float pagerH = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 3.0f;
     float tableH = std::max(100.0f, ImGui::GetContentRegionAvail().y - pagerH);
-    if (ImGui::BeginTable(mainTab == 0 ? "cprevtbl" : "bprevtbl", 4,
-                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+    if (ImGui::BeginTable(mainTab == 0 ? "cprevtbl" : mainTab == 1 ? "kprevtbl" : "bprevtbl", 4,
+                          ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
                           ImVec2(0, tableH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        bool saved = g_listCompact;
-        g_listCompact = true;
+        
+        
         ListSetupColumns(g.order, cols);
-        ListHeaderRow(g.order, cols, g.sort, g.pager);
-        g_listCompact = saved;
+        ImGui::TableSetColumnEnabled(ListPos(g.order, 2), false);      // owing and being late are the same thing here
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &pvDistinct);
+        
         auto P = [&](int c) { return ListPos(g.order, c); };
         const int end = std::min(g.pager.total, g.pager.offset + g.pager.pageSize);
         for (int i = g.pager.offset; i < end; i++) {
             const Row* r = shown[i];
-            ImGui::PushID(r->isBuilding ? -r->building_id : r->id);
+            ImGui::PushID(r->kind == 2 ? -r->id * 1000 - r->building_id : r->id);
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(P(0));
             if (LinkCell(r->name)) {
-                if (r->isBuilding) g_page = PAGE_JOINT;
-                else               OpenUserProfile(r->id);
+                if (r->kind == 2) OpenResident(r->id); else OpenUserProfile(r->id);
             }
             ImGui::TableSetColumnIndex(P(1));
             ImGui::TextColored(r->owes > 0.005 ? kColOwed : kColMuted, "%s", Eur(r->owes).c_str());
@@ -10207,25 +10871,13 @@ static void DrawHomeScreen() {
         ImGui::SetWindowFontScale(1.4f); ImGui::TextColored(ImVec4(0.92f, 0.95f, 1.0f, 1.0f), "%s", hello); ImGui::SetWindowFontScale(1.0f);
         ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("  %s", DateGr(today).c_str());
     }
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - 190);
-    if (ImGui::Button("Αναλυτικά σύνολα ►", ImVec2(190, 0))) g_page = PAGE_DASHBOARD;
-
+    
     // ---- quick actions: the things done every day, one click away
     {
         const float bw = 190, bh = 34;
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.30f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.55f, 0.36f, 1));
-        if (ImGui::Button("+ Είσπραξη", ImVec2(bw, bh))) OpenRecordPayment(-1);
-        ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ήρθαν χρήματα από πελάτη ή ένοικο");
-        ImGui::SameLine();
         if (ImGui::Button("+ Χρέωση πελάτη", ImVec2(bw, bh))) ImGui::OpenPopup("##quickcharge");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Κάναμε μια δουλειά σε πελάτη: χρεώνουμε υπηρεσία ή πακέτο");
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.28f, 0.55f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.50f, 0.34f, 0.65f, 1));
-        if (ImGui::Button("Πληρωμή συνεργάτη", ImVec2(bw, bh))) g_showOwed = true;
-        ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Πληρώνουμε κάτι που χρωστάμε σε συνεργάτη");
         ImGui::SameLine();
         if (ImGui::Button("+ Σημείωση", ImVec2(bw * 0.7f, bh))) OpenAddNote();
         ImGui::PopStyleVar();
@@ -10233,8 +10885,8 @@ static void DrawHomeScreen() {
         if (ImGui::BeginPopup("##quickcharge")) {
             static int qUser = -1, qKind = 0, qSvc = -1, qPkg = -1;
             ImGui::TextDisabled("Γρήγορη χρέωση");
-            ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Πελάτης:"); ImGui::SameLine(90); PickClient("qcli", qUser, 320);
-            ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Τι:"); ImGui::SameLine(90);
+            ImGui::AlignTextToFramePadding(); CellText("Πελάτης:"); ImGui::SameLine(90); PickClient("qcli", qUser, 320);
+            ImGui::AlignTextToFramePadding(); CellText("Τι:"); ImGui::SameLine(90);
             ImGui::RadioButton("Υπηρεσία", &qKind, 0); ImGui::SameLine(); ImGui::RadioButton("Πακέτο υπηρεσιών", &qKind, 1);
             ImGui::Dummy(ImVec2(82, 0)); ImGui::SameLine();
             if (qKind == 0) PickService("qsvc", qSvc, 320); else PickPackage("qpkg", qPkg, 320);
@@ -10253,7 +10905,7 @@ static void DrawHomeScreen() {
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
     // three choices: today, this month (the default), or any dates with the pickers
     static int homeMode = 1;
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Περίοδος:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Περίοδος:"); ImGui::SameLine();
     {
         const char* modes[] = { "Σήμερα", "Αυτός ο μήνας", "Ελεύθερη επιλογή" };
         ImGui::SetNextItemWidth(180);
@@ -10262,11 +10914,11 @@ static void DrawHomeScreen() {
             else if (homeMode == 1) { char b[16]; std::snprintf(b, sizeof(b), "%04d-%02d-01", y, m); from = b;
                                       to = IsoFromDays(DaysFromCivil(m == 12 ? y + 1 : y, m == 12 ? 1 : m + 1, 1) - 1); }
         }
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Από:"); ImGui::SameLine();
+        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); CellText("Από:"); ImGui::SameLine();
         ImGui::BeginDisabled(homeMode != 2);
         DatePicker("homefrom", from, ImVec2(0, 1));
         ImGui::EndDisabled();
-        ImGui::SameLine(); ImGui::TextUnformatted("Έως:"); ImGui::SameLine();
+        ImGui::SameLine(); CellText("Έως:"); ImGui::SameLine();
         ImGui::BeginDisabled(homeMode != 2);
         DatePicker("hometo", to, ImVec2(0, 1));
         ImGui::EndDisabled();
@@ -10283,7 +10935,7 @@ static void DrawHomeScreen() {
     static Cached<HomeData> cache;
     const HomeData& hd = cache.get(from + "|" + to, [&] {
         HomeData r;
-        DataConn::MoneyQuery mq; mq.fromDate = from; mq.toDate = to;
+        DataConn::MoneyQuery mq; mq.fromDate = from; mq.toDate = to; mq.oursOnly = true;
         double in = 0, out = 0;
         g_app.conn->countMoney(mq, &in, &out);
         r.cash.moneyIn = in; r.cash.moneyOut = out;
@@ -10325,82 +10977,59 @@ static void DrawHomeScreen() {
         f.status = 1;         // resolved charges only (exclude scheduled / future)
         f.owed = 2;           // still owed (balance > 0.005)
         f.requireUser = true; // exclude joint-cost lines (user_id=NULL); only client and building-as-client costs
+        f.oursOnly = true;    // what residents owe their building's fund is not owed to us
         auto t = g_app.conn->paymentTotals(f);
         o.owedToUs = t.owedIn;
         o.weOwe = t.owedOut;
         return o;
     });
     
-    const double gotPaidP = hd.cash.moneyIn;
+    static Cached<DataConn::IncomeSplit> splitC;
+    const DataConn::IncomeSplit& sp = splitC.get(from + "|" + to, [&] { return g_app.conn->incomeSplit(from, to); });
+    // our business: services and contracts with their costs. The management fees are shown on their own below.
+    const double gotPaidP = MoneySub(hd.cash.moneyIn, sp.fees);
+    const double gotServices = MoneySub(gotPaidP, sp.contracts);
     const double paidOutP = hd.cash.moneyOut;
-    const double owedToUs = ow.owedToUs;
+    const double owedToUs = MoneySub(ow.owedToUs, sp.feesOwed);
     const double weOwe = ow.weOwe;
-    HomeSection("Τα οικονομικά μας", periodTitle.c_str());
+    HomeSection("Η επιχείρησή μας: υπηρεσίες και συμβάσεις", periodTitle.c_str());
     if (ImGui::BeginTable("homemoney", 4, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); HomeTile("Πληρωθήκαμε (περίοδος)", Eur(gotPaidP), kColIn, "υπηρεσίες " + Eur(hd.cl.collected) + " · διαχείριση " + Eur(fe.collected),
-                                           "Ό,τι εισπράξαμε για τις χρεώσεις της περιόδου.");
+        ImGui::TableNextColumn(); HomeTile("Πληρωθήκαμε (περίοδος)", Eur(gotPaidP), kColIn, "υπηρεσίες " + Eur(gotServices) + " · συμβάσεις " + Eur(sp.contracts),
+                                           "Ό,τι μπήκε μέσα στην περίοδο για υπηρεσίες και συμβάσεις, για όποια χρέωση κι αν ήταν. Χωρίς την αμοιβή διαχείρισης (φαίνεται παρακάτω) και τα αποθεματικά.");
         ImGui::TableNextColumn(); HomeTile("Πληρώσαμε (περίοδος)", Eur(paidOutP), kColOut, "σε συνεργάτες για τις δουλειές μας",
                                            "Ό,τι πληρώσαμε σε συνεργάτες για δουλειές της περιόδου.");
         
-        ImGui::TableNextColumn(); if (HomeTile("Μας χρωστάνε (όλα τα ανοιχτά)", Eur(owedToUs), kColOwed, "όλες οι ημερομηνίες · ανοιχτές οφειλές",
+        ImGui::TableNextColumn(); if (HomeTile("Μας χρωστάνε (όλα τα ανοιχτά)", Eur(owedToUs), kColOwed, "υπηρεσίες " + Eur(sp.servicesOwed) + " · συμβάσεις " + Eur(sp.contractsOwed),
                                                "Όλα τα ανοιχτά τιμολόγια που δεν έχουν εξοφληθεί ακόμα — ανεξάρτητα από την περίοδο. Όταν πληρωθούν, εμφανίζονται στα έσοδα της περιόδου πληρωμής.")) g_page = PAGE_SCORING;
                                                
         ImGui::TableNextColumn(); if (HomeTile("Χρωστάμε (όλα τα ανοιχτά)", Eur(weOwe), kColWeOwe, "όλες οι ημερομηνίες · ανοιχτές οφειλές",
                                                "Όλα τα ανοιχτά κόστη προς συνεργάτες — ανεξάρτητα από την περίοδο. Κλικ: η λίστα.")) g_showOwed = true;
         ImGui::EndTable();
     }
-    {
-        // Ταμείο: 4 εικόνες, υπολογισμένα αυστηρά για την επιλεγμένη περίοδο
-        const double fundNow        = MoneySub(gotPaidP, paidOutP);
-        const double fundPayAll     = MoneySub(fundNow, weOwe);
-        const double fundCollectAll = FromCents(ToCents(fundNow) + ToCents(owedToUs));
-        const double fundEverything = FromCents(ToCents(fundNow) + ToCents(owedToUs) - ToCents(weOwe));
-        ImGui::Spacing();
-        ImGui::TextDisabled("Ταμείο περιόδου:");
-        if (ImGui::BeginTable("homefunds", 4, ImGuiTableFlags_SizingStretchSame)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            StatTile("Ταμείο περιόδου", Eur(fundNow), fundNow >= 0 ? kColIn : kColOut, "πληρωθήκαμε - πληρώσαμε", ImVec2(ImGui::GetContentRegionAvail().x, 96));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ό,τι έχει μπει μείον ό,τι έχει βγει για την επιλεγμένη περίοδο.");
-            ImGui::TableNextColumn();
-            StatTile("Αν πληρώσουμε όσα χρωστάμε", Eur(fundPayAll), fundPayAll >= 0 ? kColIn : kColOut, ("ταμείο - " + Eur(weOwe)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 96));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου - όλα τα ανοιχτά που χρωστάμε σήμερα (όλες οι ημερομηνίες).");
-            ImGui::TableNextColumn();
-            StatTile("Αν μας πληρώσουν όσα μας χρωστάνε", Eur(fundCollectAll), fundCollectAll >= 0 ? kColIn : kColOut, ("ταμείο + " + Eur(owedToUs)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 96));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου + όλα τα ανοιχτά που μας χρωστάνε σήμερα (όλες οι ημερομηνίες).");
-            ImGui::TableNextColumn();
-            StatTile("Αν τακτοποιηθούν όλα", Eur(fundEverything), fundEverything >= 0 ? kColIn : kColOut, "ταμείο + οφειλές - οφειλόμενα", ImVec2(ImGui::GetContentRegionAvail().x, 96));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ταμείο περιόδου + μας χρωστάνε - χρωστάμε: όλα εξοφλημένα.");
-            ImGui::EndTable();
-        }
+    if (ToCents(sp.contractsScheduled) > 0) ImGui::TextDisabled("Μελλοντικές δόσεις συμβάσεων (δεν οφείλονται ακόμα): %s", Eur(sp.contractsScheduled).c_str());
+    ImGui::Spacing();
+    HomeSection("Υπηρεσία: Αμοιβή διαχείρισης", periodTitle.c_str());
+    if (ImGui::BeginTable("homefees", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); StatTile("Εισπράξαμε (περίοδος)", Eur(sp.fees), kColIn, "χρεώνεται στην πολυκατοικία ως πελάτη", ImVec2(ImGui::GetContentRegionAvail().x, 96));
+        ImGui::TableNextColumn(); StatTile("Μας χρωστάνε", Eur(sp.feesOwed), sp.feesOwed > 0.005 ? kColOwed : kColMuted, "όλες οι ημερομηνίες", ImVec2(ImGui::GetContentRegionAvail().x, 96));
+        ImGui::EndTable();
     }
-
     ImGui::Spacing();
     DrawHomeScoringPreview();
 
-    // ---- 4. what we owe (partners, one line per cost)
-    ImGui::Spacing();
-    float listH = std::max(180.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 5.0f);
-    float boxH = listH + ImGui::GetFrameHeightWithSpacing() * 4.2f;
-
-    ImGui::BeginChild("homeweowe", ImVec2(0.0f, boxH), ImGuiChildFlags_Border);
-    ImGui::TextColored(kColWeOwe, "Χρωστάμε");
-    ImGui::SameLine(); ImGui::TextDisabled("· %s", Eur(weOwe).c_str());
-    ImGui::SameLine(); if (ImGui::SmallButton("Συνεργάτες ►")) g_page = PAGE_PARTNERS;
-    DrawHomeWeOwe(listH);
-    ImGui::EndChild();
     DrawNoteDialog();
 }
 
 
 
 // =====================================================================================================
-// ΧΡΕΩΣΕΙΣ / ΤΑΜΕΙΟ
+// ΧΡΕΩΣΕΙΣ / ΑΠΟΘΕΜΑΤΙΚΟ
 // A bill says "you owe us this". It stays open until money fills it: every payment, whole or part, is recorded
 // with «Είσπραξη» (money in, with its receipt) or «Πληρωμή» (money out to a partner) and the bill closes only when
 // nothing is left. Clients are billed one by one; a building is billed once (a κοινόχρηστο) and that total is split
-// into one bill per resident, each paid and receipted on its own. The Ταμείο lists every movement of money.
+// into one bill per resident, each paid and receipted on its own. The Αποθεματικό lists every movement of money.
 // =====================================================================================================
 // Paid / partly / not yet, as a coloured word.
 static void PayBadge(double due, double paid, bool future = false) {
@@ -10428,37 +11057,46 @@ static void OpenRecordPaymentFor(const Payment& p) {
     if (p.status == "future") g_rpExtra.insert(p.id);
 }
 
-static void DrawBillsClients() {
+// Mode: 4 our clients' services, 7 their contracts (the same list, each with its own filters)
+template <int Mode> static void DrawBillsClients() {
     static std::string from, to; static int userId = -1, payState = 1; static bool showFuture = true;
     static char text[128] = "";
-    enum { BC_DATE, BC_WHO, BC_WHAT, BC_DUE, BC_PAID, BC_LEFT, BC_STATE, BC_ACT, BC_COUNT };
+    enum { BC_DATE, BC_WHO, BC_WHAT, BC_DUE, BC_PAID, BC_LEFT, BC_STATE, BC_ACT, BC_LOGGED, BC_COUNT };
     static const ListColDef cols[BC_COUNT] = {
         { "Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },      { "Πελάτης", ImGuiTableColumnFlags_WidthFixed, 200.0f, true },
         { "Τι χρεώθηκε", ImGuiTableColumnFlags_WidthFixed, 260.0f, true }, { "Ποσό", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },
         { "Πληρώθηκαν", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },  { "Μένουν", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },
-        { "Κατάσταση", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },   { "", ImGuiTableColumnFlags_WidthFixed, 150.0f, false } };
+        { "Κατάσταση", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },   { "", ImGuiTableColumnFlags_WidthFixed, 150.0f, false },
+        { "Καταχωρήθηκε", ImGuiTableColumnFlags_WidthFixed, 150.0f, true } };
     static ListModel<Payment> m;
     m.Init(BC_COUNT, {{BC_DATE, false}}, 20);
+    if (m.g.order.back() == BC_LOGGED) m.g.order = { BC_DATE, BC_LOGGED, BC_WHO, BC_WHAT, BC_DUE, BC_PAID, BC_LEFT, BC_STATE, BC_ACT };
     Pager& pager = m.g.pager;
     ImGui::TextDisabled("Οι υπηρεσίες και τα πακέτα που χρεώσαμε σε πελάτες. Μένουν ανοιχτά μέχρι να εξοφληθούν - η είσπραξη μπορεί να είναι και μέρος του ποσού.");
     bool ch = DrawDateRange("bilcl", from, to);
     DrawUserFilterPicker("Πελάτης:", userId, 240); ImGui::SameLine();
     ImGui::SetNextItemWidth(150); ch |= ImGui::Combo("##pay", &payState, "Όλες\0Ανοιχτές (οφείλονται)\0Εξοφλημένες\0"); ImGui::SameLine();
     ch |= ImGui::Checkbox("και προγραμματισμένες", &showFuture); ImGui::SameLine();
-    ImGui::SetNextItemWidth(200); ch |= ImGui::InputTextWithHint("##bt", "Αναζήτηση...", text, sizeof(text));
+    
     if (ch) pager.Reset();
-    DataConn::PaymentFilter f; f.fromDate = from; f.toDate = to; f.userId = userId > 0 ? userId : -1; f.direction = "in"; f.joint = 2;
+    DataConn::PaymentFilter f; f.fromDate = from; f.toDate = to; f.userId = userId > 0 ? userId : -1; f.direction = "in"; f.joint = Mode;
     f.status = showFuture ? 0 : 1; f.owed = payState == 1 ? 2 : (payState == 2 ? 1 : 0); f.text = text;
     std::string key = from + "|" + to + "|" + std::to_string(f.userId) + "|" + std::to_string(f.status) + "|" + std::to_string(f.owed) + "|" + text;
     static Cached<DataConn::MoneyTotals> tc;
     const DataConn::MoneyTotals& t = tc.get(key, [&] { return g_app.conn->paymentTotals(f); });
     // every sort / page change fetches exactly that page from the database
-    const auto& pg = m.Load(key,
-        [&](const SortSpec& s, int off, int lim) {
+    auto bcFetch = [&](const SortSpec& s, int off, int lim) {
             DataConn::PaymentFilter q = f;
-            q.sort = MapSort(s, {{BC_DATE, 0}, {BC_WHO, 1}, {BC_WHAT, 2}, {BC_DUE, 3}, {BC_PAID, 4}, {BC_LEFT, 5}, {BC_STATE, 6}});
-            return g_app.conn->findPayments(q, DataConn::PayOrder::DateDesc, off, lim); },
-        [&] { return (int)t.count; });
+            q.sort = MapSort(s, {{BC_DATE, 0}, {BC_WHO, 1}, {BC_WHAT, 2}, {BC_DUE, 3}, {BC_PAID, 4}, {BC_LEFT, 5}, {BC_STATE, 6}, {BC_LOGGED, 7}});
+            return g_app.conn->findPayments(q, DataConn::PayOrder::DateDesc, off, lim); };
+    auto bcText = [](const Payment& p, int c) -> std::string {
+        const double left = MoneySub(p.amount_due, p.amount_paid);
+        switch (c) { case BC_DATE: return DateGr(p.year, p.month, p.day); case BC_WHO: return g_app.userName(p.user_id); case BC_WHAT: return ChargeLabel(p);
+                     case BC_DUE: return Eur(p.amount_due); case BC_PAID: return Eur(p.amount_paid); case BC_LEFT: return Eur(left);
+                     case BC_LOGGED: return p.created_at; case BC_STATE: return p.status == "future" ? "Προγραμματισμένη" : left <= 0.005 ? "Εξοφλήθηκε" : p.amount_paid > 0.005 ? "Μερικώς" : "Απλήρωτη"; default: return ""; } };
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadF(key, bcFetch, [&] { return (int)t.count; }, bcText, BC_COUNT);
+    const DistinctFn bcDistinct = [&](int col, const std::string& q) { return ListDistinct(m.All(key, bcFetch), m.g, bcText, BC_COUNT, col, q); };
     ImGui::Text("%d χρεώσεις  ·  ", pg.count); ImGui::SameLine(0, 0);
     ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1), "χρεώθηκαν %s", Eur(t.dueAll).c_str()); ImGui::SameLine();
     ImGui::TextColored(kColIn, "· εισπράχθηκαν %s", Eur(t.collected).c_str()); ImGui::SameLine();
@@ -10468,17 +11106,18 @@ static void DrawBillsClients() {
     if (ImGui::BeginTable("bilcltab", BC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(m.g.order, cols);
-        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager);
+        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager, &m.g.cf, &bcDistinct);
         auto P = [&](int c) { return ListPos(m.g.order, c); };
         for (auto& p : pg.rows) {
             ImGui::PushID(p.id); ImGui::TableNextRow();
             bool fut = p.status == "future";
             double left = MoneySub(p.amount_due, p.amount_paid);
-            ImGui::TableSetColumnIndex(P(BC_DATE)); ImGui::TextUnformatted(DateGr(p.year, p.month, p.day).c_str());
+            ImGui::TableSetColumnIndex(P(BC_DATE)); CellText(DateGr(p.year, p.month, p.day).c_str());
+            ImGui::TableSetColumnIndex(P(BC_LOGGED)); ImGui::TextDisabled("%s", p.created_at.c_str());
             ImGui::TableSetColumnIndex(P(BC_WHO)); if (LinkCell(g_app.userName(p.user_id))) OpenUserProfile(p.user_id);
-            ImGui::TableSetColumnIndex(P(BC_WHAT)); ImGui::TextUnformatted(ChargeLabel(p).c_str());
+            ImGui::TableSetColumnIndex(P(BC_WHAT)); CellText(ChargeLabel(p).c_str());
             if (!p.notes.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.notes.c_str());
-            ImGui::TableSetColumnIndex(P(BC_DUE)); ImGui::TextUnformatted(Eur(p.amount_due).c_str());
+            ImGui::TableSetColumnIndex(P(BC_DUE)); CellText(Eur(p.amount_due).c_str());
             ImGui::TableSetColumnIndex(P(BC_PAID)); if (p.amount_paid > 0.005) ImGui::TextColored(kColIn, "%s", Eur(p.amount_paid).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(BC_LEFT)); if (left > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(left).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(BC_STATE)); PayBadge(p.amount_due, p.amount_paid, fut);
@@ -10496,7 +11135,7 @@ static void DrawBillsBuildings() {
     static int building = -1; static Pager pager; static bool openOnly = false;
     ImGui::TextDisabled("Μία χρέωση στην πολυκατοικία (κοινόχρηστο), μοιρασμένη σε έναν λογαριασμό ανά ένοικο. Κάθε ένοικος πληρώνει και παίρνει απόδειξη χωριστά.");
     bool ch = false;
-    ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Πολυκατοικία:"); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding(); CellText("Πολυκατοικία:"); ImGui::SameLine();
     ch |= PickBuilding("bilbd", building, 300, "Όλες");
     ImGui::SameLine(); ch |= ImGui::Checkbox("Μόνο όσες δεν εισπράχθηκαν όλες", &openOnly);
     ImGui::SameLine(); if (ImGui::Button("+ Χρέωση πολυκατοικίας")) OpenJointCharge(building > 0 ? building : -1);
@@ -10531,11 +11170,11 @@ static void DrawBillsBuildings() {
             const JointOp& o = r.op;
             double left = MoneySub(o.total, o.paid);
             ImGui::PushID(o.id); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(o.op_date).c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(o.building_address.empty() ? "(επιλεγμένα διαμερίσματα)" : o.building_address.c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(o.label.c_str());
+            ImGui::TableNextColumn(); CellText(DateGr(o.op_date).c_str());
+            ImGui::TableNextColumn(); CellText(o.building_address.empty() ? "(επιλεγμένα διαμερίσματα)" : o.building_address.c_str());
+            ImGui::TableNextColumn(); CellText(o.label.c_str());
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d διαμερίσματα χρεώθηκαν%s", o.included, o.excluded ? (", " + std::to_string(o.excluded) + " εξαιρέθηκαν").c_str() : "");
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(o.total).c_str());
+            ImGui::TableNextColumn(); CellText(Eur(o.total).c_str());
             ImGui::TableNextColumn(); if (o.paid > 0.005) ImGui::TextColored(kColIn, "%s", Eur(o.paid).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); if (left > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(left).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); if (r.cost > 0.005) ImGui::TextColored(kColOut, "%s", Eur(r.cost).c_str()); else ImGui::TextDisabled("—");
@@ -10581,11 +11220,13 @@ static void DrawBillsPartners() {
     ImGui::SameLine(); ch |= ImGui::Checkbox("Μόνο όσα χρωστάμε", &owedOnly);
     if (ch) pager.Reset();
     std::string key = from + "|" + to + "|" + std::to_string(partner) + "|" + std::to_string(owedOnly);
-    const auto& pg = m.Load(key,
+    DrawListSearch(m.g);
+    const auto& pg = m.LoadT(key,
         [&](const SortSpec& s, int off, int lim) {
             return g_app.conn->partnerJobs(partner, from, to, MapSort(s, {{BP_DATE, 0}, {BP_PARTNER, 1}, {BP_WHAT, 2}, {BP_FOR, 3}, {BP_COST, 4}, {BP_PAID, 5}, {BP_OWE, 6}}),
                                            off, lim, 1, owedOnly); },
-        [&] { return g_app.conn->countPartnerJobs(partner, from, to, 1, owedOnly); });
+        [&] { return g_app.conn->countPartnerJobs(partner, from, to, 1, owedOnly); },
+        [](const DataConn::PartnerJob& j, int c) -> std::string { switch (c) { case BP_DATE: return DateGr(j.date); case BP_PARTNER: return j.partner; case BP_WHAT: return j.service; case BP_FOR: return j.jointLabel.empty() ? j.client : j.jointLabel; case BP_COST: return Eur(j.amount); case BP_PAID: return Eur(j.paid); case BP_OWE: return Eur(j.balance); default: return ""; } }, BP_COUNT);
     ImGui::Text("%d κόστη", pg.count); ImGui::SameLine();
     ImGui::TextColored(kColWeOwe, "· χρωστάμε συνολικά %s", Eur(g_app.conn->cashNow().owedOut).c_str());
     ImGui::SameLine(); ImGui::TextDisabled("  (κλικ στον τίτλο στήλης: ταξινόμηση · σύρσιμο: μετακίνηση)");
@@ -10593,15 +11234,15 @@ static void DrawBillsPartners() {
     if (ImGui::BeginTable("bilouttab", BP_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(m.g.order, cols);
-        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager);
+        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager, &m.g.cf, &m.distinct);
         auto P = [&](int c) { return ListPos(m.g.order, c); };
         for (auto& j : pg.rows) {
             ImGui::PushID(j.charge_id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(BP_DATE)); ImGui::TextUnformatted(DateGr(j.date).c_str());
+            ImGui::TableSetColumnIndex(P(BP_DATE)); CellText(DateGr(j.date).c_str());
             ImGui::TableSetColumnIndex(P(BP_PARTNER)); if (j.partner_id > 0) { if (LinkCell(j.partner)) OpenPartnerProfile(j.partner_id); } else ImGui::TextDisabled("χωρίς συνεργάτη");
-            ImGui::TableSetColumnIndex(P(BP_WHAT)); ImGui::TextUnformatted(j.service.c_str());
-            ImGui::TableSetColumnIndex(P(BP_FOR)); ImGui::TextUnformatted((j.jointLabel.empty() ? j.client : j.jointLabel).c_str());
-            ImGui::TableSetColumnIndex(P(BP_COST)); ImGui::TextUnformatted(Eur(j.amount).c_str());
+            ImGui::TableSetColumnIndex(P(BP_WHAT)); CellText(j.service.c_str());
+            ImGui::TableSetColumnIndex(P(BP_FOR)); CellText((j.jointLabel.empty() ? j.client : j.jointLabel).c_str());
+            ImGui::TableSetColumnIndex(P(BP_COST)); CellText(Eur(j.amount).c_str());
             ImGui::TableSetColumnIndex(P(BP_PAID)); if (j.paid > 0.005) ImGui::TextColored(kColOut, "%s", Eur(j.paid).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(BP_OWE)); if (j.balance > 0.005) ImGui::TextColored(kColWeOwe, "%s", Eur(j.balance).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(BP_STATE)); PayBadge(j.amount, j.paid);
@@ -10621,10 +11262,11 @@ static void DrawBillsManaged() {
 }
 
 static void DrawBillsScreen() {
-    ImGui::SetWindowFontScale(1.2f); ImGui::TextUnformatted("Χρεώσεις"); ImGui::SetWindowFontScale(1.0f);
+    ImGui::SetWindowFontScale(1.2f); CellText("Χρεώσεις"); ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine(); ImGui::TextDisabled("  χρεώσαμε → οφείλεται → εισπράττουμε (όλο ή μέρος, κάθε φορά με απόδειξη) → εξοφλείται");
     if (ImGui::BeginTabBar("billtabs")) {
-        if (ImGui::BeginTabItem("Πελάτες")) { DrawBillsClients(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Πελάτες")) { DrawBillsClients<4>(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Συμβάσεις")) { DrawBillsClients<7>(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Διαχείριση")) { DrawBillsManaged(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Συνεργάτες (κόστη μας)")) { DrawBillsPartners(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
@@ -10637,7 +11279,6 @@ static void DrawBillsScreen() {
 // apartments, each resident paying his share with a receipt, and what the job costs paid to whoever did it, now or
 // later. Each building keeps its own fund: collected from residents − paid for the building. It may go negative.
 // =====================================================================================================
-static int g_mgSel = -1;                  // the building open on the right
 static int g_mgTab = -1;                  // a tab to bring forward once (0 fund, 1 charges, 2 residents, 3 expenses, 4 apartments)
 
 struct BuildingFund { int ops = 0, open = 0; double charged = 0, collected = 0, cost = 0, costPaid = 0; };
@@ -10672,7 +11313,7 @@ static void DrawFundTiles(const BuildingFund& f) {
             if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
         };
         ImGui::TableNextRow();
-        tile("Ταμείο κτιρίου (κρατάμε τώρα)", held, held >= 0 ? kColIn : kColOut, "εισπράχθηκαν − πληρώθηκαν",
+        tile("Αποθεματικό κτιρίου (κρατάμε τώρα)", held, held >= 0 ? kColIn : kColOut, "εισπράχθηκαν − πληρώθηκαν",
              "Ό,τι κρατάμε για την πολυκατοικία: όσα μαζέψαμε από τους ενοίκους μείον όσα πληρώσαμε για το κτίριο.\nΑρνητικό = πληρώσαμε πρώτα, μένει να μαζέψουμε.");
         tile("Χρωστάνε οι ένοικοι", owe, owe > 0.005 ? kColOwed : kColMuted, "από " + Eur(f.charged) + " που χρεώθηκαν", nullptr);
         tile("Μένει να πληρώσουμε", toPay, toPay > 0.005 ? kColWeOwe : kColMuted, "από " + Eur(f.cost) + " έξοδα", nullptr);
@@ -10718,7 +11359,7 @@ static void DrawManagedResidents(int buildingId) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Ένοικος", 0, 2.0f); ImGui::TableSetupColumn("Διαμέρισμα", ImGuiTableColumnFlags_WidthFixed, 100);
         ImGui::TableSetupColumn("Μερίδια", ImGuiTableColumnFlags_WidthFixed, 70); ImGui::TableSetupColumn("Χρεώθηκε", ImGuiTableColumnFlags_WidthFixed, 95);
-        ImGui::TableSetupColumn("Έβαλε στο ταμείο", ImGuiTableColumnFlags_WidthFixed, 120); ImGui::TableSetupColumn("Χρωστάει", ImGuiTableColumnFlags_WidthFixed, 95);
+        ImGui::TableSetupColumn("Έβαλε στο αποθεματικό", ImGuiTableColumnFlags_WidthFixed, 120); ImGui::TableSetupColumn("Χρωστάει", ImGuiTableColumnFlags_WidthFixed, 95);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableHeadersRow();
         for (int i = pager.offset; i < pager.ShowingTo(); i++) {
@@ -10726,9 +11367,9 @@ static void DrawManagedResidents(int buildingId) {
             double owe = MoneySub(r.charged, r.paid);
             ImGui::PushID(r.uid); ImGui::TableNextRow();
             ImGui::TableNextColumn(); if (LinkCell(r.name + (r.past ? "  (πρώην ένοικος)" : ""))) OpenUserProfile(r.uid);
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(r.apt.c_str());
+            ImGui::TableNextColumn(); CellText(r.apt.c_str());
             ImGui::TableNextColumn(); ImGui::Text("%d", r.n);
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(r.charged).c_str());
+            ImGui::TableNextColumn(); CellText(Eur(r.charged).c_str());
             ImGui::TableNextColumn(); ImGui::TextColored(kColIn, "%s", Eur(r.paid).c_str());
             ImGui::TableNextColumn(); if (owe > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(owe).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); if (owe > 0.005 && ImGui::SmallButton("Είσπραξη")) OpenRecordPayment(r.uid);
@@ -10766,10 +11407,10 @@ static void DrawManagedExpenses(int buildingId) {
         for (int i = pager.offset; i < pager.ShowingTo(); i++) {
             const auto& j = *shown[i];
             ImGui::PushID(j.charge_id); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(j.date).c_str());
+            ImGui::TableNextColumn(); CellText(DateGr(j.date).c_str());
             ImGui::TableNextColumn(); if (LinkCell(j.jointLabel.empty() ? j.service : j.jointLabel)) OpenJointView(j.jointOpId);
             ImGui::TableNextColumn(); if (j.partner_id > 0) { if (LinkCell(j.partner)) OpenPartnerProfile(j.partner_id); } else ImGui::TextDisabled("χωρίς συνεργάτη");
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(j.amount).c_str());
+            ImGui::TableNextColumn(); CellText(Eur(j.amount).c_str());
             ImGui::TableNextColumn(); if (j.paid > 0.005) ImGui::TextColored(kColOut, "%s", Eur(j.paid).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); if (j.balance > 0.005) ImGui::TextColored(kColWeOwe, "%s", Eur(j.balance).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableNextColumn(); PayBadge(j.amount, j.paid);
@@ -10781,13 +11422,13 @@ static void DrawManagedExpenses(int buildingId) {
     DrawPager(pager, "mgexppg");
 }
 
-// ---- Ταμείο πολυκατοικίας: the balance, what moves it, and the statement ----
+// ---- Αποθεματικό πολυκατοικίας: the balance, what moves it, and the statement ----
 static const char* kContributionLabel = "Εισφορά ταμείου";
 static int ContributionServiceId() {
     static int sid = -1;
     if (sid > 0) return sid;
     for (auto& j : g_app.conn->getJointCatalog(true)) if (j.service.label == kContributionLabel) { sid = j.service.id; return sid; }
-    Service s; s.label = kContributionLabel; s.extra_notes = "Χρήματα των ενοίκων στο ταμείο της πολυκατοικίας (όχι έσοδο μας).";
+    Service s; s.label = kContributionLabel; s.extra_notes = "Χρήματα των ενοίκων στο αποθεματικό της πολυκατοικίας (όχι έσοδο μας).";
     int jid = g_app.conn->addJointService(s, "equal");
     if (jid > 0) sid = g_app.conn->getJointServiceById(jid).service.id;
     return sid;
@@ -10810,7 +11451,7 @@ static int FeeServiceId() {
     static int sid = -1;
     if (sid > 0) return sid;
     for (auto& j : g_app.conn->getJointCatalog(true)) if (j.service.label == kFeeLabel) { sid = j.service.id; return sid; }
-    Service s; s.label = kFeeLabel; s.extra_notes = "Η αμοιβή μας για τη διαχείριση πολυκατοικίας: έσοδο μας, όχι χρήματα του ταμείου.";
+    Service s; s.label = kFeeLabel; s.extra_notes = "Η αμοιβή μας για τη διαχείριση πολυκατοικίας: έσοδο μας, όχι χρήματα του αποθεματικού.";
     int jid = g_app.conn->addJointService(s, "equal");
     if (jid > 0) sid = g_app.conn->getJointServiceById(jid).service.id;
     return sid;
@@ -10850,8 +11491,8 @@ static long long DrawDistribution(const char* id, int bid, double total, Distrib
         for (auto& u : residents) {
             ImGui::PushID(u.id); ImGui::TableNextRow();
             ImGui::TableNextColumn(); bool on = d.in[u.id]; if (ImGui::Checkbox("##in", &on)) { d.in[u.id] = on; if (!on) { d.amt[u.id] = 0; d.payNow[u.id] = 0; } }
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(u.apartment.c_str());
-            ImGui::TableNextColumn(); if (on) ImGui::TextUnformatted(u.full_name.c_str()); else ImGui::TextDisabled("%s (εξαιρείται)", u.full_name.c_str());
+            ImGui::TableNextColumn(); CellText(u.apartment.c_str());
+            ImGui::TableNextColumn(); if (on) CellText(u.full_name.c_str()); else ImGui::TextDisabled("%s (εξαιρείται)", u.full_name.c_str());
             ImGui::TableNextColumn(); ImGui::BeginDisabled(!on); ImGui::SetNextItemWidth(-1); InputMoney("##a", &d.amt[u.id]); ImGui::EndDisabled();
             if (d.amt[u.id] < 0) d.amt[u.id] = 0;
             if (payable) {
@@ -10973,7 +11614,7 @@ static const std::vector<FundAction>& FundActions(int bid) {
         return acts; });
 }
 
-static void DrawFundTab(int bid) {
+static void DrawFundTab(int bid, int mode) {
     std::string today = CurrentDateString();
     static Cached<std::pair<double, DataConn::FundTotals>> bc;
     const auto& bt = bc.get(std::to_string(bid), [&] { return std::make_pair(g_app.conn->getFundBalance(bid), g_app.conn->getFundTotals(bid)); });
@@ -10989,10 +11630,12 @@ static void DrawFundTab(int bid) {
                 if (!s.included) continue;
                 JointOp op = g_app.conn->getJointOpById(s.op_id);
                 if (op.kind == "fee") { o.fees = FromCents(ToCents(o.fees) + ToCents(MoneySub(s.amount, std::min(s.paid, s.amount)))); continue; }   // owed to US, not to the fund
+                if (op.kind == "monthly") continue;                     // a month's expenses: counted below, only once the deposit covered them
                 double left = MoneySub(s.amount, std::min(s.paid, s.amount));
                 if (currentUsers.count(s.user_id)) o.current = FromCents(ToCents(o.current) + ToCents(left));
                 else o.former = FromCents(ToCents(o.former) + ToCents(left));
             }
+        for (auto& mb : g_app.conn->getMonthlyBills(bid, "", true)) if (mb.status == "resolved") o.current = FromCents(ToCents(o.current) + ToCents(mb.owed));
         return o; });
     const double owedFund = FromCents(ToCents(ow.current) + ToCents(ow.former)), ifPaid = FromCents(ToCents(bal) + ToCents(owedFund));
     int cid = BuildingClientId(bid);
@@ -11001,38 +11644,19 @@ static void DrawFundTab(int bid) {
     double ourOpenSum = 0; for (auto& p : ourOpen) ourOpenSum = FromCents(ToCents(ourOpenSum) + ToCents(p.balance));
 
     // ---- where the fund stands
-    if (ImGui::BeginTable("fundtop", 4, ImGuiTableFlags_SizingStretchSame)) {
+    if (mode == 1 && ImGui::BeginTable("fundtop", 3, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); StatTile("Καθαρό τώρα", Eur(bal), bal >= 0 ? kColIn : kColOut, bal < 0 ? "αρνητικό: πληρώσαμε με χρήματα που δεν υπάρχουν ακόμα" : "τα χρήματα του κτιρίου που υπάρχουν", ImVec2(ImGui::GetContentRegionAvail().x, 92));
-        ImGui::TableNextColumn(); StatTile("Οφειλές προς το ταμείο", Eur(owedFund), owedFund > 0.005 ? kColOwed : kColMuted,
+        ImGui::TableNextColumn(); StatTile("Αποθεματικό τώρα", Eur(bal), bal >= 0 ? kColIn : kColOut, bal < 0 ? "αρνητικό: πληρώσαμε με χρήματα που δεν υπάρχουν ακόμα" : "τα χρήματα του κτιρίου που υπάρχουν", ImVec2(ImGui::GetContentRegionAvail().x, 92));
+        ImGui::TableNextColumn(); StatTile("Οφειλές προς το αποθεματικό", Eur(owedFund), owedFund > 0.005 ? kColOwed : kColMuted,
                                            ow.former > 0.005 ? ("από αυτά πρώην ένοικοι " + Eur(ow.former)).c_str() : "ό,τι χρωστάνε από χρηματοδοτήσεις", ImVec2(ImGui::GetContentRegionAvail().x, 92));
         ImGui::TableNextColumn(); StatTile("Σύνολο με τις οφειλές", Eur(ifPaid), ifPaid >= 0 ? kColIn : kColOut, "αν πληρωθούν όλες", ImVec2(ImGui::GetContentRegionAvail().x, 92));
-        ImGui::TableNextColumn(); StatTile("Αμοιβές που μας χρωστάνε", Eur(ow.fees), ow.fees > 0.005 ? ImVec4(0.55f, 0.65f, 1.0f, 1) : kColMuted, "δικές μας, όχι του ταμείου", ImVec2(ImGui::GetContentRegionAvail().x, 92));
         ImGui::EndTable();
     }
 
     // ---- what a manager does
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.30f, 1));
-    if (ImGui::Button("+ Χρηματοδότηση ταμείου")) ImGui::OpenPopup("Χρηματοδότηση ταμείου");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Οι ένοικοι χρεώνονται για το κοινό ταμείο (όλοι, κάποιοι ή ένας).\nΌποιος πληρώνει τώρα παίρνει απόδειξη· οι υπόλοιποι χρωστάνε.");
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.28f, 0.28f, 1));
-    if (ImGui::Button("+ Έξοδο")) ImGui::OpenPopup("Έξοδο της πολυκατοικίας");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ένα έξοδο του κτιρίου: βγαίνει από το ταμείο τώρα.\nΑν χρειάζεται, το επιμερίζουμε στους ενοίκους για να ξαναμπεί.");
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.35f, 0.60f, 1));
-    if (ImGui::Button("+ Αμοιβή διαχείρισης")) ImGui::OpenPopup("Αμοιβή διαχείρισης");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Η αμοιβή μας για τη διαχείριση, μοιρασμένη στους ενοίκους.\nΚαθαρό έσοδο για εμάς - δεν μπαίνει στο ταμείο του κτιρίου (φαίνεται στα «Κέρδη»).");
-    ImGui::SameLine();
-    if (ImGui::Button("Αρχικό υπόλοιπο / διόρθωση")) ImGui::OpenPopup("Διόρθωση ταμείου");
+    if (mode == 0) {
+    if (ImGui::Button("Ενημέρωση Αποθεματικού")) ImGui::OpenPopup("Διόρθωση αποθεματικού");
 
-    if (!ourOpen.empty()) {
-        ImGui::TextColored(kColOwed, "Χρεώσεις μας στην πολυκατοικία (ως πελάτη) που δεν έχουν περάσει στο ταμείο: %d · %s", (int)ourOpen.size(), Eur(ourOpenSum).c_str());
-        ImGui::SameLine(); if (ImGui::SmallButton("Πέρασμα στο ταμείο…")) ImGui::OpenPopup("Πέρασμα χρέωσής μας στο ταμείο");
-    }
 
     // funding the fund / our management fee: a total split over the residents; each pays now what he pays, owes the rest
     auto splitDialog = [&](const char* title, const char* kind, const char* defLabel) {
@@ -11042,11 +11666,11 @@ static void DrawFundTab(int bid) {
         struct S { double total = 0; std::string date, err; TextBuf label; char note[400] = ""; Distribution d; };
         static std::map<std::string, S> states; S& s = states[title];
         if (ImGui::IsWindowAppearing()) { s = S{}; s.date = today; s.label.set(defLabel); }
-        if (fee) ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1), "Η αμοιβή μας: ό,τι πληρώνουν και ό,τι χρωστάνε είναι ΔΙΚΟ ΜΑΣ, όχι του ταμείου του κτιρίου.");
-        else ImGui::TextDisabled("Ό,τι πληρώνουν τώρα μπαίνει στο ταμείο· ό,τι μένει το χρωστάνε στο ταμείο.");
+        if (fee) ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1), "Η αμοιβή μας: ό,τι πληρώνουν και ό,τι χρωστάνε είναι ΔΙΚΟ ΜΑΣ, όχι του αποθεματικού του κτιρίου.");
+        else ImGui::TextDisabled("Ό,τι πληρώνουν τώρα μπαίνει στο αποθεματικό· ό,τι μένει το χρωστάνε στο αποθεματικό.");
         ImGui::SetNextItemWidth(380); ImGui::InputText("Αιτία", s.label.data, sizeof(s.label.data));
         ImGui::SetNextItemWidth(160); if (InputMoney("Σύνολο (€)", &s.total)) SplitEqually(bid, s.total, s.d);
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("  Ημερομηνία:"); ImGui::SameLine(); DatePicker("dlgdate", s.date, ImVec2(0, 1));
+        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); CellText("  Ημερομηνία:"); ImGui::SameLine(); DatePicker("dlgdate", s.date, ImVec2(0, 1));
         ImGui::InputTextMultiline("Σχόλιο", s.note, sizeof(s.note), ImVec2(380, 40));
         SectionTitle("Ποιος πληρώνει τι");
         bool ok = true; DrawDistribution("dd", bid, s.total, s.d, ok);
@@ -11057,8 +11681,7 @@ static void DrawFundTab(int bid) {
         ImGui::SameLine(); if (ImGui::Button("Άκυρο", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     };
-    splitDialog("Χρηματοδότηση ταμείου", "contribution", "Εισφορά ταμείου");
-    splitDialog("Αμοιβή διαχείρισης", "fee", kFeeLabel);
+    splitDialog("Χρηματοδότηση αποθεματικού", "contribution", "Εισφορά αποθεματικού");
 
     // an expense of the building: charged and paid from the fund at once, all of it - even when that takes the fund
     // below zero. Its distribution over the residents is recorded with it so they can be managed better (who had how
@@ -11069,17 +11692,17 @@ static void DrawFundTab(int bid) {
         if (ImGui::IsWindowAppearing()) { total = 0; lastTotal = -1; date = today; err.clear(); label.set(""); note[0] = 0; d = Distribution{}; }
         ImGui::SetNextItemWidth(380); ImGui::InputTextWithHint("Αιτία", "π.χ. ΔΕΗ κοινοχρήστων, συντήρηση ανελκυστήρα", label.data, sizeof(label.data));
         ImGui::SetNextItemWidth(160); InputMoney("Σύνολο (€)", &total);
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("  Ημερομηνία:"); ImGui::SameLine(); DatePicker("exdate", date, ImVec2(0, 1));
+        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); CellText("  Ημερομηνία:"); ImGui::SameLine(); DatePicker("exdate", date, ImVec2(0, 1));
         ImGui::InputTextMultiline("Σχόλιο", note, sizeof(note), ImVec2(380, 40));
         const long long totC = std::max(0LL, ToCents(total)), balC = ToCents(bal);
         if (ToCents(total) != ToCents(lastTotal)) { SplitEqually(bid, total, d); lastTotal = total; }
         SectionTitle("Κατανομή στους ενοίκους");
-        ImGui::TextDisabled("Πόσο αναλογεί σε κάθε ένοικο, για την ανάλυση ανά ένοικο. Το έξοδο πληρώνεται όλο από το ταμείο τώρα.");
+        ImGui::TextDisabled("Πόσο αναλογεί σε κάθε ένοικο, για την ανάλυση ανά ένοικο. Το έξοδο πληρώνεται όλο από το αποθεματικό τώρα.");
         bool ok = true;
         if (totC > 0) DrawDistribution("exd", bid, total, d, ok, false);
         const double after = FromCents(balC - totC);
-        ImGui::Text("Ταμείο τώρα %s → μετά ", Eur(bal).c_str()); ImGui::SameLine(0, 0); ImGui::TextColored(after >= 0 ? kColIn : kColOut, "%s", Eur(after).c_str());
-        if (after < 0) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1), "(το ταμείο γίνεται αρνητικό)"); }
+        ImGui::Text("Αποθεματικό τώρα %s → μετά ", Eur(bal).c_str()); ImGui::SameLine(0, 0); ImGui::TextColored(after >= 0 ? kColIn : kColOut, "%s", Eur(after).c_str());
+        if (after < 0) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1), "(το αποθεματικό γίνεται αρνητικό)"); }
         if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
         ImGui::BeginDisabled(totC <= 0 || label.str().empty() || !ok);
         if (ImGui::Button("Καταχώριση εξόδου", ImVec2(170, 0))) {
@@ -11095,10 +11718,10 @@ static void DrawFundTab(int bid) {
     }
     // one of OUR bills to the building passes through the fund (paid from it), optionally split over the residents
     ImGui::SetNextWindowSize(ImVec2(640, 0), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("Πέρασμα χρέωσής μας στο ταμείο", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::BeginPopupModal("Πέρασμα χρέωσής μας στο αποθεματικό", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         static int bill = -1; static double amount = 0; static std::string date, err; static bool split = false; static Distribution d;
         if (ImGui::IsWindowAppearing()) { bill = -1; amount = 0; date = today; split = false; d = Distribution{}; err.clear(); }
-        ImGui::TextDisabled("Η χρέωση μένει στα δικά μας βιβλία (έσοδο μας). Εδώ καταγράφεται ως έξοδο του ταμείου.");
+        ImGui::TextDisabled("Η χρέωση μένει στα δικά μας βιβλία (έσοδο μας). Εδώ καταγράφεται ως έξοδο του αποθεματικού.");
         for (auto& p : ourOpen) {
             ImGui::PushID(p.id);
             std::string l = DateGr(p.year, p.month, p.day) + "  ·  " + ChargeLabel(p) + "  ·  μένουν " + Eur(p.balance);
@@ -11109,12 +11732,12 @@ static void DrawFundTab(int bid) {
         bool ok = true;
         if (bill > 0) {
             ImGui::SetNextItemWidth(160); InputMoney("Ποσό (€)", &amount); ImGui::SameLine(); ImGui::TextDisabled("έως %s", Eur(left).c_str());
-            ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Ημερομηνία:"); ImGui::SameLine(); DatePicker("fbdate", date, ImVec2(0, 1));
-            ImGui::Text("Ταμείο τώρα %s → μετά %s", Eur(bal).c_str(), Eur(MoneySub(bal, amount)).c_str());
+            ImGui::AlignTextToFramePadding(); CellText("Ημερομηνία:"); ImGui::SameLine(); DatePicker("fbdate", date, ImVec2(0, 1));
+            ImGui::Text("Αποθεματικό τώρα %s → μετά %s", Eur(bal).c_str(), Eur(MoneySub(bal, amount)).c_str());
         }
         if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
         ImGui::BeginDisabled(bill <= 0 || ToCents(amount) <= 0 || ToCents(amount) > ToCents(left) || !ok);
-        if (ImGui::Button("Πέρασμα στο ταμείο", ImVec2(180, 0))) {
+        if (ImGui::Button("Πέρασμα στο αποθεματικό", ImVec2(180, 0))) {
             int opId = split ? ChargeDistribution(bid, "recharge", "Υπηρεσία μας: " + what, "", date, amount, d, err) : -1;
             if (!split || opId > 0) {
                 if (g_app.conn->fundPayOurBill(bid, bill, amount, date) > 0) { err.clear(); ImGui::CloseCurrentPopup(); }
@@ -11126,14 +11749,14 @@ static void DrawFundTab(int bid) {
         ImGui::EndPopup();
     }
 
-    if (ImGui::BeginPopupModal("Διόρθωση ταμείου", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::BeginPopupModal("Διόρθωση αποθεματικού", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         static int kind = 0, sign = 0; static double amount = 0; static std::string date; static TextBuf desc; static std::string err;
         if (ImGui::IsWindowAppearing()) { kind = 0; sign = 0; amount = 0; date = today; desc.set(""); err.clear(); }
         ImGui::RadioButton("Αρχικό υπόλοιπο", &kind, 0); ImGui::SameLine(); ImGui::RadioButton("Διόρθωση", &kind, 1);
         ImGui::RadioButton("Προσθήκη (+)", &sign, 0); ImGui::SameLine(); ImGui::RadioButton("Αφαίρεση (−)", &sign, 1);
         ImGui::SetNextItemWidth(160); InputMoney("Ποσό (€)", &amount);
         ImGui::SetNextItemWidth(400); ImGui::InputTextWithHint("Αιτία", kind == 0 ? "π.χ. παραλαβή από προηγούμενο διαχειριστή" : "τι διορθώνεται και γιατί", desc.data, sizeof(desc.data));
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Ημερομηνία:"); ImGui::SameLine(); DatePicker("fadate", date, ImVec2(0, 1));
+        ImGui::AlignTextToFramePadding(); CellText("Ημερομηνία:"); ImGui::SameLine(); DatePicker("fadate", date, ImVec2(0, 1));
         ImGui::TextDisabled("Οι κινήσεις δεν αλλάζουν ποτέ: ένα λάθος διορθώνεται με νέα κίνηση.");
         if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
         ImGui::BeginDisabled(ToCents(amount) <= 0 || desc.str().size() < 3);
@@ -11145,70 +11768,56 @@ static void DrawFundTab(int bid) {
         ImGui::SameLine(); if (ImGui::Button("Άκυρο", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+    return;
+    }
 
-    // ---- the fund, one line per ACTION (not per resident): a funding with what it brought in so far, an expense with what
-    // it cost (and what came back from its split), our fee, an opening balance or a correction. One page at a time from the
-    // database, sorted there; residents paying later move the completion bar, not the list. Clicking the reason opens its report.
-    ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1), "Κινήσεις ταμείου");
-    ImGui::SameLine(); ImGui::TextDisabled("· μία γραμμή ανά ενέργεια · κλικ στην αιτία: σύνολο, κατανομή στους ενοίκους, πληρωμές, οφειλές");
-    enum { FA_DATE, FA_KIND, FA_WHY, FA_NOTE, FA_WAS, FA_AMT, FA_AFTER, FA_DONE, FA_COUNT };
-    static const ListColDef cols[FA_COUNT] = {
-        { "Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },      { "Ενέργεια", ImGuiTableColumnFlags_WidthFixed, 165.0f, true },
-        { "Αιτία", ImGuiTableColumnFlags_WidthFixed, 260.0f, true },       { "Σχόλιο", ImGuiTableColumnFlags_WidthFixed, 170.0f, true },
-        { "Ήταν", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },        { "Κίνηση €", ImGuiTableColumnFlags_WidthFixed, 130.0f, true },
-        { "Έγινε", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },       { "Ολοκλήρωση", ImGuiTableColumnFlags_WidthFixed, 170.0f, true } };
-    static std::map<int, ListModel<DataConn::FundActionRow>> models;
-    ListModel<DataConn::FundActionRow>& m = models[bid];
-    m.Init(FA_COUNT, {{FA_DATE, false}}, 20);
-    const auto& pg = m.Load(std::to_string(bid),
-        [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageFundActions(bid, s, off, lim); },      // same column numbers as the SQL
-        [&] { return g_app.conn->countFundActions(bid); });
-    if (pg.count == 0) { ImGui::TextDisabled("Καμία κίνηση ακόμα."); return; }
+    // ---- the deposit's moves, and only those: what was added, what covered a cost, what residents paid back. Our fees are not here.
+    SectionTitle("Κινήσεις αποθεματικού");
+    enum { DM_DATE, DM_KIND, DM_WHY, DM_WHO, DM_AMT, DM_AFTER, DM_COUNT };
+    static const ListColDef cols[DM_COUNT] = {
+        { "Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },   { "Κίνηση", ImGuiTableColumnFlags_WidthFixed, 190.0f, true },
+        { "Αιτία", ImGuiTableColumnFlags_WidthFixed, 430.0f, true },   { "Ένοικος", ImGuiTableColumnFlags_WidthFixed, 190.0f, true },
+        { "Ποσό", ImGuiTableColumnFlags_WidthFixed, 110.0f, true },    { "Αποθεματικό μετά", ImGuiTableColumnFlags_WidthFixed, 130.0f, true } };
+    static std::map<int, GridState> grids; GridState& g = grids[bid];
+    if (g.order.empty()) { for (int i = 0; i < DM_COUNT; i++) g.order.push_back(i); g.pager.pageSize = 20; }
+    static std::map<int, Cached<std::vector<DataConn::FundMove>>> mc;
+    const auto& moves = mc[bid].get("", [&] { return g_app.conn->pageFundMoves(bid, 0, 1000000); });
+    auto kindOf = [](const DataConn::FundMove& m) -> std::string {
+        if (m.description.rfind("Από οφειλή", 0) == 0 || m.description.rfind("Επιστροφή στο αποθεματικό", 0) == 0) return "+ Από οφειλή ενοίκου";
+        if (m.direction == "out") return m.description.rfind("Κάλυψη", 0) == 0 ? "− Κάλυψη κόστους" : m.kind == "expense" ? "− Παλιό έξοδο" : "− Διόρθωση";
+        return m.kind == "opening" || m.kind == "correction" ? "+ Χρηματοδότηση" : "+ Παλιά είσπραξη"; };
+    auto text = [kindOf](const DataConn::FundMove& m, int col) -> std::string {
+        switch (col) { case DM_DATE: return DateGr(m.date); case DM_KIND: return kindOf(m); case DM_WHY: return m.description; case DM_WHO: return m.who;
+                       case DM_AMT: return (m.direction == "out" ? "−" : "+") + Eur(m.amount); case DM_AFTER: return Eur(m.balance); default: return ""; } };
+    DrawListSearch(g);
+    std::vector<const DataConn::FundMove*> rows;
+    for (auto& m : moves) if (ListRowMatches(m, g, text, DM_COUNT)) rows.push_back(&m);
+    const DistinctFn distinct = [&](int col, const std::string& q) { return ListDistinct(moves, g, text, DM_COUNT, col, q); };
+    GridSort(rows, g.sort, [](int col, const DataConn::FundMove& a, const DataConn::FundMove& b) {
+        switch (col) { case DM_DATE: return Cmp3(a.date, b.date); case DM_WHY: return CmpText(a.description, b.description); case DM_WHO: return CmpText(a.who, b.who);
+                       case DM_AMT: return Cmp3(ToCents(a.amount), ToCents(b.amount)); case DM_AFTER: return Cmp3(ToCents(a.balance), ToCents(b.balance)); default: return 0; } });
+    g.pager.total = (int)rows.size(); if (g.pager.offset >= g.pager.total) g.pager.Reset();
+    if (moves.empty()) { ImGui::TextDisabled("Καμία κίνηση ακόμα."); return; }
     float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
-    if (ImGui::BeginTable("fundacts", FA_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+    if (ImGui::BeginTable("fundacts", DM_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ListSetupColumns(m.g.order, cols);
-        ListHeaderRow(m.g.order, cols, m.g.sort, m.g.pager);
-        auto P = [&](int c) { return ListPos(m.g.order, c); };
-        for (size_t i = 0; i < pg.rows.size(); i++) {
-            const auto& a = pg.rows[i];
-            const bool toUs = a.opKind == "fee";
-            const bool isOut = a.out > 0.005 || a.opKind == "recharge";
-            std::string kind = a.opKind == "contribution" ? "Χρηματοδότηση" : a.opKind == "recharge" ? "Έξοδο" : toUs ? "Αμοιβή διαχείρισης"
-                             : a.opId > 0 ? (isOut ? "Έξοδο" : "Κοινόχρηστο") : a.moveKind == "expense" ? "Έξοδο" : FundKindLabel(a.moveKind);
-            const int key = a.opId > 0 ? -a.opId : (a.moveKind == "expense" || a.moveKind == "our_bill") ? a.moveId : 0;
-            double net = MoneySub(a.in, a.out);
-            ImGui::PushID((int)i); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(FA_DATE)); ImGui::TextUnformatted(DateGr(a.date).c_str());
-            ImGui::TableSetColumnIndex(P(FA_KIND));
-            if (toUs) ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1), "► %s", kind.c_str());
-            else ImGui::TextColored(isOut ? kColOut : kColIn, "%s %s", isOut ? "▼" : "▲", kind.c_str());
-            ImGui::TableSetColumnIndex(P(FA_WHY));
-            std::string why = (a.moveKind == "our_bill" ? "Υπηρεσία μας: " : "") + a.label;
-            if (key != 0) { if (LinkCell(why)) g_expenseOpen = key; if (ImGui::IsItemHovered()) ImGui::SetTooltip("Αναφορά: σύνολο, κατανομή στους ενοίκους, τι πλήρωσε και τι χρωστάει ο καθένας"); }
-            else ImGui::TextUnformatted(why.c_str());
-            ImGui::TableSetColumnIndex(P(FA_NOTE)); ImGui::TextDisabled("%s", a.note.c_str()); if (!a.note.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", a.note.c_str());
-            ImGui::TableSetColumnIndex(P(FA_WAS)); ImGui::TextDisabled("%s", Eur(MoneySub(a.balance, net)).c_str());
-            ImGui::TableSetColumnIndex(P(FA_AMT));
-            if (toUs) ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1), "→ εμάς %s", Eur(a.charged).c_str());
-            else if (isOut) { ImGui::TextColored(kColOut, "−%s", Eur(a.out).c_str()); if (a.in > 0.005) { ImGui::SameLine(); ImGui::TextColored(kColIn, "+%s", Eur(a.in).c_str()); } }
-            else ImGui::TextColored(kColIn, "+%s", Eur(a.in).c_str());
-            ImGui::TableSetColumnIndex(P(FA_AFTER)); ImGui::TextColored(a.balance >= 0 ? ImVec4(0.92f, 0.95f, 1.0f, 1) : kColOut, "%s", Eur(a.balance).c_str());
-            if (a.balance < 0 && ImGui::IsItemHovered()) ImGui::SetTooltip("Αρνητικό: πληρώθηκε με χρήματα που δεν υπήρχαν ακόμα στο ταμείο");
-            ImGui::TableSetColumnIndex(P(FA_DONE));
-            if (a.charged > 0.005) {
-                float fr = (float)std::min(1.0, a.collected / a.charged);
-                char b[64]; std::snprintf(b, sizeof(b), "%.0f%% · μένουν %s", fr * 100.0f, Eur(MoneySub(a.charged, a.collected)).c_str());
-                ImGui::PushStyleColor(ImGuiCol_PlotHistogram, fr >= 0.9999f ? ImVec4(0.30f, 0.70f, 0.45f, 1) : ImVec4(0.85f, 0.60f, 0.25f, 1));
-                ImGui::ProgressBar(fr, ImVec2(-1, 0), fr >= 0.9999f ? "εισπράχθηκε όλο" : b); ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Χρεώθηκαν στους ενοίκους %s · εισπράχθηκαν %s", Eur(a.charged).c_str(), Eur(a.collected).c_str());
-            } else ImGui::TextDisabled("—");
+        ListSetupColumns(g.order, cols);
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &distinct);
+        auto P = [&](int col) { return ListPos(g.order, col); };
+        for (int i = g.pager.offset; i < std::min(g.pager.total, g.pager.offset + g.pager.pageSize); i++) {
+            const auto& m = *rows[i]; const bool out = m.direction == "out";
+            ImGui::PushID(m.id); ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(P(DM_DATE)); CellText(DateGr(m.date).c_str());
+            ImGui::TableSetColumnIndex(P(DM_KIND)); ImGui::TextColored(out ? kColOut : kColIn, "%s", kindOf(m).c_str());
+            ImGui::TableSetColumnIndex(P(DM_WHY)); CellText(m.description.c_str()); if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.description.c_str());
+            ImGui::TableSetColumnIndex(P(DM_WHO)); CellText(m.who.c_str());
+            ImGui::TableSetColumnIndex(P(DM_AMT)); ImGui::TextColored(out ? kColOut : kColIn, "%s%s", out ? "−" : "+", Eur(m.amount).c_str());
+            ImGui::TableSetColumnIndex(P(DM_AFTER)); ImGui::TextColored(m.balance >= 0 ? ImVec4(0.92f, 0.95f, 1.0f, 1) : kColOut, "%s", Eur(m.balance).c_str());
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
-    DrawPager(m.g.pager, "fundpg");
+    DrawPager(g.pager, "fundmovespg");
 }
 
 // ---- Ιστορικό εξόδων: every expense of the building, with the fund before and after; clicking opens it as a tab
@@ -11219,7 +11828,7 @@ static void DrawExpenseHistory(int bid) {
     const Pg& pg = pc.get(std::to_string(bid) + "|" + std::to_string(pager.offset) + "|" + std::to_string(pager.pageSize), [&] {
         Pg p; p.count = g_app.conn->countFundMoves(bid, true); p.rows = g_app.conn->pageFundMoves(bid, pager.offset, pager.pageSize, true); return p; });
     pager.total = pg.count;
-    ImGui::TextDisabled("Κάθε έξοδο που κάναμε για την πολυκατοικία: το ταμείο πριν και μετά. Κλικ: λεπτομέρειες, επιμερισμός, πληρωμές και αποδείξεις ανά ένοικο.");
+    ImGui::TextDisabled("Κάθε έξοδο που κάναμε για την πολυκατοικία: το αποθεματικό πριν και μετά. Κλικ: λεπτομέρειες, επιμερισμός, πληρωμές και αποδείξεις ανά ένοικο.");
     {   // our management fee is a cost of the building too: its residents pay it straight to us (it never touches the fund)
         static Cached<std::vector<JointOp>> fc;
         const auto& fees = fc.get(std::to_string(bid), [&] { std::vector<JointOp> v; for (auto& o : g_app.conn->getJointOps(bid, 0, 100000)) if (o.kind == "fee") v.push_back(o); return v; });
@@ -11231,7 +11840,7 @@ static void DrawExpenseHistory(int bid) {
                 for (auto& o : fees) {
                     ImGui::PushID(o.id);
                     double p2 = std::min(o.paid, o.total), left = MoneySub(o.total, p2);
-                    ImGui::TextUnformatted(DateGr(o.op_date).c_str()); ImGui::SameLine(110); if (LinkCell(o.label)) OpenJointView(o.id);
+                    CellText(DateGr(o.op_date).c_str()); ImGui::SameLine(110); if (LinkCell(o.label)) OpenJointView(o.id);
                     ImGui::SameLine(); ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1), "%s", Eur(o.total).c_str());
                     ImGui::SameLine(); if (left > 0.005) ImGui::TextColored(kColOwed, "· χρωστάνε %s", Eur(left).c_str()); else ImGui::TextColored(kColIn, "· πληρώθηκε");
                     ImGui::PopID();
@@ -11244,16 +11853,16 @@ static void DrawExpenseHistory(int bid) {
     if (ImGui::BeginTable("exphist", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 90); ImGui::TableSetupColumn("Έξοδο", 0, 2.0f); ImGui::TableSetupColumn("Σχόλιο", 0, 1.5f);
-        ImGui::TableSetupColumn("Ταμείο πριν", ImGuiTableColumnFlags_WidthFixed, 105); ImGui::TableSetupColumn("Κόστος", ImGuiTableColumnFlags_WidthFixed, 95);
-        ImGui::TableSetupColumn("Ταμείο μετά", ImGuiTableColumnFlags_WidthFixed, 105); ImGui::TableSetupColumn("Επιμερισμός", ImGuiTableColumnFlags_WidthFixed, 160);
+        ImGui::TableSetupColumn("Αποθεματικό πριν", ImGuiTableColumnFlags_WidthFixed, 105); ImGui::TableSetupColumn("Κόστος", ImGuiTableColumnFlags_WidthFixed, 95);
+        ImGui::TableSetupColumn("Αποθεματικό μετά", ImGuiTableColumnFlags_WidthFixed, 105); ImGui::TableSetupColumn("Επιμερισμός", ImGuiTableColumnFlags_WidthFixed, 160);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableHeadersRow();
         for (auto& m : pg.rows) {
             ImGui::PushID(m.id); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(m.date).c_str());
+            ImGui::TableNextColumn(); CellText(DateGr(m.date).c_str());
             ImGui::TableNextColumn(); if (LinkCell((m.kind == "our_bill" ? "Υπηρεσία μας: " : "") + m.description)) g_expenseOpen = m.id;
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", m.note.c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(FromCents(ToCents(m.balance) + ToCents(m.amount))).c_str());
+            ImGui::TableNextColumn(); CellText(Eur(FromCents(ToCents(m.balance) + ToCents(m.amount))).c_str());
             ImGui::TableNextColumn(); ImGui::TextColored(kColOut, "−%s", Eur(m.amount).c_str());
             ImGui::TableNextColumn(); ImGui::TextColored(m.balance >= 0 ? ImVec4(0.92f, 0.95f, 1.0f, 1) : kColOut, "%s", Eur(m.balance).c_str());
             ImGui::TableNextColumn();
@@ -11261,7 +11870,7 @@ static void DrawExpenseHistory(int bid) {
                 JointOp op = g_app.conn->getJointOpById(m.joint_op_id);
                 double left = MoneySub(op.total, std::min(op.paid, op.total));
                 if (left > 0.005) ImGui::TextColored(kColOwed, "χρωστάνε %s", Eur(left).c_str()); else ImGui::TextColored(kColIn, "εισπράχθηκε όλο");
-            } else ImGui::TextDisabled("μόνο από το ταμείο");
+            } else ImGui::TextDisabled("μόνο από το αποθεματικό");
             ImGui::TableNextColumn(); if (ImGui::SmallButton("Άνοιγμα")) g_expenseOpen = m.id;
             ImGui::PopID();
         }
@@ -11283,11 +11892,11 @@ static void DrawExpenseDetail(int key) {
     } else op = g_app.conn->getJointOpById(-key);
     const bool funding = moveId <= 0 && op.kind == "contribution";
     std::string title = moveId > 0 ? (m.kind == "our_bill" ? "Υπηρεσία μας: " : "") + m.description : op.label;
-    ImGui::SetWindowFontScale(1.15f); ImGui::TextUnformatted(title.c_str()); ImGui::SetWindowFontScale(1.0f);
-    ImGui::SameLine(); ImGui::TextDisabled("  %s", funding ? "χρηματοδότηση ταμείου" : op.kind == "fee" ? "αμοιβή διαχείρισης · χρήματα δικά μας, όχι του ταμείου" : "έξοδο της πολυκατοικίας");
+    ImGui::SetWindowFontScale(1.15f); CellText(title.c_str()); ImGui::SetWindowFontScale(1.0f);
+    ImGui::SameLine(); ImGui::TextDisabled("  %s", funding ? "χρηματοδότηση αποθεματικού" : op.kind == "fee" ? "αμοιβή διαχείρισης · χρήματα δικά μας, όχι του αποθεματικού" : "έξοδο της πολυκατοικίας");
     if (moveId > 0) {
         ImGui::Text("%s  ·  κόστος ", DateGr(m.date).c_str()); ImGui::SameLine(0, 0); ImGui::TextColored(kColOut, "%s", Eur(m.amount).c_str());
-        ImGui::SameLine(); ImGui::TextDisabled("·  ταμείο πριν %s → μετά %s", Eur(FromCents(ToCents(m.balance) + ToCents(m.amount))).c_str(), Eur(m.balance).c_str());
+        ImGui::SameLine(); ImGui::TextDisabled("·  αποθεματικό πριν %s → μετά %s", Eur(FromCents(ToCents(m.balance) + ToCents(m.amount))).c_str(), Eur(m.balance).c_str());
         if (!m.note.empty()) ImGui::TextWrapped("Σχόλιο: %s", m.note.c_str());
         if (m.kind == "our_bill" && m.charge_id > 0) { if (ImGui::SmallButton("Η χρέωσή μας (στα βιβλία μας)")) OpenPaymentView(m.charge_id); }
     } else {
@@ -11299,8 +11908,8 @@ static void DrawExpenseDetail(int key) {
         static Cached<std::vector<JointShare>> esc;
         const auto& es = esc.get(std::to_string(moveId), [&] { return g_app.conn->getExpenseShares(moveId); });
         ImGui::Spacing();
-        if (es.empty()) { ImGui::TextDisabled("Πληρώθηκε από το ταμείο - δεν επιμερίστηκε στους ενοίκους."); return; }
-        ImGui::TextDisabled("Πληρώθηκε όλο από το ταμείο. Το μερίδιο κάθε ενοίκου είναι ενημερωτικό: δεν χρωστάει κανείς γι' αυτό.");
+        if (es.empty()) { ImGui::TextDisabled("Πληρώθηκε από το αποθεματικό - δεν επιμερίστηκε στους ενοίκους."); return; }
+        ImGui::TextDisabled("Πληρώθηκε όλο από το αποθεματικό. Το μερίδιο κάθε ενοίκου είναι ενημερωτικό: δεν χρωστάει κανείς γι' αυτό.");
         float th = std::max(160.0f, ImGui::GetContentRegionAvail().y - 8.0f);
         if (ImGui::BeginTable("expsh", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit, ImVec2(0, th))) {
             ImGui::TableSetupScrollFreeze(0, 1);
@@ -11308,9 +11917,9 @@ static void DrawExpenseDetail(int key) {
             ImGui::TableHeadersRow();
             for (auto& s : es) {
                 ImGui::PushID(s.id); ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(s.apartment_label.c_str());
+                ImGui::TableNextColumn(); CellText(s.apartment_label.c_str());
                 ImGui::TableNextColumn(); if (LinkCell(s.user_name)) OpenResident(s.user_id);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(s.amount).c_str());
+                ImGui::TableNextColumn(); CellText(Eur(s.amount).c_str());
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%.1f%%", m.amount > 0 ? 100.0 * s.amount / m.amount : 0.0);
                 ImGui::PopID();
             }
@@ -11337,9 +11946,11 @@ static void DrawExpenseDetail(int key) {
         ListModel<JointShare>& mdl = models[op.id];
         mdl.Init(AR_COUNT, {{AR_APT, true}}, 20);
         const int opId = op.id;
-        const auto& pg = mdl.Load(std::to_string(opId),
+        DrawListSearch(mdl.g);
+        const auto& pg = mdl.LoadT(std::to_string(opId),
             [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageShareRows(opId, {}, MapSort(s, {{AR_APT, 3}, {AR_WHO, 2}, {AR_SHARE, 5}, {AR_PAID, 6}, {AR_OWED, 7}}), off, lim); },
-            [&] { return g_app.conn->countShareRows(opId, {}); });
+            [&] { return g_app.conn->countShareRows(opId, {}); },
+        [](const JointShare& s, int c) -> std::string { switch (c) { case AR_APT: return s.apartment_label; case AR_WHO: return s.user_name; case AR_SHARE: return Eur(s.amount); case AR_PAID: return Eur(std::min(s.paid, s.amount)); case AR_OWED: return Eur(MoneySub(s.amount, std::min(s.paid, s.amount))); default: return ""; } }, AR_COUNT);
         // the payments and receipts of the residents on this page only
         static std::map<std::string, Cached<std::map<int, std::vector<std::pair<MoneyPayment, Receipt>>>>> pc;
         std::string pkey = std::to_string(opId) + "|" + std::to_string(mdl.g.pager.offset) + "|" + SortKeyStr(mdl.g.sort.keys);
@@ -11360,14 +11971,14 @@ static void DrawExpenseDetail(int key) {
         if (ImGui::BeginTable("expdet", AR_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, th))) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ListSetupColumns(mdl.g.order, cols);
-            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager);
+            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager, &mdl.g.cf, &mdl.distinct);
             auto P = [&](int c) { return ListPos(mdl.g.order, c); };
             for (auto& s : pg.rows) {
                 double paid = std::min(s.paid, s.amount), owe = MoneySub(s.amount, paid);
                 ImGui::PushID(s.id); ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(P(AR_APT)); ImGui::TextUnformatted(s.apartment_label.c_str());
+                ImGui::TableSetColumnIndex(P(AR_APT)); CellText(s.apartment_label.c_str());
                 ImGui::TableSetColumnIndex(P(AR_WHO)); if (LinkCell(s.user_name)) OpenResident(s.user_id);
-                ImGui::TableSetColumnIndex(P(AR_SHARE)); ImGui::TextUnformatted(Eur(s.amount).c_str());
+                ImGui::TableSetColumnIndex(P(AR_SHARE)); CellText(Eur(s.amount).c_str());
                 ImGui::TableSetColumnIndex(P(AR_PAID)); if (paid > 0.005) ImGui::TextColored(kColIn, "%s", Eur(paid).c_str()); else ImGui::TextDisabled("—");
                 ImGui::TableSetColumnIndex(P(AR_OWED)); if (owe > 0.005) { ImGui::TextColored(kColOwed, "%s", Eur(owe).c_str()); ImGui::SameLine(); if (ImGui::SmallButton("Είσπραξη")) OpenRecordPayment(s.user_id); } else ImGui::TextDisabled("—");
                 ImGui::TableSetColumnIndex(P(AR_PAYS));
@@ -11404,23 +12015,27 @@ static void DrawAptResidentsTab(const BuildingAgg& b) {
     static std::map<int, ListModel<DataConn::AptResidentRow>> curM, prevM;
     static char q[96] = "";
     if (ImGui::Button("+ Διαμέρισμα")) { g_showAptDialog = true; g_aptDialogIsEdit = false; g_aptDialogId = -1; g_aptDialogBuilding = bid; ad_label.set(""); }
-    ImGui::SameLine(); ImGui::SetNextItemWidth(260);
-    bool ch = ImGui::InputTextWithHint("##arq", "Αναζήτηση διαμερίσματος ή ενοίκου...", q, sizeof(q));
+    bool ch = false;
     ImGui::SameLine(); ImGui::TextDisabled("· κλικ στο διαμέρισμα: ένοικοι, αποχώρηση, μετονομασία · κλικ στο όνομα: η καρτέλα του ενοίκου");
     bool openApt = false;
     auto table = [&](const char* id, ListModel<DataConn::AptResidentRow>& mdl, bool previous, float height) {
         mdl.Init(RA_COUNT, previous ? SortSpec{{RA_TO, false}} : SortSpec{{RA_APT, true}}, previous ? 10 : 20);
         if (ch) mdl.g.pager.Reset();
         const std::string text = q;
-        const auto& pg = mdl.Load(std::to_string(bid) + "|" + text,
+        DrawListSearch(mdl.g);
+        const auto& pg = mdl.LoadT(std::to_string(bid) + "|" + text,
             [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageAptResidents(bid, previous, text, s, off, lim); },
-            [&] { return g_app.conn->countAptResidents(bid, previous, text); });
+            [&] { return g_app.conn->countAptResidents(bid, previous, text); },
+        [](const DataConn::AptResidentRow& r, int c) -> std::string { switch (c) { case RA_APT: return r.apartment; case RA_NAME: return r.r.full_name; case RA_PHONE: return r.r.phone; case RA_EMAIL: return r.r.email; case RA_FROM: return r.r.start_date.empty() ? std::string() : DateGr(r.r.start_date); case RA_TO: return r.r.end_date.empty() ? std::string() : DateGr(r.r.end_date); case RA_OWED: return Eur(r.owed); default: return ""; } }, RA_COUNT);
         if (pg.count == 0) { ImGui::TextDisabled(previous ? "Κανένας πρώην ένοικος." : "Κανένα διαμέρισμα ακόμα."); return; }
-        if (ImGui::BeginTable(id, RA_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, height))) {
+        if (ImGui::BeginTable(id, RA_COUNT, ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, height))) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ListSetupColumns(mdl.g.order, cols);
-            if (!previous) ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, RA_TO), false);       // they live there today
-            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager);
+            if (!previous) {                                                                        // they live there today; dates are for past residents
+                ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, RA_FROM), false);
+                ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, RA_TO), false);
+            }
+            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager, &mdl.g.cf, &mdl.distinct);
             auto P = [&](int c) { return ListPos(mdl.g.order, c); };
             for (size_t i = 0; i < pg.rows.size(); i++) {
                 const auto& r = pg.rows[i];
@@ -11431,10 +12046,10 @@ static void DrawAptResidentsTab(const BuildingAgg& b) {
                 ImGui::TableSetColumnIndex(P(RA_NAME));
                 if (r.r.id <= 0) ImGui::TextDisabled("κενό");
                 else if (LinkCell(r.r.full_name)) OpenResident(r.r.user_id);
-                ImGui::TableSetColumnIndex(P(RA_PHONE)); ImGui::TextUnformatted(r.r.phone.empty() ? "—" : r.r.phone.c_str());
-                ImGui::TableSetColumnIndex(P(RA_EMAIL)); ImGui::TextUnformatted(r.r.email.empty() ? "—" : r.r.email.c_str());
-                ImGui::TableSetColumnIndex(P(RA_FROM)); ImGui::TextUnformatted(r.r.start_date.empty() ? "—" : DateGr(r.r.start_date).c_str());
-                ImGui::TableSetColumnIndex(P(RA_TO)); ImGui::TextUnformatted(r.r.end_date.empty() ? "—" : DateGr(r.r.end_date).c_str());
+                ImGui::TableSetColumnIndex(P(RA_PHONE)); CellText(r.r.phone.empty() ? "—" : r.r.phone.c_str());
+                ImGui::TableSetColumnIndex(P(RA_EMAIL)); CellText(r.r.email.empty() ? "—" : r.r.email.c_str());
+                ImGui::TableSetColumnIndex(P(RA_FROM)); CellText(r.r.start_date.empty() ? "—" : DateGr(r.r.start_date).c_str());
+                ImGui::TableSetColumnIndex(P(RA_TO)); CellText(r.r.end_date.empty() ? "—" : DateGr(r.r.end_date).c_str());
                 ImGui::TableSetColumnIndex(P(RA_OWED));
                 if (r.owed > 0.005) { ImGui::TextColored(kColOwed, "%s", Eur(r.owed).c_str()); ImGui::SameLine(); if (ImGui::SmallButton("Είσπραξη")) OpenRecordPayment(r.r.user_id); }
                 else ImGui::TextDisabled("—");
@@ -11481,7 +12096,7 @@ static void DrawAptResidentsTab(const BuildingAgg& b) {
         ImGui::SetNextItemWidth(280); ImGui::InputText("Ονοματεπώνυμο", nn.data, sizeof(nn.data));
         ImGui::SetNextItemWidth(280); ImGui::InputText("Τηλέφωνο", np.data, sizeof(np.data));
         ImGui::SetNextItemWidth(280); ImGui::InputText("Email", ne.data, sizeof(ne.data));
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Από:"); ImGui::SameLine(); DatePicker("startdate", start, ImVec2(0, 1));
+        ImGui::AlignTextToFramePadding(); CellText("Από:"); ImGui::SameLine(); DatePicker("startdate", start, ImVec2(0, 1));
         ImGui::BeginDisabled(nn.str().empty());
         if (ImGui::Button("Προσθήκη ενοίκου")) {
             DataConn::Resident x; x.apartment_id = g_resAptId; x.full_name = nn.str(); x.phone = np.str(); x.email = ne.str(); x.start_date = start;
@@ -11526,7 +12141,7 @@ static void DrawResidentCard() {
     if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
         const auto& cur = stays[0];
         std::vector<int> ids = {g_resCardUser}; for (auto& s : stays) if (s.legacy_user_id > 0 && std::find(ids.begin(), ids.end(), s.legacy_user_id) == ids.end()) ids.push_back(s.legacy_user_id);
-        ImGui::SetWindowFontScale(1.2f); ImGui::TextUnformatted(cur.full_name.c_str()); ImGui::SetWindowFontScale(1.0f);
+        ImGui::SetWindowFontScale(1.2f); CellText(cur.full_name.c_str()); ImGui::SetWindowFontScale(1.0f);
         ImGui::SameLine(); ImGui::TextDisabled("  ένοικος · %s, %s · %s", cur.building.c_str(), cur.apartment.c_str(), cur.active() ? ("από " + DateGr(cur.start_date)).c_str() : ("έφυγε " + DateGr(cur.end_date)).c_str());
         ImGui::Text("Τηλ. %s  ·  %s", cur.phone.empty() ? "—" : cur.phone.c_str(), cur.email.empty() ? "χωρίς email" : cur.email.c_str());
         ImGui::SameLine(); if (ImGui::SmallButton("Στοιχεία…")) ImGui::OpenPopup("Στοιχεία ενοίκου");
@@ -11552,9 +12167,9 @@ static void DrawResidentCard() {
         ImGui::Spacing();
         if (ImGui::BeginTable("rctiles", 3, ImGuiTableFlags_SizingStretchSame)) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); StatTile("Χρωστάει στο ταμείο", Eur(owes), owes > 0.005 ? kColOwed : kColIn, owes > 0.005 ? "από χρηματοδοτήσεις" : "εξοφλημένος", ImVec2(ImGui::GetContentRegionAvail().x, 80));
+            ImGui::TableNextColumn(); StatTile("Χρωστάει στο αποθεματικό", Eur(owes), owes > 0.005 ? kColOwed : kColIn, owes > 0.005 ? "από χρηματοδοτήσεις" : "εξοφλημένος", ImVec2(ImGui::GetContentRegionAvail().x, 80));
             ImGui::TableNextColumn(); StatTile("Μας χρωστάει (αμοιβές)", Eur(feesOwed), feesOwed > 0.005 ? kColOwed : ImVec4(0.55f, 0.65f, 1.0f, 1), "αμοιβές διαχείρισης", ImVec2(ImGui::GetContentRegionAvail().x, 80));
-            ImGui::TableNextColumn(); StatTile("Έχει πληρώσει", Eur(FromCents(ToCents(T.fundPaid) + ToCents(T.feePaid))), kColIn, ("στο ταμείο " + Eur(T.fundPaid)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 80));
+            ImGui::TableNextColumn(); StatTile("Έχει πληρώσει", Eur(FromCents(ToCents(T.fundPaid) + ToCents(T.feePaid))), kColIn, ("στο αποθεματικό " + Eur(T.fundPaid)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 80));
             ImGui::EndTable();
         }
         ImGui::Spacing();
@@ -11604,12 +12219,12 @@ static void DrawResidentCard() {
                         for (auto& o : open) {
                             const bool fee = o.kind == "fee";
                             ImGui::PushID(o.c.id); ImGui::TableNextRow();
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(o.c.year, o.c.month, o.c.day).c_str());
+                            ImGui::TableNextColumn(); CellText(DateGr(o.c.year, o.c.month, o.c.day).c_str());
                             ImGui::TableNextColumn();
                             ImGui::TextColored(fee ? ImVec4(0.55f, 0.65f, 1.0f, 1) : o.kind == "contribution" ? kColIn : kColOwed, "%s",
                                                fee ? "Αμοιβή" : o.kind == "contribution" ? "Χρηματοδότηση" : "Παλιό έξοδο");
                             ImGui::SameLine(); if (LinkCell(ChargeLabel(o.c))) { g_mgSel = o.building; g_expenseOpen = -o.op; g_page = PAGE_JOINT; }
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(o.c.amount_due).c_str());
+                            ImGui::TableNextColumn(); CellText(Eur(o.c.amount_due).c_str());
                             ImGui::TableNextColumn(); MoneyCell(ToCents(o.c.amount_paid), kColIn);
                             ImGui::TableNextColumn(); ImGui::TextColored(kColOwed, "%s", Eur(o.c.balance).c_str());
                             ImGui::TableNextColumn(); if (ImGui::SmallButton("Πληρωμή")) OpenRecordPaymentFor(o.c);
@@ -11631,9 +12246,11 @@ static void DrawResidentCard() {
         static std::map<int, ListModel<JointShare>> models;
         ListModel<JointShare>& mdl = models[g_resCardUser];
         mdl.Init(RC_COUNT, {{RC_DATE, false}}, 20);
-        const auto& pg = mdl.Load(std::to_string(g_resCardUser),
+        DrawListSearch(mdl.g);
+        const auto& pg = mdl.LoadT(std::to_string(g_resCardUser),
             [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageShareRows(-1, ids, MapSort(s, {{RC_DATE, 0}, {RC_WHY, 1}, {RC_TOTAL, 4}, {RC_SHARE, 5}, {RC_PAID, 6}, {RC_OWED, 7}}), off, lim); },
-            [&] { return g_app.conn->countShareRows(-1, ids); });
+            [&] { return g_app.conn->countShareRows(-1, ids); },
+        [](const JointShare& s, int c) -> std::string { switch (c) { case RC_DATE: return DateGr(s.op_date); case RC_WHY: return s.op_label; case RC_TOTAL: return Eur(s.op_total); case RC_SHARE: return Eur(s.amount); case RC_PAID: return Eur(std::min(s.paid, s.amount)); case RC_OWED: return Eur(MoneySub(s.amount, std::min(s.paid, s.amount))); default: return ""; } }, RC_COUNT);
         // the kind of each action and his latest receipt on it: only for the rows on this page
         struct Extra { std::string kind; int building = -1, receipt = -1; };
         static std::map<std::string, Cached<std::map<int, Extra>>> xc;
@@ -11654,7 +12271,7 @@ static void DrawResidentCard() {
         if (ImGui::BeginTable("rcacts", RC_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ListSetupColumns(mdl.g.order, cols);
-            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager);
+            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager, &mdl.g.cf, &mdl.distinct);
             auto P = [&](int c) { return ListPos(mdl.g.order, c); };
             for (auto& s : pg.rows) {
                 auto xi = X.find(s.id); Extra e = xi != X.end() ? xi->second : Extra{};
@@ -11662,13 +12279,13 @@ static void DrawResidentCard() {
                 std::string kind = fee ? "Αμοιβή διαχείρισης" : e.kind == "contribution" ? "Χρηματοδότηση" : "Παλιό έξοδο (χρεώθηκε)";
                 double paid = std::min(s.paid, s.amount), left = MoneySub(s.amount, paid);
                 ImGui::PushID(s.id); ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(P(RC_DATE)); ImGui::TextUnformatted(DateGr(s.op_date).c_str());
+                ImGui::TableSetColumnIndex(P(RC_DATE)); CellText(DateGr(s.op_date).c_str());
                 ImGui::TableSetColumnIndex(P(RC_KIND)); ImGui::TextColored(fee ? ImVec4(0.55f, 0.65f, 1.0f, 1) : (e.kind == "contribution" ? kColIn : kColOut), "%s", kind.c_str());
                 ImGui::TableSetColumnIndex(P(RC_WHY));
                 if (LinkCell(s.op_label)) { g_mgSel = e.building; g_expenseOpen = -s.op_id; g_page = PAGE_JOINT; }      // the action's report: everybody's part
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Η ενέργεια: σύνολο και κατανομή σε όλους τους ενοίκους");
                 ImGui::TableSetColumnIndex(P(RC_TOTAL)); ImGui::TextDisabled("%s", Eur(s.op_total).c_str());
-                ImGui::TableSetColumnIndex(P(RC_SHARE)); ImGui::TextUnformatted(Eur(s.amount).c_str());
+                ImGui::TableSetColumnIndex(P(RC_SHARE)); CellText(Eur(s.amount).c_str());
                 ImGui::TableSetColumnIndex(P(RC_PAID)); if (paid > 0.005) ImGui::TextColored(kColIn, "%s", Eur(paid).c_str()); else ImGui::TextDisabled("—");
                 ImGui::TableSetColumnIndex(P(RC_OWED)); if (left > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(left).c_str()); else ImGui::TextDisabled("—");
                 ImGui::TableSetColumnIndex(P(RC_RECEIPT)); if (e.receipt > 0) { if (LinkCell("Απόδειξη")) OpenReceiptView(e.receipt); } else if (paid > 0.005) ImGui::TextColored(kColOwed, "χωρίς"); else ImGui::TextDisabled("—");
@@ -11692,10 +12309,10 @@ static void DrawResidentCard() {
                         ImGui::TableHeadersRow();
                         for (auto& p : pays) {
                             ImGui::PushID(p.m.id); ImGui::TableNextRow();
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(DateGr(p.m.pay_date).c_str());
+                            ImGui::TableNextColumn(); CellText(DateGr(p.m.pay_date).c_str());
                             ImGui::TableNextColumn(); ImGui::TextColored(kColIn, "%s", Eur(p.m.amount).c_str());
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(ReceiptMethodName(p.m.method).c_str());
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(p.what.c_str());
+                            ImGui::TableNextColumn(); CellText(ReceiptMethodName(p.m.method).c_str());
+                            ImGui::TableNextColumn(); CellText(p.what.c_str());
                             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.what.c_str());
                             ImGui::TableNextColumn();
                             if (p.m.receipt_id > 0) { if (LinkCell("Προβολή")) OpenReceiptView(p.m.receipt_id); }
@@ -11778,7 +12395,7 @@ static void DrawMonthlyTab(int bid) {
     std::string& ym = months.emplace(bid, thisMonth).first->second;
     if (ImGui::ArrowButton("##mprev", ImGuiDir_Left)) ym = MonthAdd(ym, -1);
     ImGui::SameLine(); ImGui::SetWindowFontScale(1.2f); ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(MonthTitle(ym).c_str()); ImGui::SetWindowFontScale(1.0f);
+    CellText(MonthTitle(ym).c_str()); ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine(); ImGui::BeginDisabled(ym >= thisMonth);
     if (ImGui::ArrowButton("##mnext", ImGuiDir_Right)) ym = MonthAdd(ym, 1);
     ImGui::SameLine(); if (ImGui::Button("Τρέχων μήνας")) ym = thisMonth;
@@ -11814,16 +12431,16 @@ static void DrawMonthlyTab(int bid) {
         if (ImGui::BeginTable("mfund", ncol, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp, ImVec2(0, th))) {
             ImGui::TableSetupScrollFreeze(0, 2);
             ImGui::TableSetupColumn("Ημ/νία", 0, 0.75f); ImGui::TableSetupColumn("Ενέργεια", 0, 2.8f);
-            ImGui::TableSetupColumn("Ταμείο##b", 0, 0.9f); ImGui::TableSetupColumn("Οφειλές##b", 0, 0.9f);
+            ImGui::TableSetupColumn("Αποθεματικό##b", 0, 0.9f); ImGui::TableSetupColumn("Οφειλές##b", 0, 0.9f);
             ImGui::TableSetupColumn("Ποσό", 0, 0.9f); ImGui::TableSetupColumn("Πληρώθηκε", 0, 0.9f); ImGui::TableSetupColumn("Οφείλεται", 0, 0.9f);
             ImGui::TableSetupColumn("Ολοκλήρωση", 0, 0.9f);
-            ImGui::TableSetupColumn("Ταμείο##a", 0, 0.9f); ImGui::TableSetupColumn("Οφειλές##a", 0, 0.9f); ImGui::TableSetupColumn("Ταμείο + οφειλές", 0, 1.0f);
+            ImGui::TableSetupColumn("Αποθεματικό##a", 0, 0.9f); ImGui::TableSetupColumn("Οφειλές##a", 0, 0.9f); ImGui::TableSetupColumn("Αποθεματικό + οφειλές", 0, 1.0f);
             if (anyFee) ImGui::TableSetupColumn("Μας οφείλουν", 0, 0.9f);
             std::vector<ColGroup> groups(anyFee ? 4 : 3);
-            groups[0] = ColGroup{MF_FB, 2, "Πριν", carry ? "Το ταμείο και οι οφειλές των ενοίκων πριν από την ενέργεια" : "Οφειλές: μόνο του μήνα", ImVec4(0.8f, 0.8f, 0.8f, 1)};
-            groups[1] = ColGroup{MF_AMT, 4, "Η ενέργεια", "Έξοδο: το κόστος του, βγαίνει από το ταμείο (τέλος).\nΧρηματοδότηση / αμοιβή: χρέωση, πληρωμές, υπόλοιπο, ολοκλήρωση.", ImVec4(0.8f, 0.8f, 0.8f, 1)};
-            groups[2] = ColGroup{MF_FA, 3, "Μετά", "Το ταμείο και οι οφειλές των ενοίκων μετά την ενέργεια", ImVec4(0.8f, 0.8f, 0.8f, 1)};
-            if (anyFee) groups[3] = ColGroup{MF_FEE, 1, "Δικά μας", "Αμοιβές διαχείρισης που μας οφείλουν: δεν μετράνε στο ταμείο", kColFee};
+            groups[0] = ColGroup{MF_FB, 2, "Πριν", carry ? "Το αποθεματικό και οι οφειλές των ενοίκων πριν από την ενέργεια" : "Οφειλές: μόνο του μήνα", ImVec4(0.8f, 0.8f, 0.8f, 1)};
+            groups[1] = ColGroup{MF_AMT, 4, "Η ενέργεια", "Έξοδο: το κόστος του, βγαίνει από το αποθεματικό (τέλος).\nΧρηματοδότηση / αμοιβή: χρέωση, πληρωμές, υπόλοιπο, ολοκλήρωση.", ImVec4(0.8f, 0.8f, 0.8f, 1)};
+            groups[2] = ColGroup{MF_FA, 3, "Μετά", "Το αποθεματικό και οι οφειλές των ενοίκων μετά την ενέργεια", ImVec4(0.8f, 0.8f, 0.8f, 1)};
+            if (anyFee) groups[3] = ColGroup{MF_FEE, 1, "Δικά μας", "Αμοιβές διαχείρισης που μας οφείλουν: δεν μετράνε στο αποθεματικό", kColFee};
             GroupHeaderRow(groups);
             auto signedCell = [](long long c) { ImGui::TextColored(c >= 0 ? kColIn : kColOut, "%s", Eur(FromCents(c)).c_str()); };
             long long fund = C(F.fundStart), owed = carry ? C(F.owedStart) : 0, fee = carry ? C(F.feeOwedStart) : 0;
@@ -11836,8 +12453,8 @@ static void DrawMonthlyTab(int bid) {
             };
             auto band = [&](const std::string& date, const char* what, const char* note) {
                 ImGui::TableNextRow(); ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImGuiCol_TableHeaderBg));
-                ImGui::TableSetColumnIndex(MF_DATE); ImGui::TextUnformatted(DateGr(date).c_str());
-                ImGui::TableSetColumnIndex(MF_ACT); ImGui::TextUnformatted(what); ImGui::SameLine(); ImGui::TextDisabled("%s", note);
+                ImGui::TableSetColumnIndex(MF_DATE); CellText(DateGr(date).c_str());
+                ImGui::TableSetColumnIndex(MF_ACT); CellText(what); ImGui::SameLine(); ImGui::TextDisabled("%s", note);
             };
             band(ym + "-01", "Αρχή μήνα", carry ? "(με τις οφειλές προηγούμενων μηνών)" : "(χωρίς τις παλιές οφειλές)");
             after();
@@ -11846,13 +12463,13 @@ static void DrawMonthlyTab(int bid) {
                 const long long ch = C(x.charged), pin = C(x.paidIn);
                 const bool isFee = x.kind == "fee", isExp = x.kind == "expense", isCorr = x.kind == "correction";
                 ImGui::PushID((int)i); ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(MF_DATE); ImGui::TextUnformatted(DateGr(x.date).c_str());
+                ImGui::TableSetColumnIndex(MF_DATE); CellText(DateGr(x.date).c_str());
                 ImGui::TableSetColumnIndex(MF_ACT);
                 ImGui::TextColored(isExp ? kColOut : isFee ? kColFee : isCorr ? kColMuted : kColIn, "%s",
                                    isExp ? "Έξοδο" : isFee ? "Αμοιβή μας" : isCorr ? "Διόρθωση" : "Χρηματοδότηση");
                 ImGui::SameLine();
                 if (!isCorr && opOf(x) != 0) { if (LinkCell(x.label)) g_expenseOpen = opOf(x); if (ImGui::IsItemHovered()) ImGui::SetTooltip("Η ενέργεια και η κατανομή της στους ενοίκους"); }
-                else ImGui::TextUnformatted(x.label.c_str());
+                else CellText(x.label.c_str());
                 before();
                 ImGui::TableSetColumnIndex(MF_AMT);
                 if (isExp) { ImGui::TextColored(kColOut, "−%s", Eur(x.cost).c_str()); fund -= C(x.cost); owed += ch; }        // done: it went out
@@ -11870,10 +12487,10 @@ static void DrawMonthlyTab(int bid) {
             if (payRow) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(MF_DATE); ImGui::TextDisabled("στον μήνα");
-                ImGui::TableSetColumnIndex(MF_ACT); ImGui::TextColored(kColIn, "Πληρωμές"); ImGui::SameLine(); ImGui::TextUnformatted("παλαιότερων οφειλών");
+                ImGui::TableSetColumnIndex(MF_ACT); ImGui::TextColored(kColIn, "Πληρωμές"); ImGui::SameLine(); CellText("παλαιότερων οφειλών");
                 before();
                 ImGui::TableSetColumnIndex(MF_AMT); ImGui::TextColored(kColIn, "+%s", Eur(FromCents(olderPaid)).c_str());
-                if (ImGui::IsItemHovered() && C(F.feePriorPaidIn)) ImGui::SetTooltip("Και %s για παλιές αμοιβές μας (όχι στο ταμείο)", Eur(F.feePriorPaidIn).c_str());
+                if (ImGui::IsItemHovered() && C(F.feePriorPaidIn)) ImGui::SetTooltip("Και %s για παλιές αμοιβές μας (όχι στο αποθεματικό)", Eur(F.feePriorPaidIn).c_str());
                 fund += olderPaid;
                 long long thisMonths = olderPaid - C(F.priorPaidIn);       // old charged expenses of this month: their debt is in this month too
                 owed -= carry ? olderPaid : thisMonths;
@@ -11885,8 +12502,8 @@ static void DrawMonthlyTab(int bid) {
                 static const int dm[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
                 int last = dm[(mo - 1 + 12) % 12] + (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 1 : 0);
                 const bool off = C(F.fundEnd) != fund || (carry && (C(F.owedEnd) != owed || C(F.feeOwedEnd) != fee));
-                band(ym + "-" + std::to_string(last), "Τέλος μήνα", off ? "" : "· συμφωνεί με το ταμείο");
-                if (off) { ImGui::SameLine(); ImGui::TextColored(kColOut, "διαφορά ταμείου %s", Eur(FromCents(C(F.fundEnd) - fund)).c_str()); }
+                band(ym + "-" + std::to_string(last), "Τέλος μήνα", off ? "" : "· συμφωνεί με το αποθεματικό");
+                if (off) { ImGui::SameLine(); ImGui::TextColored(kColOut, "διαφορά αποθεματικού %s", Eur(FromCents(C(F.fundEnd) - fund)).c_str()); }
                 fund = C(F.fundEnd); if (carry) { owed = C(F.owedEnd); fee = C(F.feeOwedEnd); }
                 after(); }
             ImGui::EndTable();
@@ -11907,17 +12524,19 @@ static void DrawMonthlyTab(int bid) {
         auto it = cell.find({p.person, p.apartment_id, cellKey(x)});
         if (it == cell.end() || C(it->second->charged) == 0) return false;
         ch = C(it->second->charged); pd = std::min(ch, C(it->second->paid)); return true; };
+    // what the cell leaves owed: an expense the fund paid (no op of its own, only a share for information) leaves nothing
+    auto owedOf = [&](const DataConn::MonthItem& x, long long ch, long long pd) { return x.opId > 0 ? ch - pd : 0; };
     long long sOld = 0;
     // old debts: expenses that were charged on to the residents before expenses stopped being charged - still owed
     auto oldOf = [&](const DataConn::MonthPerson& p) {
         long long o = carry ? C(p.prevOld) : 0;
         for (size_t i : cols_items) {
             if (F.items[i].kind != "expense") continue;
-            long long ch, pd; if (mine(p, F.items[i], ch, pd)) o += ch - pd;
+            long long ch, pd; if (mine(p, F.items[i], ch, pd)) o += owedOf(F.items[i], ch, pd);
         }
         return o; };
     for (auto& p : R.people) sOld += oldOf(p);
-    if (sOld) ImGui::TextDisabled("Παλιές οφειλές εξόδων: %s · έξοδα που χρεώθηκαν στους ενοίκους πριν την αλλαγή. Μένουν οφειλή προς το ταμείο.", Eur(FromCents(sOld)).c_str());
+    if (sOld) ImGui::TextDisabled("Παλιές οφειλές εξόδων: %s · έξοδα που χρεώθηκαν στους ενοίκους πριν την αλλαγή. Μένουν οφειλή προς το αποθεματικό.", Eur(FromCents(sOld)).c_str());
     std::vector<ColGroup> groups; std::vector<std::pair<std::string, float>> cols = {{"Διαμ.", 60}, {"Ένοικος", 200}};
     for (size_t i : cols_items) {
         const auto& x = F.items[i]; std::string id = "##i" + std::to_string(i);
@@ -11925,8 +12544,8 @@ static void DrawMonthlyTab(int bid) {
         ColGroup g; g.first = (int)cols.size(); g.open = opOf(x);
         g.label = (exp ? "Έξοδο: " : x.kind == "fee" ? "Αμοιβή μας: " : "Χρηματοδότηση: ") + x.label + "  (" + DateGr(x.date) + ")";
         g.col = exp ? kColOut : x.kind == "fee" ? kColFee : kColIn;
-        g.tip = DateGr(x.date) + " · " + x.label + (exp ? std::string("\nΈξοδο του ταμείου: βγήκε από το ταμείο. Το μερίδιο λέει πόσο αναλογούσε στον καθένα.")
-                                                      : x.kind == "fee" ? "\nΔική μας αμοιβή: δεν μπαίνει στο ταμείο." : "\nΧρήματα για το ταμείο: πληρωμές και οφειλές έως το τέλος του μήνα.") +
+        g.tip = DateGr(x.date) + " · " + x.label + (exp ? std::string("\nΈξοδο του αποθεματικού: βγήκε από το αποθεματικό. Το μερίδιο λέει πόσο αναλογούσε στον καθένα.")
+                                                      : x.kind == "fee" ? "\nΔική μας αμοιβή: δεν μπαίνει στο αποθεματικό." : "\nΧρήματα για το αποθεματικό: πληρωμές και οφειλές έως το τέλος του μήνα.") +
                 "\nΚλικ: η ενέργεια με όλη την κατανομή";
         cols.push_back({(exp ? "Κόστος" : "Σύνολο") + id, 90}); cols.push_back({"Μερίδιο" + id, 85});
         if (debt(x)) { cols.push_back({"Πλήρωσε" + id, 85}); cols.push_back({"Οφείλει" + id, 85}); }
@@ -11939,7 +12558,7 @@ static void DrawMonthlyTab(int bid) {
         if (carry) cols.push_back({"Προηγ. υπόλοιπο##t", 120});
         cols.push_back({"Πλήρωσε στον μήνα##t", 140});
         if (sOld) cols.push_back({"Παλιές οφειλές εξόδων##t", 165});
-        cols.push_back({"Χρωστάει στο ταμείο##t", 150});
+        cols.push_back({"Χρωστάει στο αποθεματικό##t", 150});
         if (feeCol) cols.push_back({"Μας χρωστάει (αμοιβές)##t", 165});
         g.n = (int)cols.size() - g.first;
         g.tip = carry ? "Ό,τι χρωστάει στο τέλος του μήνα: του μήνα και των προηγούμενων" : "Ό,τι χρωστάει από τις χρεώσεις του μήνα";
@@ -11954,7 +12573,7 @@ static void DrawMonthlyTab(int bid) {
         for (size_t i : cols_items) {
             long long ch, pd; if (!mine(p, F.items[i], ch, pd)) continue;
             sCh[i] += ch; sPd[i] += pd;
-            (F.items[i].kind == "fee" ? fee : owe) += ch - pd;          // (an old expense that was charged on: its debt too)
+            (F.items[i].kind == "fee" ? fee : owe) += owedOf(F.items[i], ch, pd);          // (an old expense that was charged on: its debt too)
         }
         sPrev += C(p.prevFund) + C(p.prevFee); sPaidIn += C(p.paidInMonth); sOwe += owe; sFee += fee;
     }
@@ -11970,7 +12589,7 @@ static void DrawMonthlyTab(int bid) {
             else ImGui::TextDisabled("—");
             const int rest = debt(x) ? 3 : 2;
             if (!in) { for (int k = 1; k < rest; k++) { ImGui::TableNextColumn(); ImGui::TextDisabled("—"); } ImGui::TableNextColumn(); ImGui::TextDisabled("—"); return; }
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(Eur(FromCents(ch)).c_str());
+            ImGui::TableNextColumn(); CellText(Eur(FromCents(ch)).c_str());
             if (debt(x)) {
                 ImGui::TableNextColumn(); if (total) CompletionBar(pd, ch, Eur(FromCents(pd))); else MoneyCell(pd, kColIn);
                 ImGui::TableNextColumn(); MoneyCell(ch - pd, x.kind == "fee" ? kColFee : kColOwed);
@@ -11983,7 +12602,7 @@ static void DrawMonthlyTab(int bid) {
         for (int r = pager.offset; r < end; r++) {
             const auto& p = R.people[r];
             ImGui::PushID(r); ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(p.apartment.c_str());
+            ImGui::TableNextColumn(); CellText(p.apartment.c_str());
             ImGui::TableNextColumn();
             if (LinkCell(p.name)) OpenResident(p.person);
             if (!p.end.empty()) { ImGui::SameLine(); ImGui::TextDisabled("(έφυγε %s)", DateGr(p.end).c_str()); }
@@ -11992,18 +12611,18 @@ static void DrawMonthlyTab(int bid) {
             for (size_t i : cols_items) {
                 long long ch = 0, pd = 0; bool in = mine(p, F.items[i], ch, pd);
                 groupCells(i, in, ch, pd, false);
-                if (in) (F.items[i].kind == "fee" ? fee : owe) += ch - pd;
+                if (in) (F.items[i].kind == "fee" ? fee : owe) += owedOf(F.items[i], ch, pd);
             }
             if (carry) {
                 ImGui::TableNextColumn(); MoneyCell(C(p.prevFund) + C(p.prevFee), kColOwed);
-                if (ImGui::IsItemHovered() && C(p.prevFund) + C(p.prevFee)) ImGui::SetTooltip("Απλήρωτα από προηγούμενους μήνες:\nστο ταμείο %s · σε εμάς (αμοιβές) %s",
+                if (ImGui::IsItemHovered() && C(p.prevFund) + C(p.prevFee)) ImGui::SetTooltip("Απλήρωτα από προηγούμενους μήνες:\nστο αποθεματικό %s · σε εμάς (αμοιβές) %s",
                                                                                            Eur(p.prevFund).c_str(), Eur(p.prevFee).c_str());
             }
             ImGui::TableNextColumn(); MoneyCell(C(p.paidInMonth), kColIn);
             if (sOld) {
                 ImGui::TableNextColumn(); MoneyCell(oldOf(p), kColOwed);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Έξοδα που χρεώθηκαν στους ενοίκους πριν την αλλαγή (τώρα τα έξοδα δεν χρεώνονται).\n"
-                                                              "Μένουν οφειλή προς το ταμείο και μετράνε στο «Χρωστάει στο ταμείο».");
+                                                              "Μένουν οφειλή προς το αποθεματικό και μετράνε στο «Χρωστάει στο αποθεματικό».");
             }
             ImGui::TableNextColumn();
             if (owe > 0) { ImGui::TextColored(kColOwed, "%s", Eur(FromCents(owe)).c_str()); if (p.end.empty()) { ImGui::SameLine(); if (ImGui::SmallButton("Είσπραξη")) OpenRecordPayment(p.person); } }
@@ -12068,6 +12687,29 @@ static ScVerdict ScJudge(bool loss, const char* lossWhy, double pay, double late
     else { v.lv = SC_GOOD; v.why = "Εντάξει"; }
     return v;
 }
+// A building's deposit, on its own: nothing about its residents' habits here.
+static ScVerdict FundVerdict(const DataConn::ManageScore& m) {
+    ScVerdict v; v.lv = SC_BAD;
+    const bool heavy = m.bills > 0 && m.usedDeposit * 2 > m.bills, slow = m.avgRefillDays > 60.0;
+    if (m.deposit < -0.005) v.why = "Αρνητικό αποθεματικό";
+    else if (ToCents(m.depositMin) > 0 && ToCents(m.deposit) < ToCents(m.depositMin)) v.why = "Κάτω από το όριο";
+    else if (heavy) { v.lv = SC_LATE; v.why = "Χρειάζεται συχνά το αποθεματικό"; }
+    else if (slow) { v.lv = SC_LATE; v.why = "Αργεί να ξαναγεμίσει"; }
+    else if (ToCents(m.owedToDeposit) > 0) { v.lv = SC_OWES; v.why = "Περιμένει επιστροφές " + Eur(m.owedToDeposit); }
+    else { v.lv = SC_GOOD; v.why = "Υγιές αποθεματικό"; }
+    return v;
+}
+// the same rule, in each list's own words
+static ScVerdict ClientVerdict(bool loss, double pay, double owes) {
+    ScVerdict v = ScJudge(loss, "Ζημιογόνος πελάτης", pay, owes);
+    if (!loss && v.lv == SC_BAD) v.why = "Κακός πληρωτής"; else if (v.lv == SC_LATE) v.why = "Χρωστάει " + Eur(owes); else if (v.lv == SC_GOOD) v.why = "Καλός πελάτης";
+    return v;
+}
+static ScVerdict ResidentVerdict(double pay, double owes) {
+    ScVerdict v = ScJudge(false, "", pay, owes);
+    if (v.lv == SC_BAD) v.why = "Κακός πληρωτής"; else if (v.lv == SC_LATE) v.why = "Χρωστάει " + Eur(owes); else v.why = "Καλός πληρωτής";
+    return v;
+}
 // the filter on top of every list: all, or one category (with how many are in each)
 static void ScFilter(const char* id, int& filter, const int counts[SC_N]) {
     ImGui::PushID(id);
@@ -12102,13 +12744,13 @@ static void ScHowItWorks() {
         ImGui::TextWrapped("Κέρδος τώρα = ό,τι έχει ήδη πληρώσει − το κόστος. Η διαφορά των δύο είναι αυτό που χρωστάει.");
         ImGui::TextWrapped("Βαθμός κέρδους = 100 × κέρδος / το μεγαλύτερο κέρδος πελάτη στο ίδιο διάστημα. Ο πιο κερδοφόρος = 100, οι άλλοι αναλογικά, ζημιά = 0.");
         ImGui::Spacing(); ImGui::TextColored(hd, "Βαθμός πληρωμής (0-100): πόσο συχνά πληρώνει στην ώρα του");
-        ImGui::TextUnformatted("      βαθμός = 100 × (ευρώ που πληρώθηκαν μέσα σε 30 μέρες από τη χρέωση) / (ευρώ που έπρεπε να έχουν πληρωθεί ως σήμερα)");
+        CellText("      βαθμός = 100 × (ευρώ που πληρώθηκαν μέσα σε 30 μέρες από τη χρέωση) / (ευρώ που έπρεπε να έχουν πληρωθεί ως σήμερα)");
         ImGui::TextWrapped("«Έπρεπε να έχουν πληρωθεί» = ό,τι έχει πληρώσει (νωρίς ή αργά) + ό,τι χρωστάει εδώ και πάνω από 30 μέρες. Οι πρόσφατες χρεώσεις (έως 30 μέρες) δεν μετράνε ακόμα: δεν έχουν αργήσει.");
         ImGui::TextWrapped("Παράδειγμα: χρεώσεις 126,68 €. Πλήρωσε αμέσως 66,68 €. Χρωστάει 20 € από πριν 75 μέρες και 40 € από πριν 49 μέρες. "
                            "Στην ώρα του: 66,68 €. Έπρεπε: 66,68 + 20 + 40 = 126,68 €. Βαθμός = 100 × 66,68 / 126,68 = 53.");
         ImGui::TextWrapped("Αξίζει = ρίζα(βαθμός κέρδους × βαθμός πληρωμής): ψηλά μόνο όταν φέρνει κέρδος ΚΑΙ πληρώνει στην ώρα του. 100 και 0 → 0.");
         ImGui::Spacing(); ImGui::TextColored(hd, "Κατηγορίες (η πρώτη που ισχύει)");
-        ImGui::TextWrapped("1. Πρόβλημα: ζημιά ακόμα κι όταν εισπραχθούν όλα (για πολυκατοικία: αρνητικό ταμείο), ή βαθμός πληρωμής κάτω από 40.");
+        ImGui::TextWrapped("1. Πρόβλημα: ζημιά ακόμα κι όταν εισπραχθούν όλα (για πολυκατοικία: αρνητικό αποθεματικό), ή βαθμός πληρωμής κάτω από 40.");
         ImGui::TextWrapped("2. Καθυστερεί: χρωστάει κάτι που χρεώθηκε πριν από πάνω από 30 μέρες.");
         ImGui::TextWrapped("3. Εντάξει: όλα τα υπόλοιπα.");
         ImGui::TextWrapped("Χωριστά, το μπλε ρολόι «Χρωστάει τώρα» μπαίνει σε όποιον έχει οτιδήποτε ανοιχτό (πρόσφατο ή παλιό), για παρακολούθηση.");
@@ -12130,7 +12772,7 @@ static void DrawClientRanking();
 static void DrawScoringClients() {
     static std::string from, to; static int filter = -1; static char q[96] = ""; static Pager pager{0, 25, 0};
     bool ch = DrawDateRange("scc", from, to);
-    ImGui::SameLine(); ImGui::SetNextItemWidth(240); ch |= ImGui::InputTextWithHint("##scq", "Αναζήτηση πελάτη...", q, sizeof(q));
+    ImGui::SameLine(); 
 
     // Period data drives profit/income. All-time data drives "owes now" and "late now" — because a debt isn't
     // a period concept: a charge from last year is still owed today, even if this month's filter is empty.
@@ -12140,12 +12782,13 @@ static void DrawScoringClients() {
         double owes = 0, late = 0;                             // ALL-TIME (owes now, overdue now)
         double profitNow = 0;                                  // period: collected − cost
         double psc = -1, pay = -1, worth = -1;
+        double mixS = 0, mixP = 0, mixC = 0;                   // period: charged as single services, packages, contracts
         ScVerdict v;
     };
     static Cached<std::vector<Row>> cache;
     const auto& all = cache.get(from + "|" + to, [&] {
-        std::set<int> managed; for (int b : g_app.conn->getManagedBuildings()) managed.insert(b);
-        std::set<int> managedClients; for (auto& u : g_app.users) if (u.kind == "building" && managed.count(u.client_building_id)) managedClients.insert(u.id);
+        const auto mix = g_app.conn->clientMix(from, to);
+        std::set<int> managedClients;                                     // none left out: a building we bill is rated like any client
         auto qsPeriod = g_app.conn->clientQuality(0, from, to);
         auto qsAll    = g_app.conn->clientQuality(0, "",  "");           // all-time: same shape, no date filter
         std::unordered_map<int, const DataConn::QualityRow*> allTime;
@@ -12167,7 +12810,8 @@ static void DrawScoringClients() {
             w.pay  = DataConn::QualityRow::OnTime(r.onTimeClient, r.dueClient);
             w.psc  = maxProfit > 0.005 ? std::max(0.0, 100.0 * w.profit / maxProfit) : 0.0;
             w.worth = w.pay < 0 ? w.psc : std::sqrt(w.psc * w.pay);
-            w.v = ScJudge(w.profit < -0.005, "Ζημιά ακόμα κι όταν εισπραχθούν όλα", w.pay, w.late);
+            w.v = ClientVerdict(w.profit < -0.005, w.pay, w.owes);
+            for (auto& mx : mix) if (mx.user_id == w.uid) { w.mixS = mx.services; w.mixP = mx.packages; w.mixC = mx.contracts; }
             out.push_back(w);
         }
         // somebody who owes from before the period, with nothing in it, still owes: he is listed (period figures 0)
@@ -12176,7 +12820,7 @@ static void DrawScoringClients() {
             if (listed.count(r.user_id) || managedClients.count(r.user_id) || r.openClient <= 0.005) continue;
             Row w; w.uid = r.user_id; w.name = r.name; w.owes = r.openClient; w.late = r.overdueClient;
             w.pay = DataConn::QualityRow::OnTime(r.onTimeClient, r.dueClient);
-            w.v = ScJudge(false, "", w.pay, w.late);
+            w.v = ClientVerdict(false, w.pay, w.owes);
             out.push_back(w);
         }
         return out; });
@@ -12188,17 +12832,22 @@ static void DrawScoringClients() {
     for (auto& r : all)
         if (ScShow(filter, r.v.lv, r.owes) && (fq.empty() || FoldGreek(r.name).find(fq) != std::string::npos))
             rows.push_back(&r);
-        static const ListColDef cols[11] = {
+        static const ListColDef cols[14] = {
         { "Κατηγορία", ImGuiTableColumnFlags_WidthFixed, 160.0f, true }, { "Πελάτης", ImGuiTableColumnFlags_WidthStretch, 1.8f, true },
         { "Χρεώσαμε", ImGuiTableColumnFlags_WidthFixed, 90.0f, true }, { "Κόστος", ImGuiTableColumnFlags_WidthFixed, 90.0f, true },
         { "Κέρδος", ImGuiTableColumnFlags_WidthFixed, 90.0f, true }, { "Οφείλει τώρα", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },
         { "Καθυστερεί", ImGuiTableColumnFlags_WidthFixed, 95.0f, true }, { "Κέρδος τώρα", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },
         { "Βαθμός κέρδους", ImGuiTableColumnFlags_WidthFixed, 110.0f, true }, { "Βαθμός πληρωμής", ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
-        { "Αξίζει", ImGuiTableColumnFlags_WidthFixed, 80.0f, true }
+        { "Αξίζει", ImGuiTableColumnFlags_WidthFixed, 80.0f, true }, LC("Υπηρεσίες"), LC("Πακέτα"), LC("Συμβάσεις")
     };
     static GridState g; static int lastFilter = -2;
-    if (g.order.empty()) { for (int i = 0; i < 11; i++) g.order.push_back(i); g.sort.keys = { { 0, true } }; g.pager.pageSize = 25; }
+    if (g.order.empty()) { for (int i = 0; i < 14; i++) g.order.push_back(i); g.sort.keys = { { 0, true } }; g.pager.pageSize = 25; }
     if (ch || lastFilter != filter) { g.pager.Reset(); lastFilter = filter; }
+    auto scText = [](const Row& r, int c) -> std::string {
+        switch (c) { case 0: return kScName[r.v.lv]; case 1: return r.name; case 2: return Eur(r.charged); case 3: return Eur(r.cost); case 4: return Eur(r.profit); case 5: return Eur(r.owes); case 6: return Eur(r.late); case 7: return Eur(r.profitNow); case 8: return ListNum(r.psc); case 9: return ListNum(r.pay); case 11: return Eur(r.mixS); case 12: return Eur(r.mixP); case 13: return Eur(r.mixC); default: return ListNum(r.worth); } };
+    DrawListSearch(g);
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const Row* r) { return !ListRowMatches(*r, g, scText, 14); }), rows.end());
+    const DistinctFn scDistinct = [&](int col, const std::string& s) { return ListDistinct(all, g, scText, 14, col, s); };
     g.pager.total = (int)rows.size(); if (g.pager.offset >= g.pager.total) g.pager.Reset();
     GridSort(rows, g.sort, [](int c, const Row& a, const Row& b) {
         switch (c) {
@@ -12206,21 +12855,22 @@ static void DrawScoringClients() {
             case 2: return Cmp3(ToCents(a.charged), ToCents(b.charged)); case 3: return Cmp3(ToCents(a.cost), ToCents(b.cost));
             case 4: return Cmp3(ToCents(a.profit), ToCents(b.profit)); case 5: return Cmp3(ToCents(a.owes), ToCents(b.owes));
             case 6: return Cmp3(ToCents(a.late), ToCents(b.late)); case 7: return Cmp3(ToCents(a.profitNow), ToCents(b.profitNow));
-            case 8: return Cmp3(a.psc, b.psc); case 9: return Cmp3(a.pay, b.pay); default: return Cmp3(a.worth, b.worth);
+            case 8: return Cmp3(a.psc, b.psc); case 9: return Cmp3(a.pay, b.pay); case 11: return Cmp3(ToCents(a.mixS), ToCents(b.mixS)); case 12: return Cmp3(ToCents(a.mixP), ToCents(b.mixP)); case 13: return Cmp3(ToCents(a.mixC), ToCents(b.mixC)); default: return Cmp3(a.worth, b.worth);
         }
     });
     float h = std::max(180.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
-    if (ImGui::BeginTable("scc", 11, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+    if (ImGui::BeginTable("scc", 14, ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(g.order, cols);
-        ListHeaderRow(g.order, cols, g.sort, g.pager);
+        ImGui::TableSetColumnEnabled(ListPos(g.order, 6), false);      // owing and being late are the same thing
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &scDistinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
         for (int i = g.pager.offset; i < std::min(g.pager.total, g.pager.offset + g.pager.pageSize); i++) {
             const Row& r = *rows[i];
             ImGui::PushID(r.uid); ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(P(0)); ScCategory(r.v, r.owes);
             ImGui::TableSetColumnIndex(P(1)); if (LinkCell(r.name)) OpenUserProfile(r.uid);
-            ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(Eur(r.charged).c_str());
+            ImGui::TableSetColumnIndex(P(2)); CellText(Eur(r.charged).c_str());
             ImGui::TableSetColumnIndex(P(3)); ScMoney(r.cost, kColOut);
             ImGui::TableSetColumnIndex(P(4)); ImGui::TextColored(r.profit >= 0 ? kColIn : kColOut, "%s", Eur(r.profit).c_str());
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Κέρδος περιόδου = χρεώσαμε %s − κόστος %s\n(τι θα μείνει όταν εισπραχθούν όλα όσα χρεώθηκαν)", Eur(r.charged).c_str(), Eur(r.cost).c_str());
@@ -12241,6 +12891,7 @@ static void DrawScoringClients() {
                 "  • Απλήρωτα έως 30 μέρες: δεν μετράνε καθόλου (δεν έχουν αργήσει ακόμα).\n"
                 "  Βαθμός = 100 × (πληρωμένα στην ώρα) / (πληρωμένα + καθυστερούμενα).\n"
                 "  — : δεν υπάρχει τίποτα να μετρηθεί.");
+            ImGui::TableSetColumnIndex(P(11)); ScMoney(r.mixS, kColMuted); ImGui::TableSetColumnIndex(P(12)); ScMoney(r.mixP, kColMuted); ImGui::TableSetColumnIndex(P(13)); ScMoney(r.mixC, kColMuted);
             ImGui::TableSetColumnIndex(P(10)); ScScore(r.worth);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Αξίζει = τετραγωνική ρίζα (βαθμός κέρδους × βαθμός πληρωμής)\nΨηλό μόνο αν φέρνει κέρδος ΚΑΙ πληρώνει στην ώρα του.\nΠαράδειγμα: 100 × 25 → ρίζα(2500) = 50.");
             ImGui::PopID();
@@ -12255,82 +12906,82 @@ static void DrawScoringClients() {
 
 
 // ---- the buildings we manage: their fund, how well their residents pay, what our fee brings
+// A building as MANAGED: how much its deposit gets used and how fast it comes back, how fast its residents pay.
+// Its bills as our client are rated separately under Πελάτες.
 static void DrawScoringBuildings() {
     static std::string from, to; static int filter = -1;
     DrawDateRange("scb", from, to);
-    struct Row { int bid; std::string addr; double fund = 0, owed = 0, late = 0, charged = 0, fee = 0, feeOpen = 0, billOpen = 0, pay = -1, coll = -1; ScVerdict v; };
+    struct Row { DataConn::ManageScore m; double residentsOwe = 0, late = 0, pay = -1; ScVerdict v; };
     static Cached<std::vector<Row>> cache;
     const auto& all = cache.get(from + "|" + to, [&] {
-        std::map<int, Row> by; std::map<int, std::pair<double, double>> idx;      // per building: on time, due
-        std::map<int, double> periodOpen;   // πόσα από τις ΧΡΕΩΣΕΙΣ ΤΗΣ ΠΕΡΙΟΔΟΥ μένουν απλήρωτα σήμερα
-        for (int b : g_app.conn->getManagedBuildings()) { Row r; r.bid = b; r.addr = g_app.conn->getBuildingById(b).address; r.fund = g_app.conn->getFundBalance(b); by[b] = r; }
-        for (auto& q : g_app.conn->residentQuality(from, to)) {
-            auto it = by.find(q.building_id); if (it == by.end()) continue;
-            Row& r = it->second;
-            r.charged += q.fundCharged + q.feeCharged; r.fee += q.feeCharged;
-            idx[q.building_id].first += q.onTime; idx[q.building_id].second += q.due;
-            periodOpen[q.building_id] += q.fundOpen;
-        }
-        for (auto& q : g_app.conn->residentQuality("", "")) {                     // debts: today, every date
-            auto it = by.find(q.building_id); if (it == by.end()) continue;
-            it->second.owed += q.fundOpen; it->second.feeOpen += q.feeOpen; it->second.late += q.fundOverdue + q.feeOverdue;
-        }
-        std::map<int, std::pair<double, double>> bill;                              // the building's own bills to us (our services)
-        for (auto& x : g_app.conn->clientQuality(0, "", "")) bill[x.user_id] = {x.openClient, x.overdueClient};
-        for (auto& u : g_app.users) if (u.kind == "building") if (auto it = by.find(u.client_building_id); it != by.end()) {
-            it->second.billOpen += bill[u.id].first; it->second.late += bill[u.id].second;
-        }
+        std::map<int, std::pair<double, double>> idx; std::map<int, Row> by;
+        for (auto& q : g_app.conn->residentQuality(from, to)) { idx[q.building_id].first += q.onTime; idx[q.building_id].second += q.due; }
+        std::map<int, std::pair<double, double>> now;
+        for (auto& q : g_app.conn->residentQuality("", "")) { now[q.building_id].first += q.fundOpen; now[q.building_id].second += q.fundOverdue; }
         std::vector<Row> out;
-        for (auto& [b, r] : by) {
-            r.pay = DataConn::QualityRow::OnTime(idx[b].first, idx[b].second);
-            const double fundCharged = r.charged - r.fee;
-            // collection rate on the PERIOD's fund charges: use the period's own open, not the all-time owed
-            const double fundOpenPeriod = periodOpen[b];
-            r.coll = fundCharged > 0.005 ? 100.0 * (fundCharged - fundOpenPeriod) / fundCharged : -1;
-            r.v = ScJudge(r.fund < -0.005, "Αρνητικό ταμείο", r.pay, r.late);
+        for (auto& m : g_app.conn->manageScores(from.size() >= 7 ? from.substr(0, 7) : "", to.size() >= 7 ? to.substr(0, 7) : "")) {
+            Row r; r.m = m; r.residentsOwe = now[m.building_id].first; r.late = now[m.building_id].second;
+            r.pay = DataConn::QualityRow::OnTime(idx[m.building_id].first, idx[m.building_id].second);
+            r.v = FundVerdict(m);
             out.push_back(r);
         }
         return out; });
-    int counts[SC_N] = {0, 0, 0, 0}; for (auto& r : all) { counts[r.v.lv]++; if (r.feeOpen + r.billOpen > 0.005) counts[SC_OWES]++; }
+    int counts[SC_N] = {0, 0, 0, 0}; for (auto& r : all) { counts[r.v.lv]++; }
     ScFilter("scbf", filter, counts);
-    std::vector<const Row*> rows; for (auto& r : all) if (ScShow(filter, r.v.lv, r.feeOpen + r.billOpen)) rows.push_back(&r);
-        static const ListColDef cols[10] = {
+    ImGui::TextDisabled("Μόνο το αποθεματικό: πόσο χρησιμοποιείται, πόσο γρήγορα γεμίζει, αν είναι πάνω από το όριο. Οι ένοικοι είναι στο επόμενο, οι χρεώσεις μας στους Πελάτες.");
+    std::vector<const Row*> rows; for (auto& r : all) if (filter < 0 || filter == r.v.lv) rows.push_back(&r);
+    static const ListColDef cols[14] = {
         { "Κατηγορία", ImGuiTableColumnFlags_WidthFixed, 160.0f, true }, { "Πολυκατοικία", ImGuiTableColumnFlags_WidthStretch, 1.8f, true },
-        { "Ταμείο", ImGuiTableColumnFlags_WidthFixed, 90.0f, true }, { "Οφειλές ενοίκων", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
-        { "Καθυστερούν", ImGuiTableColumnFlags_WidthFixed, 100.0f, true }, { "Είσπραξη χρημ/σεων", ImGuiTableColumnFlags_WidthFixed, 160.0f, true },
-        { "Βαθμός πληρωμής", ImGuiTableColumnFlags_WidthFixed, 110.0f, true }, { "Αμοιβές μας", ImGuiTableColumnFlags_WidthFixed, 90.0f, true },
-        { "Μας χρωστάνε (αμοιβές)", ImGuiTableColumnFlags_WidthFixed, 120.0f, true }, { "Μας χρωστάει η πολυκατοικία", ImGuiTableColumnFlags_WidthFixed, 130.0f, true }
-    };
+        { "Αποθεματικό", ImGuiTableColumnFlags_WidthFixed, 100.0f, true }, { "Έξοδα", ImGuiTableColumnFlags_WidthFixed, 90.0f, true },
+        { "Μήνες χωρίς αποθεματικό", ImGuiTableColumnFlags_WidthFixed, 110.0f, true }, { "Χρήσεις αποθεματικού", ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
+        { "Πήραμε από αποθεματικό", ImGuiTableColumnFlags_WidthFixed, 120.0f, true }, { "Χρωστούν στο αποθεματικό", ImGuiTableColumnFlags_WidthFixed, 120.0f, true },
+        { "Μέρες για να ξαναγεμίσει", ImGuiTableColumnFlags_WidthFixed, 120.0f, true }, { "Μέρες είσπραξης", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
+        { "Καθυστερούν", ImGuiTableColumnFlags_WidthFixed, 100.0f, true }, { "Βαθμός πληρωμής", ImGuiTableColumnFlags_WidthFixed, 110.0f, true },
+        { "Ανανεώθηκε το αποθεματικό", ImGuiTableColumnFlags_WidthFixed, 130.0f, true }, { "Όριο αποθεματικού", ImGuiTableColumnFlags_WidthFixed, 110.0f, true } };
     static GridState g; static int lastF = -2;
-    if (g.order.empty()) { for (int i = 0; i < 10; i++) g.order.push_back(i); g.sort.keys = { { 0, true } }; g.pager.pageSize = 25; }
+    if (g.order.empty()) { for (int i = 0; i < 14; i++) g.order.push_back(i); g.sort.keys = { { 0, true } }; g.pager.pageSize = 25; }
     if (lastF != filter) { g.pager.Reset(); lastF = filter; }
+    auto daysTxt = [](double d) { char b[32]; if (d < 0) return std::string(); std::snprintf(b, sizeof(b), "%.0f", d); return std::string(b); };
+    auto sbText = [daysTxt](const Row& r, int c) -> std::string {
+        switch (c) { case 0: return kScName[r.v.lv]; case 1: return r.m.address; case 2: return Eur(r.m.deposit); case 3: return Eur(r.m.cost);
+                     case 4: return std::to_string(r.m.bills - r.m.active - r.m.usedDeposit) + " / " + std::to_string(r.m.bills - r.m.active); case 5: return std::to_string(r.m.usedDeposit);
+                     case 6: return Eur(r.m.covered); case 7: return Eur(r.m.owedToDeposit); case 8: return daysTxt(r.m.avgRefillDays); case 9: return daysTxt(r.m.avgCollectDays); case 10: return Eur(r.late); case 12: return Eur(r.m.renewed); case 13: return Eur(r.m.depositMin); default: return daysTxt(r.pay); } };
+    DrawListSearch(g);
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const Row* r) { return !ListRowMatches(*r, g, sbText, 14); }), rows.end());
+    const DistinctFn sbDistinct = [&](int col, const std::string& q) { return ListDistinct(all, g, sbText, 14, col, q); };
     g.pager.total = (int)rows.size(); if (g.pager.offset >= g.pager.total) g.pager.Reset();
     GridSort(rows, g.sort, [](int c, const Row& a, const Row& b) {
-        switch (c) { case 0: return Cmp3(a.v.lv, b.v.lv); case 1: return CmpText(a.addr, b.addr); case 2: return Cmp3(ToCents(a.fund), ToCents(b.fund));
-                     case 3: return Cmp3(ToCents(a.owed), ToCents(b.owed)); case 4: return Cmp3(ToCents(a.late), ToCents(b.late)); case 5: return Cmp3(a.coll, b.coll);
-                     case 6: return Cmp3(a.pay, b.pay); case 7: return Cmp3(ToCents(a.fee), ToCents(b.fee)); case 8: return Cmp3(ToCents(a.feeOpen), ToCents(b.feeOpen));
-                     default: return Cmp3(ToCents(a.billOpen), ToCents(b.billOpen)); }
+        switch (c) { case 0: return Cmp3(a.v.lv, b.v.lv); case 1: return CmpText(a.m.address, b.m.address); case 2: return Cmp3(ToCents(a.m.deposit), ToCents(b.m.deposit));
+                     case 3: return Cmp3(ToCents(a.m.cost), ToCents(b.m.cost)); case 4: return Cmp3(a.m.bills - a.m.active - a.m.usedDeposit, b.m.bills - b.m.active - b.m.usedDeposit);
+                     case 5: return Cmp3(a.m.usedDeposit, b.m.usedDeposit); case 6: return Cmp3(ToCents(a.m.covered), ToCents(b.m.covered)); case 7: return Cmp3(ToCents(a.m.owedToDeposit), ToCents(b.m.owedToDeposit));
+                     case 8: return Cmp3(a.m.avgRefillDays, b.m.avgRefillDays); case 9: return Cmp3(a.m.avgCollectDays, b.m.avgCollectDays); case 10: return Cmp3(ToCents(a.late), ToCents(b.late));
+                     case 12: return Cmp3(ToCents(a.m.renewed), ToCents(b.m.renewed)); case 13: return Cmp3(ToCents(a.m.depositMin), ToCents(b.m.depositMin)); default: return Cmp3(a.pay, b.pay); }
     });
+    auto days = [](double d) { if (d < 0) ImGui::TextDisabled("—"); else ImGui::Text("%.0f", d); };
     float h = std::max(180.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
-    if (ImGui::BeginTable("scb", 10, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+    if (ImGui::BeginTable("scb", 14, ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(g.order, cols);
-        ListHeaderRow(g.order, cols, g.sort, g.pager);
+        for (int hide : {9, 10, 11}) ImGui::TableSetColumnEnabled(ListPos(g.order, hide), false);      // those are the residents', in the next tab
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &sbDistinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
         for (int i = g.pager.offset; i < std::min(g.pager.total, g.pager.offset + g.pager.pageSize); i++) {
             const Row& r = *rows[i];
-            ImGui::PushID(r.bid); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(0)); ScCategory(r.v, r.feeOpen + r.billOpen);
-            ImGui::TableSetColumnIndex(P(1)); if (LinkCell(r.addr)) { g_mgSel = r.bid; g_page = PAGE_JOINT; }
-            ImGui::TableSetColumnIndex(P(2)); ImGui::TextColored(r.fund >= 0 ? kColIn : kColOut, "%s", Eur(r.fund).c_str());
-            ImGui::TableSetColumnIndex(P(3)); ScMoney(r.owed, kColOwed);
-            ImGui::TableSetColumnIndex(P(4)); ScMoney(r.late, kScWarn);
-            ImGui::TableSetColumnIndex(P(5)); CompletionBar(ToCents(r.charged - r.fee - r.owed), ToCents(r.charged - r.fee));
-            ImGui::TableSetColumnIndex(P(6)); ScScore(r.pay);
-            ImGui::TableSetColumnIndex(P(7)); ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1), "%s", Eur(r.fee).c_str());
-            ImGui::TableSetColumnIndex(P(8)); ScMoney(r.feeOpen, kColOwed);
-            ImGui::TableSetColumnIndex(P(9)); ScMoney(r.billOpen, kColOwed);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Οι δικές μας υπηρεσίες στην πολυκατοικία (ως πελάτη), απλήρωτες");
+            ImGui::PushID(r.m.building_id); ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(P(0)); ScCategory(r.v, r.residentsOwe);
+            ImGui::TableSetColumnIndex(P(1)); if (LinkCell(r.m.address)) { g_mgSel = r.m.building_id; g_page = PAGE_JOINT; }
+            ImGui::TableSetColumnIndex(P(2)); ImGui::TextColored(r.m.deposit >= 0 ? kColIn : kColOut, "%s", Eur(r.m.deposit).c_str());
+            ImGui::TableSetColumnIndex(P(3)); CellText(Eur(r.m.cost).c_str());
+            ImGui::TableSetColumnIndex(P(4)); ImGui::Text("%d / %d", r.m.bills - r.m.active - r.m.usedDeposit, r.m.bills - r.m.active);
+            ImGui::TableSetColumnIndex(P(5)); ImGui::Text("%d", r.m.usedDeposit);
+            ImGui::TableSetColumnIndex(P(6)); ScMoney(r.m.covered, kScWarn);
+            ImGui::TableSetColumnIndex(P(7)); ScMoney(r.m.owedToDeposit, kColOwed);
+            ImGui::TableSetColumnIndex(P(8)); days(r.m.avgRefillDays);
+            ImGui::TableSetColumnIndex(P(9)); days(r.m.avgCollectDays);
+            ImGui::TableSetColumnIndex(P(10)); ScMoney(r.late, kScWarn);
+            ImGui::TableSetColumnIndex(P(11)); ScScore(r.pay);
+            ImGui::TableSetColumnIndex(P(12)); ScMoney(r.m.renewed, kColIn);
+            ImGui::TableSetColumnIndex(P(13)); ScMoney(r.m.depositMin, kColMuted);
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -12338,12 +12989,102 @@ static void DrawScoringBuildings() {
     DrawPager(g.pager, "scbpg");
 }
 
+// ---- each building's residents as a group: how good payers they are
+static void DrawScoringBuildingResidents() {
+    static std::string from, to; DrawDateRange("scbr", from, to);
+    struct Row { int bid; std::string addr; int n = 0, gone = 0, bad = 0, owing = 0; double sum = 0; int rated = 0; double avg = -1, best = -1, worst = -1, owed = 0, delaySum = 0; int delayN = 0; double delay = -1; std::string cat; int lv = SC_GOOD; };
+    static Cached<std::vector<Row>> cache;
+    const auto& rows = cache.get(from + "|" + to, [&] {
+        std::map<int, Row> by; std::map<std::pair<int, int>, double> nowOwed;
+        for (auto& x : g_app.conn->residentQuality("", "")) nowOwed[{x.building_id, x.user_id}] = x.fundOpen;
+        for (auto& x : g_app.conn->residentQuality(from, to)) {
+            Row& r = by[x.building_id]; r.bid = x.building_id; r.addr = x.building; r.n++; if (!x.active) r.gone++;
+            const double pay = DataConn::QualityRow::OnTime(x.onTime, x.due), owed = nowOwed[{x.building_id, x.user_id}];
+            if (pay >= 0) { r.sum += pay; r.rated++; r.best = std::max(r.best, pay); r.worst = r.worst < 0 ? pay : std::min(r.worst, pay); if (pay < 40) r.bad++; }
+            if (owed > 0.005) { r.owing++; r.owed = FromCents(ToCents(r.owed) + ToCents(owed)); }
+            if (x.AvgDelay() >= 0) { r.delaySum += x.AvgDelay(); r.delayN++; }
+        }
+        std::vector<Row> out;
+        for (auto& [k, r] : by) {
+            if (r.rated > 0) r.avg = r.sum / r.rated; if (r.delayN > 0) r.delay = r.delaySum / r.delayN;
+            if (r.avg >= 0 && r.avg < 40) { r.cat = "Κακοί πληρωτές"; r.lv = SC_BAD; } else if (r.bad > 0) { r.cat = "Κάποιοι κακοί πληρωτές"; r.lv = SC_LATE; }
+            else if (r.owing > 0) { r.cat = "Κάποιοι χρωστούν"; r.lv = SC_OWES; } else { r.cat = "Καλοί πληρωτές"; r.lv = SC_GOOD; }
+            out.push_back(r);
+        }
+        return out; });
+    ImGui::TextDisabled("Οι ένοικοι κάθε πολυκατοικίας μαζί. Βαθμός = μέσος όρος του βαθμού πληρωμής τους.");
+    static GridState g; static const ListColDef cols[10] = { LC("Κατηγορία"), LC("Πολυκατοικία"), LC("Ένοικοι"), LC("Έφυγαν"), LC("Μέσος βαθμός"), LC("Καλύτερος"), LC("Χειρότερος"), LC("Κακοί πληρωτές"), LC("Χρωστούν τώρα"), LC("Μέση καθυστέρηση (μέρες)") };
+    auto text = [](const Row& r, int c) -> std::string { switch (c) { case 0: return r.cat; case 1: return r.addr; case 2: return std::to_string(r.n); case 3: return std::to_string(r.gone); case 4: return ListNum(r.avg); case 5: return ListNum(r.best); case 6: return ListNum(r.worst); case 7: return std::to_string(r.bad); case 8: return Eur(r.owed); default: return ListNum(r.delay); } };
+    DrawMiniList("scbr", g, cols, 10, rows, text, [&](const Row& r, int c) {
+        if (c == 0) ImGui::TextColored(ScColor(r.lv), "%s", r.cat.c_str()); else if (c >= 4 && c <= 6) ScScore(c == 4 ? r.avg : c == 5 ? r.best : r.worst); else if (c == 8) ScMoney(r.owed, kColOwed); else CellText(text(r, c).c_str()); },
+        [](const Row& r) { g_mgSel = r.bid; g_page = PAGE_JOINT; });
+}
+
+// ---- contracts alone: who pays them well, who finishes them, who cancels early
+static void DrawScoringContracts() {
+    struct Row { int uid; std::string name; int total = 0, running = 0, done = 0, cancelled = 0, cancelledOwing = 0; double value = 0, collected = 0, owed = 0, sched = 0, pay = -1; std::string cat; int lv = SC_GOOD; };
+    static Cached<std::vector<Row>> cache;
+    const auto& rows = cache.get("", [] {
+        std::map<int, Row> by; auto ps = g_app.conn->contractPayScores();
+        for (auto& k : g_app.conn->pageContracts(0, 0, "", {}, 0, 1000000)) {
+            Row& r = by[k.user_id]; r.uid = k.user_id; r.name = k.user_name; r.total++;
+            if (k.cancelled) { r.cancelled++; if (k.open) r.cancelledOwing++; } else if (k.open) r.running++; else r.done++;
+            r.value = FromCents(ToCents(r.value) + ToCents(k.total)); r.collected = FromCents(ToCents(r.collected) + ToCents(k.collected));
+            r.owed = FromCents(ToCents(r.owed) + ToCents(k.owedNow)); r.sched = FromCents(ToCents(r.sched) + ToCents(k.scheduled));
+        }
+        std::vector<Row> out;
+        for (auto& [u, r] : by) {
+            if (auto it = ps.find(u); it != ps.end()) r.pay = DataConn::QualityRow::OnTime(it->second.first, it->second.second);
+            if (r.pay >= 0 && r.pay < 40) { r.cat = "Κακός πληρωτής"; r.lv = SC_BAD; } else if (r.cancelled * 2 > r.total) { r.cat = "Ακυρώνει συχνά"; r.lv = SC_LATE; }
+            else if (ToCents(r.owed) > 0) { r.cat = "Χρωστάει"; r.lv = SC_OWES; } else if (r.done > 0) { r.cat = "Ολοκληρώνει και πληρώνει"; r.lv = SC_GOOD; } else { r.cat = "Πληρώνει κανονικά"; r.lv = SC_GOOD; }
+            out.push_back(r);
+        }
+        return out; });
+    ImGui::TextDisabled("Μόνο οι συμβάσεις. Μετράνε και στους Πελάτες, γιατί είναι χρεώσεις όπως οι υπηρεσίες.");
+    static GridState g; static const ListColDef cols[12] = { LC("Κατηγορία"), LC("Πελάτης"), LC("Συμβάσεις"), LC("Σε ισχύ"), LC("Ολοκληρώθηκαν"), LC("Ακυρώθηκαν"), LC("Ακυρ. με οφειλή"), LC("Αξία"), LC("Πληρώθηκαν"), LC("Χρωστάει"), LC("Μελλοντικές"), LC("Βαθμός πληρωμής") };
+    auto text = [](const Row& r, int c) -> std::string { switch (c) { case 0: return r.cat; case 1: return r.name; case 2: return std::to_string(r.total); case 3: return std::to_string(r.running); case 4: return std::to_string(r.done); case 5: return std::to_string(r.cancelled); case 6: return std::to_string(r.cancelledOwing); case 7: return Eur(r.value); case 8: return Eur(r.collected); case 9: return Eur(r.owed); case 10: return Eur(r.sched); default: return ListNum(r.pay); } };
+    if (rows.empty()) { ImGui::TextDisabled("Καμία σύμβαση ακόμα."); return; }
+    DrawMiniList("scct", g, cols, 12, rows, text, [&](const Row& r, int c) {
+        if (c == 0) ImGui::TextColored(ScColor(r.lv), "%s", r.cat.c_str()); else if (c == 9) ScMoney(r.owed, kColOwed); else if (c == 11) ScScore(r.pay); else CellText(text(r, c).c_str()); }, [](const Row& r) { OpenUserProfile(r.uid); });
+}
+
+// ---- what each service, package and contract earns and costs
+static void DrawProfitAnalysis() {
+    static std::string from, to; DrawDateRange("prof", from, to);
+    static Cached<std::vector<DataConn::ProfitRow>> cache;
+    const auto& rows = cache.get(from + "|" + to, [&] { return g_app.conn->profitAnalysis(from, to); });
+    auto kindName = [](const std::string& k) -> const char* { return k == "contract" ? "Σύμβαση" : k == "package" ? "Πακέτο" : "Υπηρεσία"; };
+    struct Sum { double charged = 0, cost = 0, collected = 0, owed = 0, costOwed = 0; } tot, byK[3];
+    auto add = [](Sum& t, const DataConn::ProfitRow& r) { t.charged = FromCents(ToCents(t.charged) + ToCents(r.charged)); t.cost = FromCents(ToCents(t.cost) + ToCents(r.cost)); t.collected = FromCents(ToCents(t.collected) + ToCents(r.collected)); t.owed = FromCents(ToCents(t.owed) + ToCents(r.owed)); t.costOwed = FromCents(ToCents(t.costOwed) + ToCents(r.costOwed)); };
+    for (auto& r : rows) { add(tot, r); add(byK[r.kind == "service" ? 0 : r.kind == "package" ? 1 : 2], r); }
+    auto margin = [](double ch, double co) { return ToCents(ch) > 0 ? 100.0 * (ch - co) / ch : 0.0; };
+    if (ImGui::BeginTable("proftiles", 5, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow(); const ImVec2 sz(0, 86); (void)sz;
+        auto tile = [](const char* t, const std::string& v, ImVec4 col, const char* sub) { ImGui::TableNextColumn(); StatTile(t, v, col, sub, ImVec2(ImGui::GetContentRegionAvail().x, 86)); };
+        char m[48]; std::snprintf(m, sizeof(m), "περιθώριο %.0f%%", margin(tot.charged, tot.cost));
+        tile("Χρεώσαμε", Eur(tot.charged), ImVec4(0.55f, 0.65f, 1.0f, 1), nullptr); tile("Κόστος", Eur(tot.cost), kColOut, nullptr);
+        tile("Κέρδος", Eur(MoneySub(tot.charged, tot.cost)), tot.charged >= tot.cost ? kColIn : kColOut, m);
+        tile("Μας χρωστούν", Eur(tot.owed), tot.owed > 0.005 ? kColOwed : kColMuted, nullptr); tile("Χρωστάμε", Eur(tot.costOwed), tot.costOwed > 0.005 ? kColWeOwe : kColMuted, nullptr);
+        ImGui::EndTable();
+    }
+    {   struct K { const char* n; Sum* s; } ks[3] = { {"Υπηρεσίες", &byK[0]}, {"Πακέτα", &byK[1]}, {"Συμβάσεις", &byK[2]} };
+        for (auto& k : ks) { ImGui::Text("%s:", k.n); ImGui::SameLine(); ImGui::TextDisabled("χρεώσαμε %s · κόστος %s · κέρδος %s (%.0f%%) · χρωστούν %s", Eur(k.s->charged).c_str(), Eur(k.s->cost).c_str(), Eur(MoneySub(k.s->charged, k.s->cost)).c_str(), margin(k.s->charged, k.s->cost), Eur(k.s->owed).c_str()); } }
+    ImGui::Spacing();
+    static GridState g; static const ListColDef cols[12] = { LC("Είδος"), LC("Όνομα"), LC("Χρεώσεις"), LC("Πελάτες"), LC("Χρεώσαμε"), LC("Κόστος"), LC("Κέρδος"), LC("Περιθώριο %"), LC("Εισπράξαμε"), LC("Μας χρωστούν"), LC("Χρωστάμε"), LC("Μέρες είσπραξης") };
+    if (g.order.empty()) g.sort.keys = { { 6, false } };
+    auto text = [=](const DataConn::ProfitRow& r, int c) -> std::string { char b[32]; switch (c) { case 0: return kindName(r.kind); case 1: return r.label; case 2: return std::to_string(r.lines); case 3: return std::to_string(r.clients); case 4: return Eur(r.charged); case 5: return Eur(r.cost); case 6: return Eur(MoneySub(r.charged, r.cost)); case 7: std::snprintf(b, sizeof(b), "%.0f", margin(r.charged, r.cost)); return b; case 8: return Eur(r.collected); case 9: return Eur(r.owed); case 10: return Eur(r.costOwed); default: return ListNum(r.avgDays); } };
+    if (rows.empty()) { ImGui::TextDisabled("Καμία χρέωση σε αυτό το διάστημα."); return; }
+    DrawMiniList("profit", g, cols, 12, rows, text, [&](const DataConn::ProfitRow& r, int c) {
+        const double pr = MoneySub(r.charged, r.cost);
+        if (c == 6 || c == 7) ImGui::TextColored(pr >= 0 ? kColIn : kColOut, "%s", text(r, c).c_str()); else if (c == 9) ScMoney(r.owed, kColOwed); else if (c == 10) ScMoney(r.costOwed, kColWeOwe); else CellText(text(r, c).c_str()); }, [](const DataConn::ProfitRow&) {});
+}
+
 // ---- the residents of the buildings we manage: how they pay
 static void DrawScoringResidents() {
     static std::string from, to; static int filter = -1, bld = -1; static char q[96] = ""; static Pager pager{0, 25, 0};
     bool ch = DrawDateRange("scr", from, to);
-    ImGui::SameLine(); ImGui::SetNextItemWidth(240); ch |= ImGui::InputTextWithHint("##scrq", "Αναζήτηση ενοίκου...", q, sizeof(q));
-    struct Row { int uid, bid; std::string name, addr, apt; bool active; double charged, owed, feeOpen, late, pay; ScVerdict v; };
+    ImGui::SameLine(); 
+    struct Row { int uid, bid; std::string name, addr, apt; bool active; double charged, owed, feeOpen, late, pay; ScVerdict v; double delay; };
     static Cached<std::vector<Row>> cache;
     const auto& all = cache.get(from + "|" + to, [&] {
         std::vector<Row> out;
@@ -12354,7 +13095,8 @@ static void DrawScoringResidents() {
             x.fundOpen = n.fundOpen; x.feeOpen = n.feeOpen; x.fundOverdue = n.fundOverdue; x.feeOverdue = n.feeOverdue;
             Row r{x.user_id, x.building_id, x.name, x.building, x.apartment, x.active, x.fundCharged + x.feeCharged, x.fundOpen, x.feeOpen,
                   x.fundOverdue + x.feeOverdue, DataConn::QualityRow::OnTime(x.onTime, x.due), {}};
-            r.v = ScJudge(false, "", r.pay, r.late);
+            r.delay = x0.AvgDelay();
+            r.v = ResidentVerdict(r.pay, r.owed + r.feeOpen);
             if (!r.active && r.owed + r.feeOpen > 0.005 && r.v.lv >= SC_LATE) r.v.why = "Έφυγε χρωστώντας " + Eur(r.owed + r.feeOpen);
             out.push_back(r);
             now.erase({x0.building_id, x0.user_id});
@@ -12364,7 +13106,8 @@ static void DrawScoringResidents() {
             if (x.fundOpen + x.feeOpen <= 0.005) continue;
             Row r{x.user_id, x.building_id, x.name, x.building, x.apartment, x.active, 0, x.fundOpen, x.feeOpen,
                   x.fundOverdue + x.feeOverdue, DataConn::QualityRow::OnTime(x.onTime, x.due), {}};
-            r.v = ScJudge(false, "", r.pay, r.late);
+            r.delay = x.AvgDelay();
+            r.v = ResidentVerdict(r.pay, r.owed + r.feeOpen);
             if (!r.active && r.v.lv >= SC_LATE) r.v.why = "Έφυγε χρωστώντας " + Eur(r.owed + r.feeOpen);
             out.push_back(r);
         }
@@ -12378,30 +13121,40 @@ static void DrawScoringResidents() {
     }
     int counts[SC_N] = {0, 0, 0, 0}; for (auto& r : all) if (bld < 0 || r.bid == bld) { counts[r.v.lv]++; if (r.owed + r.feeOpen > 0.005) counts[SC_OWES]++; }
     ScFilter("scrf", filter, counts);
-    ImGui::TextDisabled("«Χρωστάει στο ταμείο» = εισφορές για τη χρηματοδότηση του ταμείου της πολυκατοικίας. «Μας χρωστάει» = αμοιβές διαχείρισης. «Καθυστερεί» = ποσό από αυτά που χρεώθηκε πριν από 30+ μέρες.");
+    ImGui::TextDisabled("Κάθε ένοικος: πόσο χρεώθηκε από τα μηνιαία έξοδα, πόσο γρήγορα πληρώνει και πόσο καθυστερεί. «Καθυστερεί» = ό,τι χρεώθηκε πριν από 30+ μέρες.");
     std::vector<const Row*> rows; std::string fq = FoldGreek(q);
     for (auto& r : all) if (ScShow(filter, r.v.lv, r.owed + r.feeOpen) && (bld < 0 || r.bid == bld) && (fq.empty() || FoldGreek(r.name + " " + r.apt).find(fq) != std::string::npos)) rows.push_back(&r);
-        static const ListColDef cols[9] = {
+        static const ListColDef cols[10] = {
         { "Κατηγορία", ImGuiTableColumnFlags_WidthFixed, 160.0f, true }, { "Ένοικος", ImGuiTableColumnFlags_WidthStretch, 1.6f, true },
         { "Πολυκατοικία", ImGuiTableColumnFlags_WidthStretch, 1.4f, true }, { "Διαμ.", ImGuiTableColumnFlags_WidthFixed, 60.0f, true },
-        { "Χρεώθηκε", ImGuiTableColumnFlags_WidthFixed, 90.0f, true }, { "Χρωστάει στο ταμείο", ImGuiTableColumnFlags_WidthFixed, 120.0f, true },
+        { "Χρεώθηκε", ImGuiTableColumnFlags_WidthFixed, 90.0f, true }, { "Χρωστάει για έξοδα", ImGuiTableColumnFlags_WidthFixed, 120.0f, true },
         { "Μας χρωστάει", ImGuiTableColumnFlags_WidthFixed, 100.0f, true }, { "Καθυστερεί", ImGuiTableColumnFlags_WidthFixed, 90.0f, true },
-        { "Βαθμός πληρωμής", ImGuiTableColumnFlags_WidthFixed, 110.0f, true }
+        { "Βαθμός πληρωμής", ImGuiTableColumnFlags_WidthFixed, 110.0f, true }, { "Μέση καθυστέρηση (μέρες)", ImGuiTableColumnFlags_WidthFixed, 130.0f, true }
     };
     static GridState g; static int lastFilter = -2;
-    if (g.order.empty()) { for (int i = 0; i < 9; i++) g.order.push_back(i); g.sort.keys = { { 0, true } }; g.pager.pageSize = 25; }
+    if (g.order.empty()) { for (int i = 0; i < 10; i++) g.order.push_back(i); g.sort.keys = { { 0, true } }; g.pager.pageSize = 25; }
     if (ch || lastFilter != filter) { g.pager.Reset(); lastFilter = filter; }
+    auto srText = [](const Row& r, int c) -> std::string {
+        char b[32];
+        switch (c) { case 0: return kScName[r.v.lv]; case 1: return r.name; case 2: return r.addr; case 3: return r.apt; case 4: return Eur(r.charged); case 5: return Eur(r.owed);
+                     case 6: return Eur(r.feeOpen); case 7: return Eur(r.late); case 8: if (r.pay < 0) return ""; std::snprintf(b, sizeof(b), "%.0f", r.pay); return b;
+                     default: if (r.delay < 0) return ""; std::snprintf(b, sizeof(b), "%.0f", r.delay); return b; } };
+    DrawListSearch(g);
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const Row* r) { return !ListRowMatches(*r, g, srText, 10); }), rows.end());
+    const DistinctFn srDistinct = [&](int col, const std::string& s) { return ListDistinct(all, g, srText, 10, col, s); };
     g.pager.total = (int)rows.size(); if (g.pager.offset >= g.pager.total) g.pager.Reset();
     GridSort(rows, g.sort, [](int c, const Row& a, const Row& b) {
         switch (c) { case 0: return Cmp3(a.v.lv, b.v.lv); case 1: return CmpText(a.name, b.name); case 2: return CmpText(a.addr, b.addr); case 3: return CmpText(a.apt, b.apt);
                      case 4: return Cmp3(ToCents(a.charged), ToCents(b.charged)); case 5: return Cmp3(ToCents(a.owed), ToCents(b.owed));
-                     case 6: return Cmp3(ToCents(a.feeOpen), ToCents(b.feeOpen)); case 7: return Cmp3(ToCents(a.late), ToCents(b.late)); default: return Cmp3(a.pay, b.pay); }
+                     case 6: return Cmp3(ToCents(a.feeOpen), ToCents(b.feeOpen)); case 7: return Cmp3(ToCents(a.late), ToCents(b.late)); case 8: return Cmp3(a.pay, b.pay); default: return Cmp3(a.delay, b.delay); }
     });
     float h = std::max(180.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
-    if (ImGui::BeginTable("scr", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+    if (ImGui::BeginTable("scr", 10, ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(g.order, cols);
-        ListHeaderRow(g.order, cols, g.sort, g.pager);
+        ImGui::TableSetColumnEnabled(ListPos(g.order, 6), false);      // fees are charged to the building, not to residents
+        ImGui::TableSetColumnEnabled(ListPos(g.order, 7), false);      // owing and being late are the same thing
+        ListHeaderRow(g.order, cols, g.sort, g.pager, &g.cf, &srDistinct);
         auto P = [&](int c) { return ListPos(g.order, c); };
         for (int i = g.pager.offset; i < std::min(g.pager.total, g.pager.offset + g.pager.pageSize); i++) {
             const Row& r = *rows[i];
@@ -12409,13 +13162,14 @@ static void DrawScoringResidents() {
             ImGui::TableSetColumnIndex(P(0)); ScCategory(r.v, r.owed + r.feeOpen);
             ImGui::TableSetColumnIndex(P(1)); if (LinkCell(r.name)) OpenResident(r.uid);
             if (!r.active) { ImGui::SameLine(); ImGui::TextDisabled("(έφυγε)"); }
-            ImGui::TableSetColumnIndex(P(2)); ImGui::TextUnformatted(r.addr.c_str());
-            ImGui::TableSetColumnIndex(P(3)); ImGui::TextUnformatted(r.apt.c_str());
-            ImGui::TableSetColumnIndex(P(4)); ImGui::TextUnformatted(Eur(r.charged).c_str());
+            ImGui::TableSetColumnIndex(P(2)); CellText(r.addr.c_str());
+            ImGui::TableSetColumnIndex(P(3)); CellText(r.apt.c_str());
+            ImGui::TableSetColumnIndex(P(4)); CellText(Eur(r.charged).c_str());
             ImGui::TableSetColumnIndex(P(5)); ScMoney(r.owed, kColOwed);
             ImGui::TableSetColumnIndex(P(6)); ScMoney(r.feeOpen, kColOwed);
             ImGui::TableSetColumnIndex(P(7)); ScMoney(r.late, kScWarn);
             ImGui::TableSetColumnIndex(P(8)); ScScore(r.pay);
+            ImGui::TableSetColumnIndex(P(9)); if (r.delay < 0) ImGui::TextDisabled("—"); else ImGui::Text("%.0f", r.delay);
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -12424,7 +13178,7 @@ static void DrawScoringResidents() {
 }
 
 static void DrawScoringScreen() {
-    ImGui::SetWindowFontScale(1.3f); ImGui::TextUnformatted("Αξιολόγηση"); ImGui::SetWindowFontScale(1.0f);
+    ImGui::SetWindowFontScale(1.3f); CellText("Αξιολόγηση"); ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine(0, 24); ScLegend();
     {   // what is owed to us today, split the way the tabs below show it (the same total as the home page, all dates)
         struct Tot { double clients = 0, buildings = 0, fees = 0; };
@@ -12436,16 +13190,303 @@ static void DrawScoringScreen() {
             for (auto& q : g_app.conn->clientQuality(0, "", "")) (bclients.count(q.user_id) ? x.buildings : x.clients) += q.openClient;
             for (auto& q : g_app.conn->residentQuality("", "")) x.fees += q.feeOpen;
             return x; });
-        ImGui::TextDisabled("Μας χρωστάνε σήμερα %s = πελάτες %s + πολυκατοικίες σε διαχείριση (υπηρεσίες) %s + ένοικοι (αμοιβές) %s",
-                            Eur(T.clients + T.buildings + T.fees).c_str(), Eur(T.clients).c_str(), Eur(T.buildings).c_str(), Eur(T.fees).c_str());
+        ImGui::TextDisabled("Μας χρωστάνε σήμερα %s = πελάτες %s + πολυκατοικίες ως πελάτες %s", Eur(T.clients + T.buildings).c_str(), Eur(T.clients).c_str(), Eur(T.buildings).c_str());
     }
     if (ImGui::BeginTabBar("scoretabs")) {
+        if (ImGui::BeginTabItem("Κέρδος & κόστος")) { ImGui::Spacing(); DrawProfitAnalysis(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Πελάτες", nullptr, g_scoringTab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::Spacing(); DrawScoringClients(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Πολυκατοικίες σε διαχείριση", nullptr, g_scoringTab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::Spacing(); DrawScoringBuildings(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Συμβάσεις")) { ImGui::Spacing(); DrawScoringContracts(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Πολυκατοικίες: αποθεματικό", nullptr, g_scoringTab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::Spacing(); DrawScoringBuildings(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Πολυκατοικίες: ένοικοι")) { ImGui::Spacing(); DrawScoringBuildingResidents(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Ένοικοι", nullptr, g_scoringTab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::Spacing(); DrawScoringResidents(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     g_scoringTab = -1; // Reset after use
+}
+
+// ---- Μηνιαία έξοδα: log the month's expenses, collect from the residents, then pay the cost (with the deposit if needed).
+static void DrawNewBillPopup(int bid) {
+    static std::string ym;
+    if (ImGui::IsWindowAppearing()) ym = CurrentDateString().substr(0, 7);
+    struct R { TextBuf why, amt; };
+    struct S { int user, apt; std::string name, apt_label; TextBuf amt; };
+    static std::vector<R> reasons; static std::vector<S> shares; static TextBuf note; static std::string err;
+    if (ImGui::IsWindowAppearing()) {
+        reasons.clear(); reasons.emplace_back(); shares.clear(); note.set(""); err.clear();
+        for (auto& r : g_app.conn->getResidents(bid, false)) { S x; x.user = r.user_id; x.apt = r.apartment_id; x.name = r.full_name; x.apt_label = r.apartment; shares.push_back(x); }
+        std::sort(shares.begin(), shares.end(), [](const S& a, const S& b) { return a.apt_label < b.apt_label; });
+    }
+    {   auto shift = [&](int k) { int y = std::atoi(ym.substr(0, 4).c_str()), m = std::atoi(ym.substr(5, 2).c_str()) + k; if (m < 1) { m = 12; y--; } if (m > 12) { m = 1; y++; } char t[16]; std::snprintf(t, sizeof(t), "%04d-%02d", y, m); ym = t; };
+        ImGui::AlignTextToFramePadding(); CellText("Μήνας:"); ImGui::SameLine();
+        if (ImGui::ArrowButton("##bym0", ImGuiDir_Left)) shift(-1);
+        ImGui::SameLine(); ImGui::Text("%s", ym.c_str()); ImGui::SameLine();
+        if (ImGui::ArrowButton("##bym1", ImGuiDir_Right)) shift(1);
+        ImGui::SameLine(); ImGui::TextDisabled("· οι ένοικοι χρωστάνε αμέσως το μερίδιό τους."); }
+    {   // suggestions only: nothing joins the cost unless it is added here
+        static std::vector<DataConn::BillSuggestion> sug; static std::set<int> added;
+        if (ImGui::IsWindowAppearing()) { sug = g_app.conn->billSuggestions(bid); added.clear(); }
+        if (!sug.empty()) {
+            SectionTitle("Προτάσεις: οφειλές και ό,τι προσφέραμε τις τελευταίες 30 ημέρες");
+            ImGui::BeginChild("##billsug", ImVec2(560, std::min(130.0f, 26.0f * (float)sug.size() + 8.0f)));
+            for (auto& b : sug) {
+                ImGui::PushID(b.charge_id);
+                const double amount = ToCents(b.owed) > 0 ? b.owed : b.due;
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text("%s%s · %s", b.contract ? "Σύμβαση: " : "", b.label.c_str(), DateGr(b.date).c_str()); ImGui::SameLine(330);
+                if (ToCents(b.owed) > 0) ImGui::TextColored(kColOwed, "χρωστάει %s", Eur(b.owed).c_str()); else ImGui::TextDisabled("εξοφλημένο %s", Eur(b.due).c_str());
+                ImGui::SameLine(480);
+                if (added.count(b.charge_id)) ImGui::TextDisabled("προστέθηκε");
+                else if (ImGui::SmallButton("Προσθήκη")) {
+                    if (reasons.empty() || !reasons.back().why.str().empty() || !reasons.back().amt.str().empty()) reasons.emplace_back();
+                    reasons.back().why.set(b.label); reasons.back().amt.set(FormatMoney(amount)); added.insert(b.charge_id);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+    }
+    long long total = 0, sum = 0; bool ok = true;
+    SectionTitle("Ανάλυση εξόδων (αιτία και ποσό)");
+    for (size_t i = 0; i < reasons.size(); ) {
+        ImGui::PushID((int)i);
+        ImGui::SetNextItemWidth(320); ImGui::InputTextWithHint("##w", "αιτία (π.χ. ΔΕΗ κοινοχρήστων)", reasons[i].why.data, sizeof(reasons[i].why.data)); ImGui::SameLine();
+        ImGui::SetNextItemWidth(110); ImGui::InputTextWithHint("##a", "ποσό", reasons[i].amt.data, sizeof(reasons[i].amt.data)); ImGui::SameLine();
+        double v = 0; if (!ParseMoney(reasons[i].amt.str(), v) || ToCents(v) <= 0 || reasons[i].why.str().empty()) ok = false; else total += ToCents(v);
+        bool gone = ImGui::SmallButton("x") && reasons.size() > 1;
+        ImGui::PopID();
+        if (gone) reasons.erase(reasons.begin() + i); else i++;
+    }
+    if (ImGui::SmallButton("+ Προσθήκη εξόδου")) reasons.emplace_back();
+    ImGui::SetWindowFontScale(1.15f); ImGui::TextColored(kColOut, "Σύνολο εξόδων: %s", Eur(FromCents(total)).c_str()); ImGui::SetWindowFontScale(1.0f);
+    SectionTitle("Ανάλυση ανά ένοικο");
+    if (shares.empty()) ImGui::TextColored(kColOwed, "Η πολυκατοικία δεν έχει ενοίκους.");
+    else if (ImGui::SmallButton("Ίσα σε όλους")) {
+        const long long each = total / (long long)shares.size(), rest = total - each * (long long)shares.size();
+        for (size_t i = 0; i < shares.size(); i++) shares[i].amt.set(FormatMoney(FromCents(each + ((long long)i < rest ? 1 : 0))));
+    }
+    ImGui::BeginChild("##billshares", ImVec2(560, std::min(260.0f, 30.0f * (float)shares.size() + 10.0f)));
+    for (size_t i = 0; i < shares.size(); i++) {
+        ImGui::PushID((int)i);
+        ImGui::AlignTextToFramePadding(); ImGui::Text("%s · %s", shares[i].apt_label.c_str(), shares[i].name.c_str()); ImGui::SameLine(420);
+        ImGui::SetNextItemWidth(110); ImGui::InputTextWithHint("##s", "ποσό", shares[i].amt.data, sizeof(shares[i].amt.data));
+        double v = 0; if (!shares[i].amt.str().empty()) { if (!ParseMoney(shares[i].amt.str(), v) || ToCents(v) < 0) ok = false; else sum += ToCents(v); }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    const bool match = total > 0 && sum == total;
+    ImGui::TextColored(match ? kColIn : kColOwed, "Μερίδια %s από %s%s", Eur(FromCents(sum)).c_str(), Eur(FromCents(total)).c_str(), match ? "" : " · πρέπει να είναι ίσα");
+    ImGui::InputText("Σημείωση", note.data, sizeof(note.data));
+    if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
+    ImGui::BeginDisabled(!ok || !match);
+    if (ImGui::Button("Καταχώριση και χρέωση ενοίκων", ImVec2(280, 0))) {
+        std::vector<DataConn::BillReason> rs; for (auto& r : reasons) { DataConn::BillReason x; x.reason = r.why.str(); ParseMoney(r.amt.str(), x.amount); rs.push_back(x); }
+        std::vector<JointShare> sh;
+        for (auto& x : shares) { double v = 0; if (!x.amt.str().empty()) ParseMoney(x.amt.str(), v); if (ToCents(v) <= 0) continue; JointShare j; j.apartment_id = x.apt; j.user_id = x.user; j.amount = v; sh.push_back(j); }
+        if (g_app.conn->addMonthlyBill(bid, ym, note.str(), rs, sh) > 0) ImGui::CloseCurrentPopup(); else err = g_app.conn->takeLastError();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(); if (ImGui::Button("Ακύρωση", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+}
+
+// One logged cost in its own window: the whole of it, with the reasons, every resident's part and paying the cost.
+struct BillWin { int id, building; std::string ym; };
+static std::vector<BillWin> g_billWins;
+static void OpenBillWindow(const DataConn::MonthlyBill& b) {
+    for (auto& w : g_billWins) if (w.id == b.id) return;
+    g_billWins.push_back({b.id, b.building_id, b.ym});
+}
+static void DrawBillShares(const char* id, const std::vector<DataConn::BillShare>& shares) {
+    static std::map<std::string, GridState> gs; static const ListColDef cols[6] = { LC("Διαμ."), LC("Ένοικος"), LC("Μερίδιο"), LC("Πλήρωσε"), LC("Οφείλει"), LCA };
+    auto text = [](const DataConn::BillShare& x, int c) -> std::string { switch (c) { case 0: return x.apartment; case 1: return x.name; case 2: return Eur(x.amount); case 3: return Eur(x.paid); case 4: return Eur(x.balance); default: return ""; } };
+    DrawMiniList(id, gs[id], cols, 6, shares, text, [&](const DataConn::BillShare& x, int c) {
+        if (c == 1) { if (LinkCell(x.name)) OpenResident(x.user_id); }
+        else if (c == 3) { if (ToCents(x.paid) > 0) ImGui::TextColored(kColIn, "%s", Eur(x.paid).c_str()); else ImGui::TextDisabled("—"); }
+        else if (c == 4) { if (ToCents(x.balance) > 0) ImGui::TextColored(kColOwed, "%s", Eur(x.balance).c_str()); else ImGui::TextDisabled("—"); }
+        else if (c == 5) { if (ToCents(x.balance) > 0 && ImGui::SmallButton("Είσπραξη")) { DataConn::ContractInstallment in; in.charges = x.charges; CollectInstallments(x.user_id, {in}); } }
+        else CellText(text(x, c).c_str()); }, [](const DataConn::BillShare&) {});
+}
+static void DrawBillReasons(const char* id, const std::vector<DataConn::BillReason>& reasons) {
+    static std::map<std::string, GridState> gs; static const ListColDef cols[2] = { LC("Αιτία"), LC("Ποσό") };
+    auto text = [](const DataConn::BillReason& r, int c) -> std::string { return c == 0 ? r.reason : Eur(r.amount); };
+    DrawMiniList(id, gs[id], cols, 2, reasons, text, [&](const DataConn::BillReason& r, int c) { CellText(text(r, c).c_str()); }, [](const DataConn::BillReason&) {});
+}
+static void DrawBillWindows() {
+    std::vector<BillWin> wins = g_billWins;
+    for (auto& w : wins) {
+        struct V { DataConn::MonthlyBill b; double deposit = 0; std::vector<DataConn::BillReason> reasons; std::vector<DataConn::BillShare> shares; };
+        static std::map<int, Cached<V>> cache;
+        const V& v = cache[w.id].get("", [&] { V x; for (auto& b : g_app.conn->getMonthlyBills(w.building, w.ym)) if (b.id == w.id) x.b = b;
+            x.deposit = g_app.conn->getFundBalance(w.building); x.reasons = g_app.conn->getBillReasons(w.id); x.shares = g_app.conn->getBillShares(w.id); return x; });
+        const auto& b = v.b;
+        bool open = true;
+        ImGui::SetNextWindowSize(ImVec2(680, 560), ImGuiCond_FirstUseEver);
+        std::string title = "Έξοδα " + w.ym + "###billwin_" + std::to_string(w.id);
+        if (b.id <= 0) { const int gone = w.id; g_billWins.erase(std::remove_if(g_billWins.begin(), g_billWins.end(), [gone](const BillWin& x) { return x.id == gone; }), g_billWins.end()); continue; }      // it was cancelled
+        if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+            const bool res = b.status == "resolved";
+            ImGui::Text("Σύνολο %s", Eur(b.total).c_str()); ImGui::SameLine(); ImGui::TextColored(kColIn, "· εισπράχθηκαν %s", Eur(b.collected).c_str());
+            if (ToCents(b.owed) > 0) { ImGui::SameLine(); ImGui::TextColored(kColOwed, res ? "· οφειλές προς το αποθεματικό %s" : "· οφειλές %s", Eur(b.owed).c_str()); }
+            if (res) { ImGui::TextColored(kColIn, "Πληρώθηκε %s", DateGr(b.resolved_date).c_str()); if (ToCents(b.covered) > 0) { ImGui::SameLine(); ImGui::TextDisabled("(από το αποθεματικό %s)", Eur(b.covered).c_str()); } }
+            else {
+                ImGui::TextColored(kColWeOwe, "Ενεργό κόστος"); ImGui::SameLine();
+                if (ToCents(b.collected) == 0) {
+                    if (ImGui::SmallButton("Ακύρωση καταχώρισης")) { const int bid2 = w.id; const std::string lbl = "Έξοδα " + w.ym + " · " + Eur(b.total);
+                        RequestConfirm("Ακύρωση καταχώρισης", { {"Κόστος", lbl, "(ακύρωση)"} }, [bid2]() { g_app.conn->cancelMonthlyBill(bid2); }); }
+                    ImGui::SameLine();
+                }
+                static std::string err;
+                if (ImGui::SmallButton("Πληρωμή κόστους")) { err.clear(); ImGui::OpenPopup("Πληρωμή κόστους"); }
+                if (ImGui::BeginPopupModal("Πληρωμή κόστους", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::Text("Κόστος %s · εισπράχθηκαν %s", Eur(b.total).c_str(), Eur(b.collected).c_str());
+                    const bool shortfall = ToCents(b.owed) > 0, enough = ToCents(b.owed) <= ToCents(v.deposit);
+                    if (shortfall) {
+                        ImGui::TextColored(kColOwed, "Λείπουν %s · αποθεματικό %s", Eur(b.owed).c_str(), Eur(v.deposit).c_str());
+                        ImGui::TextWrapped("Τα %s θα καλυφθούν από το αποθεματικό. Οι οφειλές των ενοίκων μένουν και, όταν πληρωθούν, επιστρέφουν στο αποθεματικό.", Eur(b.owed).c_str());
+                        if (!enough) ImGui::TextColored(kColOut, "Το αποθεματικό δεν φτάνει. Ενημερώστε το ή εισπράξτε πρώτα.");
+                    } else ImGui::TextColored(kColIn, "Εισπράχθηκε όλο το ποσό.");
+                    if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
+                    ImGui::BeginDisabled(!enough);
+                    if (ImGui::Button(shortfall ? "Πληρωμή με χρήση αποθεματικού" : "Πληρωμή", ImVec2(280, 0))) {
+                        if (g_app.conn->resolveMonthlyBill(w.id, CurrentDateString())) ImGui::CloseCurrentPopup(); else err = g_app.conn->takeLastError();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine(); if (ImGui::Button("Πίσω", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                }
+            }
+            if (!b.note.empty()) ImGui::TextDisabled("%s", b.note.c_str());
+            SectionTitle("Ανάλυση εξόδων");
+            DrawBillReasons(("why" + std::to_string(w.id)).c_str(), v.reasons);
+            SectionTitle("Ανά ένοικο");
+            DrawBillShares(("who" + std::to_string(w.id)).c_str(), v.shares);
+        }
+        ImGui::End();
+        if (!open) { const int id = w.id; g_billWins.erase(std::remove_if(g_billWins.begin(), g_billWins.end(), [id](const BillWin& x) { return x.id == id; }), g_billWins.end()); }
+    }
+}
+
+// The building's main screen: the Αποθεματικό is only observed; the timeline is the monthly costs. A cost stays active until it is
+// paid; a logged cost opens whole in its own window (where it can also be paid, with the Αποθεματικό if the residents are late).
+struct BillTabData { double deposit = 0, minDep = 0; std::vector<DataConn::MonthlyBill> active, done, used; struct Back { DataConn::MonthlyBill b; DataConn::BillShare s; }; std::vector<Back> backRows; };
+static const BillTabData& BillData(int bid) {
+    static std::map<int, Cached<BillTabData>> cache;
+    return cache[bid].get("", [&] {
+        BillTabData x; x.deposit = g_app.conn->getFundBalance(bid); x.minDep = g_app.conn->getDepositMin(bid);
+        for (auto& b : g_app.conn->getMonthlyBills(bid, "")) {
+            if (b.status == "open") { x.active.push_back(b); continue; }
+            x.done.push_back(b);
+            if (ToCents(b.covered) > 0) x.used.push_back(b);
+            if (ToCents(b.owed) > 0) for (auto& sh : g_app.conn->getBillShares(b.id)) if (ToCents(sh.balance) > 0) x.backRows.push_back({b, sh});
+        }
+        return x; });
+}
+
+// The main tab: only the costs being managed right now.
+static void DrawActiveExpenses(int bid) {
+    const BillTabData& v = BillData(bid);
+    ImGui::SetWindowFontScale(1.5f); ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.45f, 1), "Διαχείριση ενεργών εξόδων"); ImGui::SetWindowFontScale(1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.28f, 0.28f, 1));
+    if (ImGui::Button("+ Καταχώριση εξόδων μήνα")) ImGui::OpenPopup("Μηνιαία έξοδα");
+    ImGui::PopStyleColor();
+    ImGui::SetNextWindowSize(ImVec2(600, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Μηνιαία έξοδα", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) { DrawNewBillPopup(bid); ImGui::EndPopup(); }
+    ImGui::Spacing();
+    if (v.active.empty()) { ImGui::Spacing(); ImGui::SetWindowFontScale(1.2f); ImGui::TextDisabled("Κανένα ενεργό έξοδο. Αναμένεται στο τέλος του μήνα."); ImGui::SetWindowFontScale(1.0f); return; }
+    static std::map<int, Cached<std::map<int, std::pair<std::vector<DataConn::BillReason>, std::vector<DataConn::BillShare>>>>> dc;
+    const auto& det = dc[bid].get("", [&] { std::map<int, std::pair<std::vector<DataConn::BillReason>, std::vector<DataConn::BillShare>>> m; for (auto& b : v.active) m[b.id] = { g_app.conn->getBillReasons(b.id), g_app.conn->getBillShares(b.id) }; return m; });
+    ImGui::BeginChild("##activebills");
+    for (auto& b : v.active) {
+        ImGui::PushID(b.id);
+        ImGui::SetWindowFontScale(1.2f); ImGui::Text("Έξοδα %s", b.ym.c_str()); ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine(); ImGui::TextDisabled("(καταχωρήθηκε %s)", b.created_at.c_str());
+        ImGui::SameLine(); if (ImGui::Button("Πληρωμή κόστους…")) OpenBillWindow(b);
+        ImGui::Text("Στόχος %s", Eur(b.total).c_str()); ImGui::SameLine(); ImGui::TextColored(kColIn, "· μαζεύτηκαν %s", Eur(b.collected).c_str());
+        if (ToCents(b.owed) > 0) { ImGui::SameLine(); ImGui::TextColored(kColOwed, "· χρωστάνε %s", Eur(b.owed).c_str()); }
+        ImGui::ProgressBar(b.total > 0.005 ? (float)std::min(1.0, b.collected / b.total) : 1.0f, ImVec2(-1, 0), (Eur(b.collected) + " / " + Eur(b.total)).c_str());
+        if (auto it = det.find(b.id); it != det.end()) {
+            SectionTitle("Ανάλυση εξόδων"); DrawBillReasons(("awhy" + std::to_string(b.id)).c_str(), it->second.first);
+            SectionTitle("Ανά ένοικο"); DrawBillShares(("awho" + std::to_string(b.id)).c_str(), it->second.second);
+        }
+        ImGui::Separator(); ImGui::Spacing();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+static void DrawDepositTab(int bid) {
+    const BillTabData& v = BillData(bid);
+    long long toDeposit = 0; for (auto& b : v.done) toDeposit += ToCents(b.owed);
+    if (ImGui::Button("Όριο αποθεματικού")) ImGui::OpenPopup("Όριο αποθεματικού");
+    ImGui::SameLine(); DrawFundTab(bid, 0);
+    if (ImGui::BeginPopupModal("Όριο αποθεματικού", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static TextBuf amt; static std::string err;
+        if (ImGui::IsWindowAppearing()) { amt.set(FormatMoney(v.minDep)); err.clear(); }
+        ImGui::TextWrapped("Το αποθεματικό πρέπει να μένει πάνω από αυτό το ποσό. Αν πέσει κάτω, φαίνεται ως πρόβλημα εδώ και στην Αξιολόγηση. 0 = χωρίς όριο.");
+        ImGui::InputText("Ελάχιστο ποσό", amt.data, sizeof(amt.data));
+        double val = 0; const bool ok = ParseMoney(amt.str(), val) && ToCents(val) >= 0;
+        if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
+        ImGui::BeginDisabled(!ok);
+        if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) { if (g_app.conn->setDepositMin(bid, val)) ImGui::CloseCurrentPopup(); else err = g_app.conn->takeLastError(); }
+        ImGui::EndDisabled();
+        ImGui::SameLine(); if (ImGui::Button("Άκυρο", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::Spacing();
+    ImGui::TextWrapped("Αποθεματικό: η εγγύηση της πολυκατοικίας. Δεν αλλάζει από τα μηνιαία έξοδα. Μειώνεται μόνο όταν καλύψει κόστος επειδή οι ένοικοι άργησαν, και ξαναγεμίζει όταν εκείνοι πληρώσουν ή όταν προστεθεί χρηματοδότηση.");
+    const bool hasMin = ToCents(v.minDep) > 0, below = hasMin && ToCents(v.deposit) < ToCents(v.minDep);
+    if (ToCents(v.deposit) < 0) ImGui::TextColored(kColOut, "ΠΡΟΒΛΗΜΑ: το αποθεματικό είναι αρνητικό.");
+    else if (below) ImGui::TextColored(kColOut, "ΠΡΟΒΛΗΜΑ: το αποθεματικό είναι %s κάτω από το όριο των %s.", Eur(MoneySub(v.minDep, v.deposit)).c_str(), Eur(v.minDep).c_str());
+    else if (hasMin) ImGui::TextColored(kColIn, "Εντάξει: πάνω από το όριο των %s.", Eur(v.minDep).c_str());
+    else ImGui::TextDisabled("Δεν έχει οριστεί ελάχιστο όριο.");
+    if (toDeposit > 0) { ImGui::SameLine(); ImGui::TextColored(kColOwed, " Χρωστούν %s για να ξαναγεμίσει.", Eur(FromCents(toDeposit)).c_str()); }
+    if (hasMin) {
+        const float fr = (float)std::max(0.0, std::min(1.0, v.deposit / v.minDep));
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, below ? kColOut : kColIn);
+        ImGui::ProgressBar(fr, ImVec2(-1, 0), (Eur(v.deposit) + " / όριο " + Eur(v.minDep)).c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+    if (ImGui::BeginTable("mbtiles", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        auto tile = [](const char* t, double x, ImVec4 col) { ImGui::TableNextColumn(); StatTile(t, Eur(x), col, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 76)); };
+        tile("Αποθεματικό", v.deposit, v.deposit >= 0 ? kColIn : kColOut); tile("Οφειλές προς αποθεματικό", FromCents(toDeposit), toDeposit > 0 ? kColOwed : kColMuted);
+        ImGui::EndTable();
+    }
+    using Bill = DataConn::MonthlyBill; using Back = BillTabData::Back;
+    static std::map<int, GridState> uG, oG;
+    ImGui::BeginChild("##depositlists");
+    SectionTitle("Οφειλές ενοίκων προς το αποθεματικό");
+    ImGui::TextDisabled("Κόστη που κάλυψε το αποθεματικό. Ό,τι εισπράττεται εδώ επιστρέφει στο αποθεματικό.");
+    if (v.backRows.empty()) ImGui::TextDisabled("Κανείς δεν χρωστάει στο αποθεματικό.");
+    else {
+        enum { O_YM, O_APT, O_WHO, O_OWED, O_ACT, O_N };
+        static const ListColDef cols[O_N] = { LC("Κόστος μήνα"), LC("Διαμ."), LC("Ένοικος"), LC("Χρωστάει"), LCA };
+        auto text = [](const Back& r, int c) -> std::string { switch (c) { case O_YM: return r.b.ym; case O_APT: return r.s.apartment; case O_WHO: return r.s.name; case O_OWED: return Eur(r.s.balance); default: return ""; } };
+        DrawMiniList("back", oG[bid], cols, O_N, v.backRows, text, [&](const Back& r, int c) {
+            if (c == O_ACT) { if (ImGui::SmallButton("Είσπραξη")) { DataConn::ContractInstallment in; in.charges = r.s.charges; CollectInstallments(r.s.user_id, {in}); } }
+            else CellText(text(r, c).c_str()); }, [](const Back&) {});
+    }
+    ImGui::Spacing();
+    SectionTitle("Χρήσεις αποθεματικού");
+    if (v.used.empty()) ImGui::TextDisabled("Το αποθεματικό δεν έχει χρησιμοποιηθεί.");
+    else {
+        enum { U_YM, U_DATE, U_USED, U_BACK, U_LEFT, U_N };
+        static const ListColDef cols[U_N] = { LC("Κόστος μήνα"), LC("Χρησιμοποιήθηκε"), LC("Ποσό"), LC("Επέστρεψαν"), LC("Μένουν") };
+        auto text = [](const Bill& b, int c) -> std::string { switch (c) { case U_YM: return b.ym; case U_DATE: return b.resolved_date; case U_USED: return Eur(b.covered); case U_BACK: return Eur(MoneySub(b.covered, b.owed)); case U_LEFT: return Eur(b.owed); default: return ""; } };
+        DrawMiniList("used", uG[bid], cols, U_N, v.used, text, [&](const Bill& b, int c) { CellText(text(b, c).c_str()); }, [](const Bill& b) { OpenBillWindow(b); });
+    }
+    ImGui::EndChild();
+}
+
+static void DrawExpenseHistoryTab(int bid) {
+    const BillTabData& v = BillData(bid);
+    using Bill = DataConn::MonthlyBill;
+    static std::map<int, GridState> hG;
+    if (v.done.empty()) { ImGui::TextDisabled("Κανένα ολοκληρωμένο κόστος ακόμα."); return; }
+    enum { H_YM, H_LOG, H_TOTAL, H_COL, H_USED, H_LEFT, H_PAID, H_N };
+    static const ListColDef cols[H_N] = { LC("Μήνας"), LC("Καταχωρήθηκε"), LC("Στόχος"), LC("Εισπράχθηκαν"), LC("Χρήση αποθεματικού"), LC("Χρωστούν στο αποθεματικό"), LC("Πληρώθηκε") };
+    auto text = [](const Bill& b, int c) -> std::string { switch (c) { case H_YM: return b.ym; case H_LOG: return b.created_at; case H_TOTAL: return Eur(b.total); case H_COL: return Eur(MoneySub(b.total, b.covered)); case H_USED: return Eur(b.covered); case H_LEFT: return Eur(b.owed); case H_PAID: return b.resolved_date; default: return ""; } };
+    DrawMiniList("hist", hG[bid], cols, H_N, v.done, text, [&](const Bill& b, int c) { CellText(text(b, c).c_str()); }, [](const Bill& b) { OpenBillWindow(b); });
 }
 
 static void DrawManagedBuilding(int bid) {
@@ -12474,7 +13515,7 @@ static void DrawManagedBuilding(int bid) {
         RequestConfirm("Τέλος διαχείρισης πολυκατοικίας", { {"Πολυκατοικία", name, "εκτός διαχείρισης"} }, [bid]() {
             g_app.conn->setBuildingManaged(bid, false); g_mgSel = -1; });
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Βγαίνει από τη Διαχείριση. Το ταμείο και οι πληρωμές μένουν στα βιβλία.");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Βγαίνει από τη Διαχείριση. Το αποθεματικό και οι πληρωμές μένουν στα βιβλία.");
     // is this building ALSO a client of ours for our own services? say so plainly
     int cid = BuildingClientId(bid);
     if (cid > 0) {
@@ -12497,20 +13538,23 @@ static void DrawManagedBuilding(int bid) {
     ImGui::Spacing();
     // two tabs: the fund (every action together) and the apartments & residents (each one's own part)
     if (ImGui::BeginTabBar("mgbtabs")) {
-        auto tab = [&](const char* name, int idx) { return ImGui::BeginTabItem(name, nullptr, g_mgTab == idx ? ImGuiTabItemFlags_SetSelected : 0); };
-        if (tab("Ταμείο", 0)) { DrawFundTab(bid); ImGui::EndTabItem(); }
-        if (tab("Μηνιαία εικόνα", 2)) { DrawMonthlyTab(bid); ImGui::EndTabItem(); }
+        auto tab = [&](const char* name, int idx) { return ImGui::BeginTabItem(name, nullptr, (g_mgTab == idx || (idx == 2 && g_mgTab == 0)) ? ImGuiTabItemFlags_SetSelected : 0); };
+        if (tab("Ενεργά έξοδα", 2)) { DrawActiveExpenses(bid); ImGui::EndTabItem(); }
+        if (tab("Αποθεματικό", 5)) { DrawDepositTab(bid); ImGui::EndTabItem(); }
+        if (tab("Κινήσεις αποθεματικού", 6)) { DrawFundTab(bid, 1); ImGui::EndTabItem(); }
+        if (tab("Ιστορικό εξόδων", 7)) { DrawExpenseHistoryTab(bid); ImGui::EndTabItem(); }
         if (tab("Διαμερίσματα & ένοικοι", 4)) { DrawAptResidentsTab(*agg); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
         g_mgTab = -1;
     }
+    DrawBillWindows();
     // an action clicked anywhere (a funding, an expense, our fee): its report in its own window
     static int actionWin = 0;
     if (g_expenseOpen != 0) { actionWin = g_expenseOpen; g_expenseOpen = 0; ImGui::SetNextWindowFocus(); }
     if (actionWin != 0) {
         bool open = true;
         ImGui::SetNextWindowSize(ImVec2(860, 560), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("Ενέργεια ταμείου###fundaction", &open, ImGuiWindowFlags_NoCollapse)) DrawExpenseDetail(actionWin);
+        if (ImGui::Begin("Ενέργεια αποθεματικού###fundaction", &open, ImGuiWindowFlags_NoCollapse)) DrawExpenseDetail(actionWin);
         ImGui::End();
         if (!open) actionWin = 0;
     }
@@ -12531,7 +13575,7 @@ static void DrawManagementEarnings() {
         ImGui::TableNextColumn(); StatTile("Μένουν να εισπραχθούν", Eur(left), left > 0.005 ? kColOwed : kColMuted, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 86));
         ImGui::EndTable();
     }
-    ImGui::TextDisabled("Μόνο οι αμοιβές διαχείρισης: έσοδο μας, ξεχωριστό από τα ταμεία των πολυκατοικιών. «+ Αμοιβή διαχείρισης» στο ταμείο κάθε πολυκατοικίας.");
+    ImGui::TextDisabled("Μόνο οι αμοιβές διαχείρισης: έσοδο μας, ξεχωριστό από τα αποθεματικά των πολυκατοικιών. «+ Αμοιβή διαχείρισης» στο αποθεματικό κάθε πολυκατοικίας.");
     enum { EA_DATE, EA_BLD, EA_WHY, EA_CHG, EA_COL, EA_LEFT, EA_ACT, EA_COUNT };
     static const ListColDef cols[EA_COUNT] = {
         { "Ημ/νία", ImGuiTableColumnFlags_WidthFixed, 95.0f, true },         { "Πολυκατοικία", ImGuiTableColumnFlags_WidthFixed, 220.0f, true },
@@ -12541,23 +13585,25 @@ static void DrawManagementEarnings() {
     static ListModel<JointOp> mdl;
     mdl.Init(EA_COUNT, {{EA_DATE, false}}, 20);
     if (ch) mdl.g.pager.Reset();
-    const auto& pg = mdl.Load(from + "|" + to,
+    DrawListSearch(mdl.g);
+    const auto& pg = mdl.LoadT(from + "|" + to,
         [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageFees(from, to, s, off, lim); },          // same column numbers as the SQL
-        [&] { return T.n; });
+        [&] { return T.n; },
+        [](const JointOp& o, int c) -> std::string { switch (c) { case EA_DATE: return DateGr(o.op_date); case EA_BLD: return o.building_address; case EA_WHY: return o.label; case EA_CHG: return Eur(o.total); case EA_COL: return Eur(std::min(o.paid, o.total)); case EA_LEFT: return Eur(MoneySub(o.total, std::min(o.paid, o.total))); default: return ""; } }, EA_COUNT);
     if (pg.count == 0) { ImGui::TextDisabled("Καμία αμοιβή διαχείρισης σε αυτό το διάστημα."); return; }
     float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
     if (ImGui::BeginTable("earn", EA_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ListSetupColumns(mdl.g.order, cols);
-        ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager);
+        ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager, &mdl.g.cf, &mdl.distinct);
         auto P = [&](int c) { return ListPos(mdl.g.order, c); };
         for (auto& o : pg.rows) {
             double got = std::min(o.paid, o.total), l = MoneySub(o.total, got);
             ImGui::PushID(o.id); ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(P(EA_DATE)); ImGui::TextUnformatted(DateGr(o.op_date).c_str());
+            ImGui::TableSetColumnIndex(P(EA_DATE)); CellText(DateGr(o.op_date).c_str());
             ImGui::TableSetColumnIndex(P(EA_BLD)); if (LinkCell(o.building_address)) g_mgSel = o.building_id;
-            ImGui::TableSetColumnIndex(P(EA_WHY)); ImGui::TextUnformatted(o.label.c_str());
-            ImGui::TableSetColumnIndex(P(EA_CHG)); ImGui::TextUnformatted(Eur(o.total).c_str());
+            ImGui::TableSetColumnIndex(P(EA_WHY)); CellText(o.label.c_str());
+            ImGui::TableSetColumnIndex(P(EA_CHG)); CellText(Eur(o.total).c_str());
             ImGui::TableSetColumnIndex(P(EA_COL)); ImGui::TextColored(kColIn, "%s", Eur(got).c_str());
             ImGui::TableSetColumnIndex(P(EA_LEFT)); if (l > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(l).c_str()); else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(P(EA_ACT)); if (ImGui::SmallButton("Άνοιγμα")) { g_mgSel = o.building_id; g_expenseOpen = -o.id; }
@@ -12580,10 +13626,6 @@ static void DrawManagedList() {
     const auto& managed = mc.get("", [] { return g_app.conn->getManagedBuildings(); });
     if (g_mgSel > 0 && std::find(managed.begin(), managed.end(), g_mgSel) == managed.end()) g_mgSel = -1;
 
-    static char q[128] = "";
-    ImGui::SetNextItemWidth(320);
-    bool ch = ImGui::InputTextWithHint("##mgq", "Αναζήτηση: διεύθυνση, ΑΦΜ, τηλέφωνο, email, κωδικός...", q, sizeof(q));
-    ImGui::SameLine();
     if (ImGui::Button("+ Πολυκατοικία σε διαχείριση")) ImGui::OpenPopup("##mgadd");
     if (ImGui::BeginPopup("##mgadd")) {
         ImGui::TextDisabled("Ποια πολυκατοικία αναλαμβάνουμε;");
@@ -12605,61 +13647,46 @@ static void DrawManagedList() {
         ImGui::EndPopup();
     }
 
-    // one row per managed building: its client details and its fund - one page at a time, sorted in the database
-    enum { MB_CODE, MB_ADDR, MB_AFM, MB_PHONE, MB_EMAIL, MB_SPECIAL, MB_APTS, MB_FUND, MB_OWED, MB_ACT, MB_COUNT };
-    static const ListColDef cols[MB_COUNT] = {
-        { "ΚΩΔ", ImGuiTableColumnFlags_WidthFixed, 60.0f, true },             { "ΔΙΕΥΘΥΝΣΗ", ImGuiTableColumnFlags_WidthFixed, 220.0f, true },
-        { "ΑΦΜ", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },             { "ΤΗΛΕΦΩΝΟ", ImGuiTableColumnFlags_WidthFixed, 120.0f, true },
-        { "EMAIL", ImGuiTableColumnFlags_WidthFixed, 180.0f, true },           { "ΕΙΔ.ΚΩΔ", ImGuiTableColumnFlags_WidthFixed, 90.0f, true },
-        { "ΔΙΑΜΕΡ.", ImGuiTableColumnFlags_WidthFixed, 75.0f, true },          { "ΤΑΜΕΙΟ", ImGuiTableColumnFlags_WidthFixed, 105.0f, true },
-        { "ΟΦΕΙΛΟΜΕΝΑ", ImGuiTableColumnFlags_WidthFixed, 125.0f, true }, { "", ImGuiTableColumnFlags_WidthFixed, 80.0f, false } };
-    static ListModel<DataConn::ManagedRow> mdl;
-    mdl.Init(MB_COUNT, {{MB_ADDR, true}}, 20);
-    { static bool ordered = false; if (!ordered && mdl.g.order.size() == MB_COUNT) { mdl.g.order = { MB_ADDR, MB_FUND, MB_OWED, MB_APTS, MB_AFM, MB_PHONE, MB_EMAIL, MB_SPECIAL, MB_CODE, MB_ACT }; ordered = true; } }   // the money first
-    if (ch) mdl.g.pager.Reset();
-    const std::string text = q;
-    const auto& pg = mdl.Load(text,
-        [&](const SortSpec& s, int off, int lim) { return g_app.conn->pageManagedBuildings(text, s, off, lim); },        // same column numbers as the SQL
-        [&] { return g_app.conn->countManagedBuildings(text); });
-    ImGui::TextDisabled("%d πολυκατοικίες σε διαχείριση", (int)managed.size());
-    if (pg.count == 0) ImGui::TextDisabled(managed.empty() ? "Καμία ακόμα. «+ Πολυκατοικία σε διαχείριση» για να προσθέσετε." : "Κανένα αποτέλεσμα.");
-    else {
-        float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
-        if (ImGui::BeginTable("mglist", MB_COUNT, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable, ImVec2(0, h))) {
-            ImGui::TableSetupScrollFreeze(1, 1);
-            ListSetupColumns(mdl.g.order, cols);
-            { bool anyPhone = false, anyEmail = false, anySpecial = false;      // columns nobody filled in take no room
-              for (auto& r : pg.rows) { anyPhone |= !r.phone.empty(); anyEmail |= !r.email.empty(); anySpecial |= !r.special_code.empty(); }
-              ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, MB_PHONE), anyPhone); ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, MB_EMAIL), anyEmail); ImGui::TableSetColumnEnabled(ListPos(mdl.g.order, MB_SPECIAL), anySpecial); }
-            ListHeaderRow(mdl.g.order, cols, mdl.g.sort, mdl.g.pager);
-            auto P = [&](int c) { return ListPos(mdl.g.order, c); };
-            for (auto& r : pg.rows) {
-                ImGui::PushID(r.building_id); ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(P(MB_CODE));
-                char idb[16]; std::snprintf(idb, sizeof(idb), "%d", r.user_id);
-                if (ImGui::Selectable(idb, g_mgSel == r.building_id, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) g_mgSel = r.building_id;
-                ImGui::TableSetColumnIndex(P(MB_ADDR)); if (LinkCell(r.address)) g_mgSel = r.building_id;
-                ImGui::TableSetColumnIndex(P(MB_AFM)); ImGui::TextUnformatted(r.afm.c_str());
-                ImGui::TableSetColumnIndex(P(MB_PHONE)); ImGui::TextUnformatted(r.phone.c_str());
-                ImGui::TableSetColumnIndex(P(MB_EMAIL)); ImGui::TextUnformatted(r.email.c_str());
-                ImGui::TableSetColumnIndex(P(MB_SPECIAL)); ImGui::TextUnformatted(r.special_code.c_str());
-                ImGui::TableSetColumnIndex(P(MB_APTS)); ImGui::Text("%d", r.apartments);
-                ImGui::TableSetColumnIndex(P(MB_FUND)); ImGui::TextColored(r.fund >= 0 ? kColIn : kColOut, "%s", Eur(r.fund).c_str());
-                ImGui::TableSetColumnIndex(P(MB_OWED)); if (r.owed > 0.005) ImGui::TextColored(kColOwed, "%s", Eur(r.owed).c_str()); else ImGui::TextDisabled("—");
-                ImGui::TableSetColumnIndex(P(MB_ACT)); if (ImGui::SmallButton("Άνοιγμα")) g_mgSel = r.building_id;
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
+    // one row per managed building: where its deposit and its residents stand today
+    struct Row { DataConn::ManagedRow r; double minDep = 0, monthOwed = 0, fundOwed = 0, score = -1; bool active = false; std::string fundState; bool fundBad = false; };
+    static Cached<std::vector<Row>> rc;
+    const auto& rows = rc.get("", [] {
+        std::map<int, DataConn::ManageScore> ms; for (auto& m : g_app.conn->manageScores("", "")) ms[m.building_id] = m;
+        std::map<int, std::pair<double, int>> sc;
+        for (auto& q : g_app.conn->residentQuality("", "")) { const double v = DataConn::QualityRow::OnTime(q.onTime, q.due); if (v >= 0) { sc[q.building_id].first += v; sc[q.building_id].second++; } }
+        std::vector<Row> out;
+        for (auto& r : g_app.conn->pageManagedBuildings("", {}, 0, 1000000)) {
+            Row x; x.r = r; x.minDep = g_app.conn->getDepositMin(r.building_id);
+            for (auto& b : g_app.conn->getMonthlyBills(r.building_id, "")) { if (b.status == "open") { x.active = true; x.monthOwed = FromCents(ToCents(x.monthOwed) + ToCents(b.owed)); } else x.fundOwed = FromCents(ToCents(x.fundOwed) + ToCents(b.owed)); }
+            if (auto it = sc.find(r.building_id); it != sc.end() && it->second.second > 0) x.score = it->second.first / it->second.second;
+            ScVerdict v = FundVerdict(ms[r.building_id]); x.fundState = v.why; x.fundBad = v.lv != SC_GOOD;
+            out.push_back(x);
         }
-        DrawPager(mdl.g.pager, "mglistpg");
+        return out; });
+    ImGui::TextDisabled("%d πολυκατοικίες σε διαχείριση", (int)managed.size());
+    ImGui::TextWrapped("Αποθεματικό: η εγγύηση της πολυκατοικίας, και το όριο κάτω από το οποίο βγαίνει προειδοποίηση. Βαθμός ενοίκων: ο μέσος όρος του πόσο στην ώρα τους πληρώνουν (0-100). Για αυτό το μήνα: ό,τι χρωστούν για το ενεργό κόστος, «-» όταν δεν υπάρχει. Προς αποθεματικό: ό,τι κάλυψε το αποθεματικό και οι ένοικοι δεν έχουν επιστρέψει.");
+    if (rows.empty()) ImGui::TextDisabled("Καμία ακόμα. «+ Πολυκατοικία σε διαχείριση» για να προσθέσετε.");
+    else {
+        enum { MB_ADDR, MB_STATE, MB_FUND, MB_MIN, MB_FSTATE, MB_SCORE, MB_OWED, MB_MONTH, MB_TOFUND, MB_APTS, MB_AFM, MB_PHONE, MB_EMAIL, MB_SPECIAL, MB_CODE, MB_COUNT };
+        static const ListColDef cols[MB_COUNT] = { LC("Διεύθυνση"), LC("Έξοδα"), LC("Αποθεματικό"), LC("Όριο"), LC("Κατάσταση αποθεματικού"), LC("Βαθμός ενοίκων"), LC("Σύνολο οφειλών"), LC("Για αυτό το μήνα"), LC("Προς αποθεματικό"), LC("Διαμερ."), LC("ΑΦΜ"), LC("Τηλέφωνο"), LC("Email"), LC("Ειδ. κωδ."), LC("Κωδ.") };
+        static GridState g;
+        auto text = [](const Row& x, int c) -> std::string { const auto& r = x.r; switch (c) { case MB_ADDR: return r.address; case MB_STATE: return x.active ? "Ενεργή" : "Αναμένεται στο τέλος του μήνα"; case MB_FUND: return Eur(r.fund); case MB_MIN: return ToCents(x.minDep) > 0 ? Eur(x.minDep) : "-"; case MB_FSTATE: return x.fundState;
+            case MB_SCORE: return x.score < 0 ? "-" : ListNum(x.score); case MB_OWED: return Eur(r.owed); case MB_MONTH: return x.active ? Eur(x.monthOwed) : "-"; case MB_TOFUND: return Eur(x.fundOwed); case MB_APTS: return std::to_string(r.apartments); case MB_AFM: return r.afm; case MB_PHONE: return r.phone; case MB_EMAIL: return r.email; case MB_SPECIAL: return r.special_code; default: return std::to_string(r.user_id); } };
+        DrawMiniList("mglist", g, cols, MB_COUNT, rows, text, [&](const Row& x, int c) {
+            if (c == MB_STATE) ImGui::TextColored(x.active ? kColWeOwe : kColMuted, "%s", text(x, c).c_str());
+            else if (c == MB_FUND) ImGui::TextColored(x.r.fund >= 0 ? kColIn : kColOut, "%s", text(x, c).c_str());
+            else if (c == MB_FSTATE) ImGui::TextColored(x.fundBad ? kColOut : kColIn, "%s", x.fundState.c_str());
+            else if (c == MB_SCORE) ScScore(x.score);
+            else if (c == MB_OWED || c == MB_TOFUND || c == MB_MONTH) { const std::string t = text(x, c); const bool some = t != "-" && t != Eur(0); if (some) ImGui::TextColored(kColOwed, "%s", t.c_str()); else ImGui::TextDisabled("%s", t == "-" ? "-" : "—"); }
+            else CellText(text(x, c).c_str()); }, [](const Row& x) { g_mgSel = x.r.building_id; });
     }
 
     // the building's window: fund, κοινόχρηστα, residents, expenses, apartments -- full screen beside the nav
     if (g_mgSel > 0) {
         bool open = true;
         ImGuiViewport* vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + kNavCollapsed, vp->WorkPos.y), ImGuiCond_Appearing);
-        ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - kNavCollapsed, vp->WorkSize.y), ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + kNavBarH), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, vp->WorkSize.y - kNavBarH), ImGuiCond_Appearing);
         std::string title = "Διαχείριση · " + g_app.conn->getBuildingById(g_mgSel).address + "###mgwindow";
         if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) DrawManagedBuilding(g_mgSel);
         ImGui::End();
@@ -12668,18 +13695,18 @@ static void DrawManagedList() {
 }
 
 static void DrawManagementScreen() {
-    ImGui::SetWindowFontScale(1.2f); ImGui::TextUnformatted("Διαχείριση"); ImGui::SetWindowFontScale(1.0f);
-    ImGui::SameLine(); ImGui::TextDisabled("  οι πολυκατοικίες που διαχειριζόμαστε · κλικ σε γραμμή: ταμείο, διαμερίσματα & ένοικοι, έξοδα");
+    ImGui::SetWindowFontScale(1.2f); CellText("Διαχείριση"); ImGui::SetWindowFontScale(1.0f);
+    ImGui::SameLine(); ImGui::TextDisabled("  οι πολυκατοικίες που διαχειριζόμαστε · κλικ σε γραμμή: αποθεματικό, διαμερίσματα & ένοικοι, έξοδα");
     static int lastSel = -1; bool jump = g_mgSel > 0 && g_mgSel != lastSel; lastSel = g_mgSel;
     if (ImGui::BeginTabBar("mgmain")) {
         if (ImGui::BeginTabItem("Πολυκατοικίες", nullptr, jump ? ImGuiTabItemFlags_SetSelected : 0)) { DrawManagedList(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Κέρδη")) { DrawManagementEarnings(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 }
 int RunApp(DataConn* conn, const std::string& dbPath) {
     g_app.conn = conn;
     g_app.dbPath = dbPath;
+    g_app.conn->ensureFeeService();      // the ΔΙΑΧΕΙΡΙΣΗ service is always there to charge
     g_app.reloadAll();
     PrefsLoad((std::filesystem::path(dbPath).parent_path() / "ui_prefs.ini").string());
 
@@ -12854,11 +13881,17 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::Begin("PropertyManagerMain", nullptr,
                       ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                      ImGuiWindowFlags_NoBringToFrontOnFocus);   // the left navigation always stays on top of the page
+                      ImGuiWindowFlags_NoBringToFrontOnFocus);   // the navigation always stays on top of the page
 
-        // Left navigation: a thin icon bar that widens over the content while the mouse is on it.
+        // Navigation: a thin icon bar along the top.
+        {   // everything follows the data by itself: any change refreshes the loaded lists; a new day makes what fell due owed
+            static std::string day = CurrentDateString();
+            if (day != CurrentDateString()) { day = CurrentDateString(); g_app.conn->refreshDueCharges(); }
+            static long long seen = g_app.conn->dataVersion();
+            if (seen != g_app.conn->dataVersion()) { seen = g_app.conn->dataVersion(); g_app.reloadUsers(); g_app.reloadServices(); g_app.reloadJoint(); g_app.reloadNotes(); }
+        }
         if (g_tabToApartments) { g_page = PAGE_JOINT; g_tabToApartments = false; }      // buildings live in Διαχείριση now
-        ImGui::SetCursorPos(ImVec2(kNavCollapsed + 8.0f, ImGui::GetCursorPosY()));
+        ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX(), kNavBarH + 6.0f));
         ImGui::BeginChild("pagecontent", ImVec2(0, 0), false);
         switch (g_page) {
             case PAGE_HOME:       DrawHomeScreen(); break;
@@ -12879,7 +13912,11 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                         g_ledgerTab = 1;
                         if (ImGui::BeginTabBar("paymain")) {
                             if (ImGui::BeginTabItem("Πελάτες")) {
-                                DrawPaymentsScreen(2);
+                                DrawPaymentsScreen(4);
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Συμβάσεις")) {
+                                DrawPaymentsScreen(7);
                                 ImGui::EndTabItem();
                             }
                             if (ImGui::BeginTabItem("Διαχείριση")) {
@@ -12903,12 +13940,19 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                                 DrawReceiptsScreen("clients");
                                 ImGui::EndTabItem();
                             }
+                            if (ImGui::BeginTabItem("Συμβάσεις")) {
+                                if (ImGui::Button("+ Νέα είσπραξη")) OpenRecordPayment(-1);
+                                ImGui::SameLine();
+                                DrawReceiptsScreen("contracts");
+                                ImGui::EndTabItem();
+                            }
                             if (ImGui::BeginTabItem("Διαχείριση")) {
                                 if (ImGui::Button("+ Νέα είσπραξη")) OpenRecordPayment(-1);
                                 ImGui::SameLine();
                                 DrawReceiptsScreen("managed");
                                 ImGui::EndTabItem();
                             }
+                            if (ImGui::BeginTabItem("Τιμολόγια συνεργατών")) { DrawPartnerDocs(0); ImGui::EndTabItem(); }
                             if (ImGui::BeginTabItem("Συνεργάτες (πληρωμές μας)")) {
                                 static std::string pf, pt; static ListModel<DataConn::PartnerJob> pm;
                                 ImGui::TextDisabled("Ό,τι πληρώσαμε εμείς: σε συνεργάτες, ή χωρίς καταχωρημένο συνεργάτη (#-1). «Άνοιγμα» δείχνει τη χρέωση και τις πληρωμές της.");
@@ -12924,6 +13968,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                 }
                 break;
             case PAGE_OFFERS:     DrawOffersScreen(); break;
+            case PAGE_CONTRACTS:  DrawContractsScreen(); break;
             case PAGE_SCORING:    DrawScoringScreen(); break;
             case PAGE_SEARCH:     DrawSearchScreen(); break;
             case PAGE_NOTES:      DrawNotesScreen(); break;
@@ -12948,6 +13993,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         // Fix: call each of these exactly once per frame, only here.
         DrawConfirmModal();
         DrawUserProfileWindow();
+        DrawContractViewWindows();
         DrawServiceDetailWindow();
         DrawPackageViewWindow();
         DrawResidentLedgerWindow();

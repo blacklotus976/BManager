@@ -183,8 +183,8 @@ int main(int argc, char** argv) {
     CHECK(Q1(db, "SELECT COUNT(*) FROM (SELECT op_id, apartment_id, user_id FROM joint_shares GROUP BY op_id, apartment_id, user_id HAVING COUNT(*) > 1)") == 0);
     // 6. every charge's apartment is one its client lived in on that date
     CHECK(Q1(db, "SELECT COUNT(*) FROM charges c WHERE c.apartment_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM residencies r WHERE r.user_id = c.user_id "
-                 "AND r.apartment_id = c.apartment_id AND r.from_date <= c.pay_date AND (r.to_date IS NULL OR r.to_date = '' OR r.to_date >= c.pay_date)) "
-                 "AND EXISTS (SELECT 1 FROM residencies r2 WHERE r2.user_id = c.user_id AND r2.from_date <= c.pay_date)") == 0);
+                 "AND r.apartment_id = c.apartment_id AND r.from_date <= c.charge_date AND (r.to_date IS NULL OR r.to_date = '' OR r.to_date >= c.charge_date)) "
+                 "AND EXISTS (SELECT 1 FROM residencies r2 WHERE r2.user_id = c.user_id AND r2.from_date <= c.charge_date)") == 0);
     // 7. a fully paid "one receipt at the end" plan has its receipt
     CHECK(Q1(db, "SELECT COUNT(*) FROM payment_plans pl WHERE pl.receipt_mode = 'end' "
                  "AND NOT EXISTS (SELECT 1 FROM charges c WHERE c.batch_id = pl.batch_id AND (c.status = 'future' OR CAST(ROUND(c.balance*100) AS INTEGER) > 0)) "

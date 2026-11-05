@@ -45,7 +45,7 @@ int main() {
         db.setAuditReason("");
 
         // dates are one ISO column; the app still sees the parts
-        CHECK(one(db, "SELECT pay_date FROM charges WHERE id = " + std::to_string(pid)) == "2026-10-11");
+        CHECK(one(db, "SELECT charge_date FROM charges WHERE id = " + std::to_string(pid)) == "2026-10-11");
         CHECK(db.getPaymentById(pid).year == 2026 && db.getPaymentById(pid).day == 11);
         CHECK(db.getPaymentById(pid).created_at.size() == 19);
 
@@ -105,7 +105,7 @@ int main() {
     }
 
     // payment dates must be real ISO dates
-    CHECK(!raw(path2.string(), "DROP TRIGGER audit_charges_ins; INSERT INTO charges (service_id, pay_date) VALUES (1, '2026-2-30')"));
+    CHECK(!raw(path2.string(), "DROP TRIGGER audit_charges_ins; INSERT INTO charges (service_id, charge_date) VALUES (1, '2026-2-30')"));
 
     fs::remove_all(dir);
     std::printf(fails ? "%d FAILED\n" : "all audit tests passed\n", fails);

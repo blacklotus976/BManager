@@ -44,6 +44,7 @@ struct Payment {
     // Read-only: the joint charge (κοινόχρηστο) this line is one resident's share of (-1 = not joint).
     // Linked through batch_id: a joint charge owns its batch, and the share is the line's apartment + client.
     int joint_op_id = -1;
+    int contract_id = -1;          // Read-only: the contract (Σύμβαση) this charge belongs to, -1 = none
     // Write-only, used when the charge is created: the offer claimed for it and the price before the discount
     // (saved in offer_uses, not on the charge).
     // Read-only: the offer this charge was made with (offer_uses), so past payments show "this offer was applied".

@@ -8,6 +8,9 @@ struct User {
     // Client's own legacy numbering/coding scheme -- a free-text second key that
     // doesn't align with our DB `id`, plays no other role beyond being searchable.
     std::string special_code;
+    std::string code;                // ΚΩΔ: the office's own client number, free to edit (id is only the database's)
+    std::string extra_json;          // extra details, a flat JSON object {"key":"value"}; searchable
+    std::string manager_name;        // building clients: the current manager's name (may stay empty)
     std::string created_at;
 
     // The ONLY stored link to where this client lives: an apartment (-1 = none).

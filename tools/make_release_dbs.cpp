@@ -10,11 +10,12 @@
 #include "Money.h"
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <string>
 #include <vector>
 
-static const std::string kToday = "2026-10-27";
+static const std::string kToday = [] { std::time_t t = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &t); char b[16]; std::strftime(b, sizeof(b), "%Y-%m-%d", &tm); return std::string(b); }();
 
 static std::string Ago(int days) {
     int y = std::atoi(kToday.substr(0, 4).c_str()), m = std::atoi(kToday.substr(5, 2).c_str()), d = std::atoi(kToday.substr(8, 2).c_str()) - days;
@@ -31,7 +32,7 @@ static std::string NextMonth(const std::string& ym) {
 static const char* kMonth[] = { "Ιανουαρίου", "Φεβρουαρίου", "Μαρτίου", "Απριλίου", "Μαΐου", "Ιουνίου", "Ιουλίου",
                                 "Αυγούστου", "Σεπτεμβρίου", "Οκτωβρίου", "Νοεμβρίου", "Δεκεμβρίου" };
 
-static unsigned g_rnd = 20261027u;
+static unsigned g_rnd = (unsigned)std::time(nullptr);
 static int Rnd(int n) { g_rnd = g_rnd * 1103515245u + 12345u; return (int)((g_rnd >> 8) % (unsigned)n); }
 
 static int g_fail = 0;
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
     fs::path dir = argv[1]; fs::create_directories(dir);
     fs::remove(dir / "data.db"); fs::remove(dir / "data.db-wal"); fs::remove(dir / "data.db-shm");
     fs::remove(dir / "empty.db"); fs::remove(dir / "empty.db-wal"); fs::remove(dir / "empty.db-shm");
-    { SqliteConn e((dir / "empty.db").string()); }                 // the same tables, nothing in them
+    { SqliteConn e((dir / "empty.db").string()); e.ensureFeeService(); }                 // the same tables, nothing in them
 
     SqliteConn c((dir / "data.db").string());
 
@@ -102,7 +103,8 @@ int main(int argc, char** argv) {
         for (auto* l : bs[i].apts) apt.push_back(c.addApartment(bid[i], l));
         if (!bs[i].managed) continue;                                           // the 4th building has no residents of ours
         Need(c.setBuildingManaged(bid[i], true), c, "managed");
-        c.fundAdjust(bid[i], bs[i].open, "2026-06-01", "Αρχικό υπόλοιπο: παραλαβή ταμείου", true);
+        c.fundAdjust(bid[i], 5000.0 + 500.0 * (double)i, "2026-06-01", "Εγγύηση / αποθεματικό κατά την έναρξη διαχείρισης", true);
+        c.setDepositMin(bid[i], 1000.0);
         for (size_t k = 0; k < apt.size(); k++) {
             if (bs[i].managed && k == apt.size() - 1 && i == 1) continue;       // one empty apartment
             DataConn::Resident r; r.apartment_id = apt[k]; r.full_name = kRes[rn % 20]; r.phone = "69" + std::to_string(10000000 + rn * 1111); r.start_date = "2026-01-01";
@@ -158,7 +160,7 @@ int main(int argc, char** argv) {
       int b = charge(u, sClean, Ago(40), 150, "καθαρισμός δεξαμενής"); pay(u, b, Ago(38), 75); cost(u, sClean, pCleaner, Ago(40), 70, 70, "κόστος"); }
     // 8 big and profitable, with one bill scheduled for next month
     { int u = person("ΚΑΡΥΔΗΣ ΑΡΗΣ", "6911000008"); int a = charge(u, sBoiler, Ago(60), 300, "ετήσια συντήρηση εγκατάστασης"); pay(u, a, Ago(58), 300); cost(u, sBoiler, pBoiler, Ago(60), 80, 80, "κόστος");
-      charge(u, sBoiler, "2026-11-15", 300, "προγραμματισμένη συντήρηση", "future"); }
+ }
     // 9 a business: pays by bank 15 days late; one cost we have not paid to the partner yet (we owe)
     { int u = person("ΤΕΧΝΙΚΗ ΚΑΡΥΔΗΣ ΕΠΕ", "2105550999", "business", "099777888"); int a = charge(u, sPipe, Ago(75), 400, "εργασίες συντήρησης καταστήματος");
       MoneyPayment mp; mp.user_id = u; mp.pay_date = Ago(60); mp.amount = 400; mp.method = "bank"; Receipt rc; rc.method = "bank"; c.recordPayment(mp, {{-1, a, 400.0}}, &rc);
@@ -174,14 +176,66 @@ int main(int argc, char** argv) {
           p.amount_due = svc == sBoiler ? 90 : svc == sPest ? 60 : 150; p.amount_paid = 0; p.year = 2026; p.month = 10; p.day = 12; p.notes = "Πακέτο: ετήσια συντήρηση"; ps.push_back(p); }
         Need(c.addPaymentsWithReceipt(ps, "Πακέτο ετήσιας συντήρησης", nullptr) > 0, c, "package"); } }
 
+    // ---------------- many more random clients, so the lists and column filters have something to chew on ----------------
+    {
+        static const char* kSur[] = { "ΑΛΕΞΙΟΥ", "ΒΕΝΕΤΗΣ", "ΓΑΛΑΝΗΣ", "ΔΑΣΚΑΛΑΚΗΣ", "ΕΛΕΥΘΕΡΙΟΥ", "ΖΑΧΑΡΙΑΣ", "ΗΛΙΟΠΟΥΛΟΣ", "ΚΑΛΟΓΗΡΟΥ", "ΛΑΜΠΡΑΚΗΣ", "ΜΑΝΟΥΣΑΚΗΣ", "ΝΤΟΥΝΗΣ", "ΞΕΝΑΚΗΣ", "ΠΑΝΑΓΟΣ", "ΡΟΥΣΣΟΣ", "ΣΙΔΕΡΗΣ", "ΤΖΑΝΗΣ", "ΦΩΤΙΑΔΗΣ", "ΧΑΤΖΗΣ" };
+        static const char* kFirst[] = { "ΑΝΔΡΕΑΣ", "ΒΑΣΙΛΗΣ", "ΓΙΩΡΓΟΣ", "ΔΗΜΗΤΡΗΣ", "ΕΛΕΝΗ", "ΚΑΤΕΡΙΝΑ", "ΛΕΝΑ", "ΜΑΡΙΑ", "ΝΙΚΟΣ", "ΣΟΦΙΑ", "ΣΤΕΦΑΝΟΣ", "ΦΑΝΗ" };
+        const int svcs[] = { sPest, sPipe, sBoiler, sClean, sMonthly }; const double prices[] = { 60, 100, 90, 150, 50 }; const double costs[] = { 25, 60, 40, 70, 20 }; const int pids[] = { pCleaner, pPlumber, pBoiler, pCleaner, pElectric };
+        for (int n = 0; n < 40; n++) {
+            std::string name = std::string(kSur[Rnd(18)]) + " " + kFirst[Rnd(12)];
+            if (UserByName(c, name) > 0) continue;
+            const bool biz = Rnd(5) == 0;
+            int u = person(biz ? (name + " ΕΕ").c_str() : name.c_str(), ("69" + std::to_string(20000000 + Rnd(9999999))).c_str(), biz ? "business" : "person", biz ? ("09" + std::to_string(1000000 + Rnd(8999999))).c_str() : "");
+            for (int k = 1 + Rnd(4); k > 0; k--) {
+                int i = Rnd(5), age = 2 + Rnd(150), behave = Rnd(4);
+                int id = charge(u, svcs[i], Ago(age), prices[i], "τυχαία χρέωση");
+                if (behave == 0) pay(u, id, Ago(age), prices[i]);
+                else if (behave == 1) pay(u, id, Ago(std::max(0, age - Rnd(30))), prices[i]);
+                else if (behave == 2) pay(u, id, Ago(std::max(0, age - Rnd(20))), prices[i] / 2);
+                if (Rnd(2)) cost(u, svcs[i], pids[i], Ago(age), costs[i], Rnd(3) ? costs[i] : 0, "κόστος");
+            }
+        }
+        // every client gets the office's code, some a special code and extra details; buildings a manager, or none
+        static const char* kCall[] = { "πρωί", "απόγευμα", "μόνο email" }; static const char* kFrom[] = { "σύσταση", "Facebook", "πινακίδα", "παλιός πελάτης" };
+        static const char* kMgr[] = { "ΚΟΚΚΙΝΟΣ ΠΕΤΡΟΣ", "ΜΑΥΡΟΥ ΑΝΝΑ", "ΛΕΥΚΑΣ ΓΙΑΝΝΗΣ" };
+        int seq = 100;
+        for (auto& u0 : c.pageUsers("", 0, {}, 0, 1000)) {
+            User u = u0; u.code = "Π-" + std::to_string(seq++);
+            if (Rnd(2)) u.special_code = "ΠΑΛ" + std::to_string(1000 + Rnd(8999));
+            if (Rnd(3)) u.extra_json = std::string("{\"Επικοινωνία\":\"") + kCall[Rnd(3)] + "\",\"Από\":\"" + kFrom[Rnd(4)] + "\"}";
+            if (u.kind == "building") { if (Rnd(4)) { u.manager_name = kMgr[Rnd(3)]; u.phone = "69" + std::to_string(30000000 + Rnd(9999999)); } else u.phone.clear(); }
+            Need(c.editUser(u.id, u), c, "client details");
+        }
+    }
+
+    // ---------------- contracts: a yearly price in installments, at different stages of their year ----------------
+    {
+        auto clients = c.pageUsers("", 0, {}, 0, 1000, {}, 5); int made = 0;
+        std::vector<DataConn::ContractItem> pkgItems = { {sBoiler, "ΣΥΝΤΗΡΗΣΗ ΚΑΥΣΤΗΡΑ", 240, 100}, {sPest, "ΑΠΕΝΤΟΜΩΣΗ", 120, 40}, {sClean, "ΚΑΘΑΡΙΣΜΟΣ ΔΕΞΑΜΕΝΗΣ", 240, 110} };
+        for (size_t i = 0; i < clients.size() && made < 10; i += 1 + Rnd(6)) {
+            DataConn::Contract k; k.user_id = clients[i].id; k.start_date = Ago(Rnd(300)); static const int plans[] = { 12, 12, 12, 4, 2 }; k.installments = plans[Rnd(5)]; k.partner_id = pBoiler;
+            const bool package = Rnd(3) > 0; k.source_type = package ? "package" : "service"; k.source_id = package ? pkg : sMonthly;
+            if (package) k.label = "ΠΑΚΕΤΟ ΕΤΗΣΙΑΣ ΣΥΝΤΗΡΗΣΗΣ";
+            std::vector<DataConn::ContractItem> one = { {sMonthly, "ΜΗΝΙΑΙΑ ΥΠΗΡΕΣΙΑ ΣΥΝΤΗΡΗΣΗΣ", 600, 240} };
+            int id = c.addContract(k, package ? pkgItems : one); Need(id > 0, c, "contract"); if (id <= 0) continue; made++;
+            // pays most of what fell due, one installment at a time, and now and then one early
+            for (auto& in : c.getContractInstallments(id)) {
+                if (in.future ? Rnd(12) != 0 : Rnd(4) == 0) continue;
+                MoneyPayment mp; mp.user_id = k.user_id; mp.pay_date = in.future ? kToday : in.date; mp.amount = in.due; mp.method = "cash"; Receipt rc; rc.method = "cash";
+                std::vector<Allocation> al; for (int cid : in.charges) al.push_back({-1, cid, c.getPaymentById(cid).amount_due});
+                Need(c.recordPayment(mp, al, &rc) > 0, c, "contract payment");
+            }
+        }
+    }
+
     // ---------------- managed buildings: funds and residents' payments ----------------
     auto jointService = [&](const char* label, const char* notes) {
         for (auto& j : c.getJointCatalog(true)) if (j.service.label == label) return j.service.id;
         Service s; s.label = label; s.extra_notes = notes; int jid = c.addJointService(s, "equal"); return jid > 0 ? c.getJointServiceById(jid).service.id : -1; };
     const int sFund = jointService("Εισφορά ταμείου", "Χρήματα των ενοίκων στο ταμείο της πολυκατοικίας (όχι έσοδο μας).");
-    const int sFee = jointService("Αμοιβή διαχείρισης", "Η αμοιβή μας για τη διαχείριση πολυκατοικίας: έσοδο μας, όχι χρήματα του ταμείου.");
+    const int sFee = c.ensureFeeService();
     Need(sFund > 0 && sFee > 0, c, "joint services");
-    const std::string first = "2026-06", last = "2026-10", lastDay = kToday;
+    const std::string first = "2026-06", last = kToday.substr(0, 7), lastDay = kToday;
     int nOps = 0, nExp = 0, nPay = 0;
     for (size_t bi = 0; bi < 3; bi++) {
         const std::string mood = bs[bi].mood;                         // good / mixed / bad
@@ -218,25 +272,32 @@ int main(int argc, char** argv) {
         };
         for (std::string ym = first; ym <= last; ym = NextMonth(ym)) {
             const std::string mname = kMonth[std::atoi(ym.substr(5, 2).c_str()) - 1];
-            // monthly funding: healthy building asks enough, the bad one asks too little for what it spends
-            const long long perRes = mood == "good" ? 3500 : (mood == "mixed" ? 3000 : 1500);
-            JointOp f; f.building_id = bid[bi]; f.source_type = "service"; f.source_id = sFund; f.kind = "contribution";
-            f.label = "Εισφορά " + mname; f.op_date = Day(ym, 1); f.total = FromCents(perRes * n);
-            int fid = c.chargeJoint(f, {{sFund, f.total}}, Equal(rs, perRes * n));
-            if (fid > 0) { nOps++; payOp(fid, ym, false); } else std::printf("funding: %s\n", c.takeLastError().c_str());
-            struct Ex { const char* what; int day; long long lo, span; int chance; };
-            const Ex exs[] = { {"ΔΕΗ κοινοχρήστων", 7, 4500, 6000, 100}, {"Νερό ΕΥΔΑΠ", 11, 1800, 3500, 100}, {"Καθαριότητα κλιμακοστασίου", 15, 6000, 1, 100},
-                               {"Συντήρηση ανελκυστήρα", 19, 8500, 2000, 60}, {"Λαμπτήρες & ηλεκτρολογικά", 22, 1200, 2500, 35}, {"Επισκευή θυροτηλεφώνου", 26, 7000, 9000, 15} };
-            for (auto& e : exs) {
-                if (mood != "bad" && e.chance < 100 && Rnd(100) >= e.chance) continue;
-                const std::string d = Day(ym, e.day); if (d > lastDay) continue;
-                long long amt = e.lo + (e.span > 1 ? Rnd((int)e.span) : 0);
-                if (mood == "bad") amt = amt * 13 / 10;                  // the bad building spends more
-                if (c.fundExpenseShared(bid[bi], FromCents(amt), d, std::string(e.what) + " " + mname, "", Equal(rs, amt)) > 0) nExp++; else std::printf("expense: %s\n", c.takeLastError().c_str());
+            // the month's expenses, as the manager's other program gives them: why, how much, each resident's part
+            struct Ex { const char* what; long long lo, span; int chance; };
+            const Ex exs[] = { {"ΔΕΗ κοινοχρήστων", 4500, 6000, 100}, {"Νερό ΕΥΔΑΠ", 1800, 3500, 100}, {"Καθαριότητα κλιμακοστασίου", 6000, 1, 100},
+                               {"Συντήρηση ανελκυστήρα", 8500, 2000, 60}, {"Λαμπτήρες & ηλεκτρολογικά", 1200, 2500, 35} };
+            std::vector<DataConn::BillReason> reasons; long long sum = 0;
+            for (auto& e : exs) { if (Rnd(100) >= e.chance) continue; long long amt = e.lo + (e.span > 1 ? Rnd((int)e.span) : 0); DataConn::BillReason r; r.reason = e.what; r.amount = FromCents(amt); reasons.push_back(r); sum += amt; }
+            int billId = c.addMonthlyBill(bid[bi], ym, "", reasons, Equal(rs, sum));
+            Need(billId > 0, c, "monthly bill");
+            if (billId > 0) {
+                nExp++;
+                for (auto& mb : c.getMonthlyBills(bid[bi], ym)) if (mb.id == billId) { payOp(mb.op_id, ym, false); }
+                // past months: the cost got paid, with the deposit when collections fell short and it could
+                if (ym < last) {
+                    Need(c.resolveMonthlyBill(billId, Day(NextMonth(ym), 25)), c, "paying a month's cost");
+                    for (auto& sh : c.getBillShares(billId)) {
+                        const std::string d = Day(NextMonth(ym), 27);
+                        if (ToCents(sh.balance) <= 0 || d > lastDay || Rnd(100) < 60) continue;       // most keep owing the deposit for now
+                        MoneyPayment m; m.user_id = sh.user_id; m.pay_date = d; m.amount = sh.balance; m.method = "cash"; Receipt rc; rc.method = "cash";
+                        std::vector<Allocation> al; for (int cid : sh.charges) al.push_back({-1, cid, c.getPaymentById(cid).balance});
+                        Need(c.recordPayment(m, al, &rc) > 0, c, "paying back the deposit");
+                    }
+                }
             }
-            JointOp q; q.building_id = bid[bi]; q.source_type = "service"; q.source_id = sFee; q.kind = "fee"; q.label = "Αμοιβή διαχείρισης " + mname;
-            q.op_date = Day(ym, 28); q.total = FromCents(500 * n);
-            if (q.op_date <= lastDay) { int qid = c.chargeJoint(q, {{sFee, q.total}}, Equal(rs, 500 * n)); if (qid > 0) { nOps++; payOp(qid, ym, true); } }
+            // our fee: the service, charged to the building as a client
+            if (Day(ym, 28) <= lastDay) { int bc = -1; for (auto& u : c.pageUsers("", 0, {}, 0, 100, {}, 2)) if (u.client_building_id == bid[bi]) bc = u.id;
+                if (bc > 0) { int fc = charge(bc, sFee, Day(ym, 28), 5.0 * (double)n, "αμοιβή διαχείρισης"); nOps++; if (ym < last && Rnd(4)) pay(bc, fc, Day(NextMonth(ym), 3), 5.0 * (double)n); } }
         }
     }
     // a one-off fund correction in the good building (a refund received)
@@ -256,7 +317,7 @@ int main(int argc, char** argv) {
         double owing = 0; c.countClientOwings("", &owing); same("clients owing (own)", owing, own.owed - own.scheduledIn);
         double owingJ = 0; c.countClientOwings("", &owingJ, true); same("residents owing (joint)", owingJ, jnt.owed - jnt.scheduledIn);
         // every managed building: start + the month's rows = end
-        for (int b : c.getManagedBuildings()) for (std::string ym = "2026-06"; ym <= "2026-10"; ym = NextMonth(ym)) {
+        for (int b : c.getManagedBuildings()) for (std::string ym = "2026-06"; ym <= kToday.substr(0, 7); ym = NextMonth(ym)) {
             auto mf = c.monthFund(b, ym); long long fund = ToCents(mf.fundStart), owed = ToCents(mf.owedStart);
             for (auto& x : mf.items) {
                 if (x.kind == "expense") { fund += -ToCents(x.cost) + ToCents(x.paidIn); owed += ToCents(x.charged) - ToCents(x.paidIn); }

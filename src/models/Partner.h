@@ -11,6 +11,8 @@ struct Partner {
     std::string email;
     std::string afm;
     std::string notes;
+    std::string iban;
+    std::string extra_json;   // anything else worth keeping, a flat JSON object {"key":"value"}
     bool active = true;
     std::string created_at;
 };

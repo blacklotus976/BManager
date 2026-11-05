@@ -137,11 +137,13 @@ int main() {
             int b1 = addPay(db, c2, svc2, 50, 0), b2 = addPay(db, c2, svc2, 30, 0);     // two unpaid bills
             CHECK(db.getOpenCharges(c2).size() == 2);
             MoneyPayment m; m.user_id = c2; m.pay_date = "2026-10-05"; m.amount = 100;
+            { Receipt over; over.user_id = c2; over.method = "bank"; CHECK(db.recordPayment(m, {{-1, b1, 50}, {-1, b2, 20}}, &over) == -1); db.takeLastError(); }   // a receipt never says more than its lines
+            m.amount = 70;
             Receipt rr; rr.user_id = c2; rr.method = "bank"; rr.bank_ref = "TRX-9";
             int mid = db.recordPayment(m, {{-1, b1, 50}, {-1, b2, 20}}, &rr);
             CHECK(mid > 0);
             CHECK(ToCents(db.getPaymentById(b1).balance) == 0 && ToCents(db.getPaymentById(b2).balance) == 1000);
-            CHECK(ToCents(db.getClientCredit(c2)) == 3000);                                  // 100 - 50 - 20
+            CHECK(ToCents(db.getClientCredit(c2)) == 0);
             CHECK(db.getOpenCharges(c2).size() == 1);
             CHECK(db.getReceiptIdForPayment(b1) > 0 && db.getReceiptIdForPayment(b1) == db.getReceiptIdForPayment(b2));
             // a second instalment on b2, no receipt yet -> shows up in "missing receipt"

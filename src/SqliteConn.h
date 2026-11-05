@@ -253,9 +253,43 @@ public:
 
     std::vector<User> pageUsers(const std::string& query, int scope,
                                  const std::vector<std::string>& letters,
-                                 int offset, int limit, const SortSpec& sort = {}, int kinds = 7) override;
+                                 int offset, int limit, const SortSpec& sort = {}, int kinds = 7, const ColFilters* cf = nullptr) override;
+    int addMonthlyBill(int buildingId, const std::string& ym, const std::string& note, const std::vector<BillReason>& reasons, const std::vector<JointShare>& shares) override;
+    std::vector<MonthlyBill> getMonthlyBills(int buildingId, const std::string& ym, bool openOnly = false) override;
+    std::vector<BillReason> getBillReasons(int billId) override;
+    std::vector<BillShare> getBillShares(int billId) override;
+    bool resolveMonthlyBill(int billId, const std::string& date) override;
+    bool cancelMonthlyBill(int billId) override;
+    std::vector<ResidentOwing> residentOwingsByMonth() override;
+    double getDepositMin(int buildingId) override;
+    bool setDepositMin(int buildingId, double amount) override;
+    std::vector<BillSuggestion> billSuggestions(int buildingId) override;
+    bool isMonthlyShare(int chargeId);
+    bool payOutWithDoc(int chargeId, double amount, const std::string& payDate, const std::string& method, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) override;
+    std::vector<PartnerDoc> getPartnerDocs(int partnerId, const std::string& from, const std::string& to) override;
+    std::vector<ClientMix> clientMix(const std::string& from, const std::string& to) override;
+    std::vector<ProfitRow> profitAnalysis(const std::string& from, const std::string& to) override;
+    std::map<int, std::pair<double, double>> contractPayScores() override;
+    std::vector<ManageScore> manageScores(const std::string& fromYm, const std::string& toYm) override;
+    std::vector<std::string> contractDefaultDates(const std::string& start, int months, int installments) override;
+    int addContract(const Contract& c, const std::vector<ContractItem>& items) override;
+    Contract getContract(int id) override;
+    std::vector<ContractItem> getContractItems(int id) override;
+    std::vector<ContractInstallment> getContractInstallments(int id) override;
+    std::vector<Receipt> getContractReceipts(int id) override;
+    std::vector<Contract> pageContracts(int userId, int state, const std::string& text, const SortSpec& sort, int offset, int limit) override;
+    ContractTotals contractTotals(int userId, int state, const std::string& text) override;
+    int ensureFeeService() override;
+    bool cancelContract(int id, const std::string& reason) override;
+    IncomeSplit incomeSplit(const std::string& fromDate, const std::string& toDate) override;
+    std::vector<ContractOwing> contractOwings() override;
+    std::vector<Contract> contractTemplates(int limit) override;
+    bool refreshDueCharges() override;
+    std::vector<std::pair<int, std::string>> topContractPackages(int limit) override;
     int countUsers(const std::string& query, int scope,
-                    const std::vector<std::string>& letters, int kinds = 7) override;
+                    const std::vector<std::string>& letters, int kinds = 7, const ColFilters* cf = nullptr) override;
+    std::vector<std::pair<std::string, int>> distinctUserValues(int col, const std::string& search, const std::string& query, int scope,
+                    const std::vector<std::string>& letters, int kinds, const ColFilters* cf, int limit) override;
     std::vector<Service> pageServices(const std::string& query, int offset, int limit,
                                        const SortSpec& sort = {}) override;
     int countServices(const std::string& query) override;

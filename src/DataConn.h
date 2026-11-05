@@ -9,6 +9,8 @@
 #include "models/Payment.h"
 #include "models/Note.h"
 #include "models/Receipt.h"
+#include <map>
+#include <set>
 #include "models/MoneyPayment.h"
 #include "models/Attachment.h"
 #include <vector>
@@ -233,6 +235,7 @@ public:
         std::string method;               // "" = any
         std::string text;                 // client / partner name, reference, notes
         int receipt = 0;                  // 0 any, 1 with an issued receipt, 2 incoming money without one
+        bool oursOnly = false;            // countMoney: leave out what went into or out of the buildings' funds
     };
     virtual std::vector<MoneyPayment> pageMoney(const MoneyQuery& q, int offset, int limit) = 0;     // newest first
     virtual long long countMoney(const MoneyQuery& q, double* in = nullptr, double* out = nullptr) = 0;
@@ -250,8 +253,10 @@ public:
                                              // 3 amount, 4 paid, 5 still owed, 6 status (several keys allowed)
         double minDue = 0.0, maxDue = 0.0;   // amount_due bounds, 0 = none
         int joint = 0;                       // 0 any, 1 only shares of joint charges (κοινόχρηστα), 2 only the client's own charges
+                                             // (4 of those: not from contracts, 7: only from contracts)
         int jointOpId = -1;                  // only the lines of this joint charge
         bool requireUser = false;            // only charges with a client (excludes joint-cost lines with user_id=NULL)
+        bool oursOnly = false;               // leave out the buildings' fund lines (fundings, old shares and their costs); fees stay
         // Accent/case-insensitive substring filters (same matching as the search screen). `text` matches any of
         // client, service, notes, status, date, client's building address.
         std::string text, clientText, serviceText, notesText, buildingText;
@@ -673,6 +678,8 @@ public:
         int building_id = -1, user_id = -1; std::string name, building, apartment; bool active = false;
         double fundCharged = 0, fundOpen = 0, feeCharged = 0, feeOpen = 0, idxNum = 0, idxDen = 0;
         double fundOverdue = 0, feeOverdue = 0;       // open and charged more than 30 days ago (late)
+        double delayNum = 0, delayDen = 0;            // days late weighted by amount: paid (when paid), unpaid (so far)
+        double AvgDelay() const { return delayDen > 0.005 ? delayNum / delayDen : -1.0; }
         double onTime = 0, due = 0;                   // the payment score, as for clients: 100 * onTime / due
     };
     virtual std::vector<ResidentQualityRow> residentQuality(const std::string& fromDate = "", const std::string& toDate = "") = 0;
@@ -714,12 +721,109 @@ public:
     // pageUsers scope: 0 = all fields, 1 = full_name only, 2 = special_code only,
     //                  3 = phone only, 4 = building address only. `letters` is
     //                  the multi-select Greek-letter name filter (empty = none).
+    // --- Συμβάσεις: a client's fixed yearly price for a service or a package, paid in installments. The services are
+    // COPIED into the contract, so changing the catalog later changes nothing here. Its installments are ordinary
+    // charges (charges.contract_id): scheduled ('future') until their date, then owed, paid with the usual payments and
+    // receipts, and counted in every total like any other charge.
+    struct ContractItem { int service_id = -1; std::string label; double amount = 0.0, cost = 0.0; };      // yearly price and cost
+    struct Contract {
+        int id = -1, user_id = -1, source_id = -1, installments = 12, batch_id = -1, partner_id = -1;
+        int months = 12;                   // how long it runs
+        std::vector<std::string> dates;    // when creating: the installments' own dates (one each); empty = evenly over the months
+        std::string user_name, source_type = "package", label, start_date, end_date, notes, created_at, next_date;
+        double total = 0.0, cost = 0.0, collected = 0.0, owedNow = 0.0, scheduled = 0.0;
+        bool open = true;                  // still running, or something is still unpaid
+        bool cancelled = false;
+    };
+    struct ContractInstallment { std::string date; std::vector<int> charges; double due = 0.0, paid = 0.0, balance = 0.0; bool future = false; };
+    struct ContractTotals { int count = 0; double total = 0.0, collected = 0.0, owedNow = 0.0, scheduled = 0.0; };
+    virtual std::vector<std::string> contractDefaultDates(const std::string& start, int months, int installments) = 0;
+    virtual int addContract(const Contract& c, const std::vector<ContractItem>& items) = 0;      // -1 + takeLastError()
+    virtual Contract getContract(int id) = 0;
+    virtual std::vector<ContractItem> getContractItems(int id) = 0;
+    virtual std::vector<ContractInstallment> getContractInstallments(int id) = 0;
+    virtual std::vector<Receipt> getContractReceipts(int id) = 0;
+    // userId 0 = everybody. state: 0 all, 1 open, 2 finished. sort columns: 0 client, 1 label, 2 start, 3 end, 4 total, 5 collected, 6 owed, 7 scheduled, 8 next date
+    virtual std::vector<Contract> pageContracts(int userId, int state, const std::string& text, const SortSpec& sort, int offset, int limit) = 0;
+    virtual ContractTotals contractTotals(int userId, int state, const std::string& text) = 0;
+    // Where our own money comes from. Collected by the date it came in (""=open); owed = what is due today, every date.
+    struct IncomeSplit { double contracts = 0, fees = 0, servicesOwed = 0, contractsOwed = 0, contractsScheduled = 0, feesOwed = 0; };
+    // Our fee for managing is an ordinary service charged to the building as a client; this finds or makes that service.
+    virtual int ensureFeeService() = 0;
+    // Ends a contract now: the installments still to come and unpaid go away; what already fell due stays owed.
+    virtual bool cancelContract(int id, const std::string& reason) = 0;
+    virtual IncomeSplit incomeSplit(const std::string& fromDate, const std::string& toDate) = 0;
+    struct ContractOwing { int user_id = -1; std::string name; double owed = 0, late = 0; };      // late: charged 30+ days ago
+    virtual std::vector<ContractOwing> contractOwings() = 0;
+    virtual std::vector<Contract> contractTemplates(int limit) = 0;     // the different contracts made so far, newest first (shortcuts for a new one)
+    virtual bool refreshDueCharges() = 0;                               // scheduled charges whose date has come become owed
+    virtual std::vector<std::pair<int, std::string>> topContractPackages(int limit) = 0;         // most used first, then the rest
+
+    // --- Μηνιαία έξοδα of a managed building. Logged once a month from the manager's other program: the total, why, and each
+    // resident's part. The residents owe at once (ordinary charges, payments, receipts). What they pay is held for this bill, it
+    // does not touch the Αποθεματικό (the building's deposit = fund_moves). Resolving means the cost got paid: if not all of
+    // it was collected, the rest comes out of the Αποθεματικό, the bill is closed, and what residents still owe from then on
+    // goes back into the Αποθεματικό when they pay.
+    struct BillReason { std::string reason; double amount = 0.0; };
+    struct MonthlyBill {
+        int id = -1, building_id = -1, op_id = -1;
+        std::string ym, status = "open", resolved_date, note, created_at;
+        double total = 0.0, covered = 0.0, collected = 0.0, owed = 0.0;
+    };
+    struct BillShare { int user_id = -1, apartment_id = -1; std::string name, apartment; std::vector<int> charges; double amount = 0.0, paid = 0.0, balance = 0.0; };
+    virtual int addMonthlyBill(int buildingId, const std::string& ym, const std::string& note, const std::vector<BillReason>& reasons, const std::vector<JointShare>& shares) = 0;
+    // ym "" = every month; openOnly: not resolved, or resolved with residents still owing
+    virtual std::vector<MonthlyBill> getMonthlyBills(int buildingId, const std::string& ym, bool openOnly = false) = 0;
+    virtual std::vector<BillReason> getBillReasons(int billId) = 0;
+    virtual std::vector<BillShare> getBillShares(int billId) = 0;
+    virtual bool resolveMonthlyBill(int billId, const std::string& date) = 0;
+    virtual bool cancelMonthlyBill(int billId) = 0;      // a logged mistake: only while nothing was collected and it is not paid; it leaves no debts
+    // What residents owe today, by building and by the month it belongs to. to: "cost" an unpaid month's cost, "deposit" the
+    // Αποθεματικό that covered it, "fund" an older funding, "us" our fee.
+    struct ResidentOwing { int building_id = -1, user_id = -1; std::string building, ym, name, apartment, to; double owed = 0.0; };
+    virtual std::vector<ResidentOwing> residentOwingsByMonth() = 0;
+    // A managed building judged as managed (never its bills as our client): how much the deposit gets used and how fast it refills.
+    struct ManageScore {
+        int building_id = -1, bills = 0, active = 0, usedDeposit = 0, refilled = 0; std::string address;
+        double deposit = 0, cost = 0, covered = 0, owedToDeposit = 0, activeOwed = 0;
+        double renewed = 0;                                  // added to the deposit after the first time
+        double depositMin = 0;                               // the level it should stay above, 0 = none
+        double avgRefillDays = -1, avgCollectDays = -1;      // -1 = nothing to measure yet
+    };
+    // The level a building's Αποθεματικό should stay above (0 = none set). Below it the building is marked as a problem.
+    virtual double getDepositMin(int buildingId) = 0;
+    virtual bool setDepositMin(int buildingId, double amount) = 0;
+    // suggestions for a new monthly cost: what the building still owes us, and what we offered it in the last 30 days
+    struct BillSuggestion { int charge_id = -1; std::string label, date; double due = 0, owed = 0; bool contract = false; };
+    virtual std::vector<BillSuggestion> billSuggestions(int buildingId) = 0;
+    // Τιμολόγια: the document a partner gave us for what we paid (type "invoice" or "receipt")
+    struct PartnerDoc { int id = -1, payment_id = -1, partner_id = -1, charge_id = -1; std::string partner, type, number, date, notes, pay_date, method, what; double amount = 0; };
+    virtual bool payOutWithDoc(int chargeId, double amount, const std::string& payDate, const std::string& method, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) = 0;
+    virtual std::vector<PartnerDoc> getPartnerDocs(int partnerId, const std::string& from, const std::string& to) = 0;
+    // what each client was charged, by kind; and each service / package / contract with what it earned and cost
+    struct ClientMix { int user_id = -1; double services = 0, packages = 0, contracts = 0; };
+    virtual std::vector<ClientMix> clientMix(const std::string& from, const std::string& to) = 0;
+    struct ProfitRow { std::string kind, label; int lines = 0, clients = 0; double charged = 0, cost = 0, collected = 0, owed = 0, costPaid = 0, costOwed = 0, avgDays = -1; };
+    virtual std::vector<ProfitRow> profitAnalysis(const std::string& from, const std::string& to) = 0;
+    virtual std::map<int, std::pair<double, double>> contractPayScores() = 0;     // client -> (paid on time, should have been paid)
+    virtual std::vector<ManageScore> manageScores(const std::string& fromYm, const std::string& toYm) = 0;
+
+    // Column filters of a list (spreadsheet style): per column, the values picked and / or a text it must contain.
+    struct ColFilters {
+        std::map<int, std::set<std::string>> in;
+        std::map<int, std::string> text;
+        bool active(int col) const { return (in.count(col) && !in.at(col).empty()) || (text.count(col) && !text.at(col).empty()); }
+        bool any() const { for (auto& k : in) if (!k.second.empty()) return true; for (auto& k : text) if (!k.second.empty()) return true; return false; }
+    };
     virtual std::vector<User> pageUsers(const std::string& query, int scope,
                                          const std::vector<std::string>& letters,
-                                         int offset, int limit, const SortSpec& sort = {}, int kinds = 7) = 0;
+                                         int offset, int limit, const SortSpec& sort = {}, int kinds = 7, const ColFilters* cf = nullptr) = 0;
+    // The distinct values of one client-list column with how many clients have each, under all the other filters.
+    virtual std::vector<std::pair<std::string, int>> distinctUserValues(int col, const std::string& search, const std::string& query, int scope,
+                                         const std::vector<std::string>& letters, int kinds, const ColFilters* cf, int limit) = 0;
     // kinds: which clients, as bits: 1 people, 2 buildings, 4 businesses (7 = all)
     virtual int countUsers(const std::string& query, int scope,
-                            const std::vector<std::string>& letters, int kinds = 7) = 0;
+                            const std::vector<std::string>& letters, int kinds = 7, const ColFilters* cf = nullptr) = 0;
 
     // Services: only single-owner services (joint ones live on their own tab).
     // query does a label/notes substring match.
