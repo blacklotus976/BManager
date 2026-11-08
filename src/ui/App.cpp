@@ -24,6 +24,12 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_internal.h"
 #include "imgui_impl_opengl3.h"
+#ifdef BM_UI_TEST
+#include "UiTest.h"          // the UI test copy only (tests/ui): a script drives the app with synthetic input
+#define UI_NOTE(label, mn, mx) uitest::Note(label, mn, mx)       // a widget ImGui does not name to the tests (combos)
+#else
+#define UI_NOTE(label, mn, mx) ((void)0)
+#endif
 
 // Plain text. In a table cell a value too long for its column slides left and right inside the cell, and shows whole on hover.
 static void CellText(const char* text, const char* textEnd = nullptr) {
@@ -72,6 +78,14 @@ static void CellText(const char* text, const char* textEnd = nullptr) {
 #include "JointKinds.h"
 #include "ErrorLog.h"  
 #include "MediaViewer.h"
+#include "XlsxWriter.h"
+#ifdef _WIN32
+#include <shlobj.h>
+#include <shellapi.h>
+#endif
+// Every list table's end passes through here (see ListTableEnded): the Excel export button of the shared list module.
+namespace ImGui { static void EndTableHooked(); }
+#define EndTable() EndTableHooked()
 
 
 // ---------------------------------------------------------------------------
@@ -434,11 +448,17 @@ static std::string ChargeLabel(const Payment& p) {
 // A value computed from the database that is recomputed only when the data changed (any write on the
 // connection), the caller's key changed (filters, selection), or the user pressed a refresh button.
 // Wrap every screen's heavy computation in one of these: an unchanged screen then costs nothing per frame.
+static long long g_frameDataVersion = -1;          // the database's version when this frame began
 template <class T> struct Cached {
     long long ver = -1; std::string key; T val{};
     template <class F> const T& get(const std::string& k, F&& compute) {
         long long v = g_app.conn->dataVersion() * 1000003 + g_app.reloadGen;
-        if (v != ver || k != key) { val = compute(); ver = v; key = k; }
+        if (v != ver || k != key) {
+            val = compute(); key = k;
+            // something was written earlier in this frame: what this was built from (another cached list) may still be the old
+            // one, so it is built again next frame instead of being kept as if it were current
+            ver = g_app.conn->dataVersion() != g_frameDataVersion ? -1 : v;
+        }
         return val;
     }
 };
@@ -985,10 +1005,11 @@ static bool RowDoubleClicked(ImGuiID rowId) {
 
 // ---------------------------------------------------------------------------
 // Spreadsheet-style list headers (PyCharm CSV viewer style). Every column header is
-//        <  NAME  ▲ ▼  >
-// "<" / ">" swap the column with its left / right neighbour (so there is no separate
-// "rearrange columns" mode), "▲" / "▼" sort ascending / descending. The sort goes to the
-// SQL ORDER BY (the lists are paged), the order is kept in memory per list.
+//        NAME
+//        ▲ ▼ (filter)
+// The name is a handle: press it and drag sideways and the column moves there (no arrows, no
+// separate "rearrange columns" mode). "▲" / "▼" sort ascending / descending. The sort goes to the
+// SQL ORDER BY (the lists are paged), the order is kept in memory per list (and in ui_prefs.ini).
 // The last column (the actions) is not sortable and stays put.
 // ---------------------------------------------------------------------------
 struct ListColDef { const char* name; ImGuiTableColumnFlags flags; float w; bool arrows; };
@@ -996,19 +1017,22 @@ struct ListColDef { const char* name; ImGuiTableColumnFlags flags; float w; bool
 // Compact headers (no move buttons): for tables that must fit the page width without sideways scrolling.
 static bool g_listCompact = false;
 static const bool g_listFilterable = true;  // every list has the filter button
-// Width a list column needs so its name and its four header buttons are never squashed.
+// Width a list column needs so its name and its header buttons (sort up, sort down, filter) are never squashed.
 static float ListColNeed(const ListColDef& d) {
     float name = ImGui::CalcTextSize(d.name).x + 4.0f;
-    float arrows = d.arrows ? ((g_listCompact ? 2.0f : 4.0f) + (g_listFilterable ? 1.0f : 0.0f)) * (ImGui::CalcTextSize("▲").x + 8.0f) + 6.0f : 0.0f;
+    float arrows = d.arrows ? (2.0f + (g_listFilterable ? 1.0f : 0.0f)) * (ImGui::CalcTextSize("▲").x + 8.0f) + 6.0f : 0.0f;
     return std::max(name, arrows) + ImGui::GetStyle().CellPadding.x * 2.0f + 6.0f;
 }
 // Every column gets a real width (stretch weights become ~80 px per unit) of at least what its header needs;
 // the tables scroll sideways when the window is narrower than the columns.
 static void ListSetupColumns(const std::vector<int>& order, const ListColDef* defs) {
-    for (int l : order) {
-        const ListColDef& d = defs[l];
+    for (size_t pos = 0; pos < order.size(); pos++) {
+        const ListColDef& d = defs[order[pos]];
         ImGuiTableColumnFlags f = (d.flags & ~ImGuiTableColumnFlags_WidthStretch) | ImGuiTableColumnFlags_WidthFixed;
-        ImGui::TableSetupColumn(d.name, f | ImGuiTableColumnFlags_NoReorder | ImGuiTableColumnFlags_NoSort, ListColNeed(d));
+        // the id belongs to the place, not to the name ("###lcN"): Dear ImGui (1.92+) follows a column by its id and would put a
+        // moved column back where it was, so a column dragged to another place would not move at all on screen
+        const std::string label = std::string(d.name) + "###lc" + std::to_string(pos);
+        ImGui::TableSetupColumn(label.c_str(), f | ImGuiTableColumnFlags_NoReorder | ImGuiTableColumnFlags_NoSort, ListColNeed(d));
     }
     ImGuiTable* t = ImGui::GetCurrentTable();
     if (!t) return;
@@ -1060,6 +1084,16 @@ static void ColFilterPopup(int col, const char* name, DataConn::ColFilters& cf, 
     if (cf.in.count(col) && cf.in[col].empty()) cf.in.erase(col);
 }
 
+// The list being drawn: ListHeaderRow notes it, the table's end (the EndTable hook) draws the button and exports.
+struct ListExportCtx {
+    ImGuiID table = 0; int frame = -1;
+    std::vector<int> order; std::vector<char> enabled; const ListColDef* defs = nullptr;
+    const DistinctFn* distinct = nullptr; Pager* pager = nullptr; SortSpec sort; const DataConn::ColFilters* cf = nullptr;
+    const void* key = nullptr;                   // the list's own column order: lets a toolbar button elsewhere ask for the export
+};
+static std::set<const void*> g_exportAsked;     // lists whose Excel button is in their toolbar (their table starts at the top of a box)
+static ListExportCtx g_lec;
+static const int kExportRows = -1000;           // asked of a list's distinct(): every row it would show (filters, sort), cells joined by \x1f
 static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSort& sort, Pager& pager,
                           DataConn::ColFilters* cf = nullptr, const DistinctFn* distinct = nullptr) {
     // the automatic pager: a page is as many rows as fit here without scrolling
@@ -1074,6 +1108,11 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
             if (fit != pager.pageSize) { pager.offset = pager.offset / fit * fit; pager.pageSize = fit; }
         }
     }
+    if (ImGuiTable* et = ImGui::GetCurrentTable()) {
+        g_lec = ListExportCtx{}; g_lec.table = et->ID; g_lec.frame = ImGui::GetFrameCount(); g_lec.order = order; g_lec.defs = defs; g_lec.distinct = distinct;
+        g_lec.pager = &pager; g_lec.sort = sort.keys; g_lec.cf = cf; g_lec.key = &order;
+        for (int d = 0; d < (int)order.size(); d++) g_lec.enabled.push_back((ImGui::TableGetColumnFlags(d) & ImGuiTableColumnFlags_IsEnabled) ? 1 : 0);
+    }
     ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
     const int n = (int)order.size();
     const ImVec4 accent(0.35f, 0.80f, 1.0f, 1.0f);
@@ -1085,23 +1124,49 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
         ImGui::PushID(l);
         if (!def.arrows) { CellText(def.name); ImGui::PopID(); continue; }
 
-        // two lines: the full column name, then the buttons (move left, sort up, sort down, move right)
+        // two lines: the full column name (press and drag it sideways to move the column), then sort up, sort down, filter
         int ki = -1;
         for (size_t q = 0; q < sort.keys.size(); q++) if (sort.keys[q].first == l) ki = (int)q;
         const bool sorted = ki >= 0;
         const bool sAsc = sorted && sort.keys[ki].second;
         const bool sDesc = sorted && !sort.keys[ki].second;
         std::string title = std::string(def.name) + ((sorted && sort.keys.size() > 1) ? " " + std::to_string(ki + 1) : std::string());
-        ImGui::PushStyleColor(ImGuiCol_Text, sorted ? accent : ImGui::GetStyleColorVec4(ImGuiCol_Text));
-        CellText(title.c_str());
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n▲ / ▼ ταξινόμηση κατά αυτή τη στήλη (κλικ ξανά: αφαίρεση)\nShift+κλικ: προσθήκη ως δεύτερο κριτήριο\n◄ / ► μετακίνηση στήλης", def.name);
+        {   const ImVec2 tp = ImGui::GetCursorScreenPos();
+            const float lineH = ImGui::GetTextLineHeight(), cw = std::max(8.0f, ImGui::GetContentRegionAvail().x);
+            const float tw = std::min(ImGui::CalcTextSize(title.c_str()).x, 420.0f);
+            ImGui::InvisibleButton("##name", ImVec2(std::max(tw, 24.0f), lineH));
+            const bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
+            const bool drag = act && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4.0f);
+            ImDrawList* hdl = ImGui::GetWindowDrawList();
+            ImGuiTable* tb = ImGui::GetCurrentTable();
+            if (drag && tb) {
+                // the column follows the mouse: it swaps with a neighbour once the mouse is where the column would be after the swap
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                const float mx = ImGui::GetIO().MousePos.x;
+                const ImGuiTableColumn& me = tb->Columns[d];
+                if (d + 1 < n && defs[order[d + 1]].arrows) { const ImGuiTableColumn& nb = tb->Columns[d + 1]; if (mx > me.MinX + (nb.MaxX - nb.MinX)) { swapA = d; swapB = d + 1; } }
+                if (swapA < 0 && d > 0 && defs[order[d - 1]].arrows) { const ImGuiTableColumn& nb = tb->Columns[d - 1]; if (mx < me.MaxX - (nb.MaxX - nb.MinX)) { swapA = d; swapB = d - 1; } }
+                // the column being moved is lit, its name rides on the mouse
+                hdl->AddRectFilled(ImVec2(me.MinX, tb->RowPosY1), ImVec2(me.MaxX, tb->RowPosY2), ImGui::GetColorU32(ImVec4(0.35f, 0.80f, 1.0f, 0.22f)));
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                const ImVec2 ts = ImGui::CalcTextSize(title.c_str()), mp = ImGui::GetIO().MousePos;
+                fg->AddRectFilled(ImVec2(mp.x + 10, mp.y - ts.y - 10), ImVec2(mp.x + 22 + ts.x, mp.y - 4), IM_COL32(30, 60, 85, 235), 4.0f);
+                fg->AddRect(ImVec2(mp.x + 10, mp.y - ts.y - 10), ImVec2(mp.x + 22 + ts.x, mp.y - 4), IM_COL32(90, 200, 255, 255), 4.0f);
+                fg->AddText(ImVec2(mp.x + 16, mp.y - ts.y - 7), IM_COL32(235, 245, 255, 255), title.c_str());
+            } else if (hov) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s\nΣύρετε το όνομα δεξιά ή αριστερά: μετακίνηση της στήλης\n▲ / ▼ ταξινόμηση κατά αυτή τη στήλη (κλικ ξανά: αφαίρεση)\nShift+κλικ στο ▲ / ▼: δεύτερο κριτήριο", def.name);
+            }
+            const ImU32 tc = ImGui::GetColorU32(sorted ? accent : (hov || act) ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+            hdl->PushClipRect(tp, ImVec2(tp.x + cw, tp.y + lineH), true);
+            hdl->AddText(tp, tc, title.c_str());
+            if (hov || act) hdl->AddLine(ImVec2(tp.x, tp.y + lineH), ImVec2(tp.x + tw, tp.y + lineH), ImGui::GetColorU32(ImVec4(0.35f, 0.80f, 1.0f, 0.7f)), 1.0f);
+            hdl->PopClipRect();
+        }
 
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(3, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 0));
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 1, 1, 0.06f));
-        const bool canL = d > 0 && defs[order[d - 1]].arrows;
-        const bool canR = d + 1 < n && defs[order[d + 1]].arrows;
         auto btn = [&](const char* label, bool enabled, bool active) {
             if (active) ImGui::PushStyleColor(ImGuiCol_Text, accent);
             if (!enabled) ImGui::BeginDisabled();
@@ -1110,11 +1175,9 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
             if (active) ImGui::PopStyleColor();
             return c;
         };
-        if (!g_listCompact) { if (btn("◄##l", canL, false)) { swapA = d; swapB = d - 1; } ImGui::SameLine(); }
         if (btn("▲##a", true, sAsc))  { SortToggle(sort, l, true, ImGui::GetIO().KeyShift);  pager.Reset(); }
         ImGui::SameLine();
         if (btn("▼##d", true, sDesc)) { SortToggle(sort, l, false, ImGui::GetIO().KeyShift); pager.Reset(); }
-        if (!g_listCompact) { ImGui::SameLine(); if (btn("►##r", canR, false)) { swapA = d; swapB = d + 1; } }
         if (cf && distinct) {
             ImGui::SameLine();
             if (btn("   ##f", true, cf->active(l))) ImGui::OpenPopup("##colfilter");
@@ -1137,7 +1200,7 @@ static void ListHeaderRow(std::vector<int>& order, const ListColDef* defs, ColSo
 }
 
 
-// In-memory version of the list tables (same header: name, ◄ ▲ ▼ ►; same pager), for lists that are already
+// In-memory version of the list tables (same header: the name to drag, ▲ ▼ and the filter; same pager), for lists that are already
 // loaded. cmp(col, a, b) returns <0 / 0 / >0 for one column; several sort keys apply in order.
 template <class Row, class Cmp>
 static void GridSort(std::vector<const Row*>& rows, const ColSort& s, Cmp cmp) {
@@ -1179,8 +1242,17 @@ static void DrawListSearch(GridState& g, float width = 300.0f) {
 }
 static std::string ListNum(double d) { if (d < 0) return ""; char b[32]; std::snprintf(b, sizeof(b), "%.0f", d); return b; }
 // a column's distinct values among the rows that pass every other filter
+static int CmpShown(const std::string& x, const std::string& y);
 template <class Rows, class TextOf>
 static std::vector<std::pair<std::string, int>> ListDistinct(const Rows& rows, const GridState& g, const TextOf& textOf, int ncols, int col, const std::string& search) {
+    if (col == -1000) {                     // kExportRows: the Excel export wants every row as shown, in the list's order
+        using R = std::decay_t<decltype(*std::begin(rows))>;
+        std::vector<const R*> v; for (auto& r : rows) if (ListRowMatches(r, g, textOf, ncols)) v.push_back(&r);
+        GridSort(v, g.sort, [&](int c, const R& a, const R& b) { return CmpShown(textOf(a, c), textOf(b, c)); });
+        std::vector<std::pair<std::string, int>> out; out.reserve(v.size());
+        for (auto* r : v) { std::string j; for (int c = 0; c < ncols; c++) { if (c) j += '\x1f'; j += textOf(*r, c); } out.push_back({ j, 0 }); }
+        return out;
+    }
     std::map<std::string, int> n; const std::string fq = FoldGreek(search);
     for (auto& r : rows) if (ListRowMatches(r, g, textOf, ncols, col)) { std::string v = textOf(r, col); if (fq.empty() || FoldGreek(v).find(fq) != std::string::npos) n[v]++; }
     return std::vector<std::pair<std::string, int>>(n.begin(), n.end());
@@ -1283,6 +1355,215 @@ static bool ListNumber(const std::string& t, double& out) {
     if (n.empty() || n == "-") return false;
     out = std::atof(n.c_str()); return true;
 }
+// "07/11/2026", "2026-11-07", "2026-11" (and with a time after it) as a number that sorts in time order, or -1
+static long long ShownDateKey(const std::string& t) {
+    int d = 0, m = 0, y = 0, hh = 0, mm = 0, ss = 0;
+    if (t.size() == 10 && t[2] == '/' && t[5] == '/' && std::sscanf(t.c_str(), "%d/%d/%d", &d, &m, &y) == 3) return (y * 10000LL + m * 100 + d) * 1000000LL;
+    if (t.size() >= 10 && t[4] == '-' && t[7] == '-' && std::sscanf(t.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
+        if (t.size() >= 19) std::sscanf(t.c_str() + 11, "%d:%d:%d", &hh, &mm, &ss);
+        return (y * 10000LL + m * 100 + d) * 1000000LL + hh * 10000 + mm * 100 + ss;
+    }
+    if (t.size() == 7 && t[4] == '-' && std::sscanf(t.c_str(), "%d-%d", &y, &m) == 2) return (y * 10000LL + m * 100) * 1000000LL;
+    return -1;
+}
+static int CmpShown(const std::string& x, const std::string& y) {
+    const long long dx = ShownDateKey(x), dy = ShownDateKey(y);
+    if (dx >= 0 && dy >= 0) return Cmp3(dx, dy);
+    double nx = 0, ny = 0; if (ListNumber(x, nx) && ListNumber(y, ny)) return Cmp3(nx, ny);
+    return CmpText(x, y);
+}
+// =====================================================================================================
+// ΕΞΑΓΩΓΗ ΣΕ EXCEL -- every list on the shared module gets an «Excel» button at its top right. It exports what the list shows: the
+// columns in their current order (hidden ones left out, the actions column too), the current filters and sort; with several pages
+// it asks: this page only, or all of them (the same sort and filters). Then the Save As dialog, a real .xlsx with a header that
+// filters, frozen, numbers, money and dates as Excel values, and a second sheet saying what was exported.
+// =====================================================================================================
+static std::string ExportTitle();                                  // the page / tabs / window the table is in (defined with the nav)
+static std::string g_exportDone, g_exportErr; static double g_exportUntil = 0;
+static std::string ExportFileName(const std::string& title) {
+    std::string n; for (char ch : title) { if (ch == '\\' || ch == '/' || ch == ':' || ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|') n += '-'; else n += ch; }
+    while (!n.empty() && (n.back() == ' ' || n.back() == '.')) n.pop_back();
+    if (n.empty()) n = "Εξαγωγή";
+    return n + " " + CurrentDateString() + ".xlsx";
+}
+// Save As: where the workbook goes (empty = cancelled). Remembers the last folder; Documents the first time.
+static std::string SaveXlsxDialog(const std::string& defaultName) {
+#ifdef BM_UI_TEST
+    if (const char* d = std::getenv("BM_UI_EXPORT_DIR")) {          // tests: no dialog; a second export of the same list gets " (2)"
+        std::string base = std::string(d) + "\\" + defaultName.substr(0, defaultName.size() - 5), path = base + ".xlsx";
+        for (int i = 2; std::filesystem::exists(std::filesystem::u8path(path)); i++) path = base + " (" + std::to_string(i) + ").xlsx";
+        return path;
+    }
+#endif
+    std::string result;
+#ifdef _WIN32
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool weInit = SUCCEEDED(hrInit);
+    if (FAILED(hrInit) && hrInit != RPC_E_CHANGED_MODE) return result;
+    IFileSaveDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+        COMDLG_FILTERSPEC spec[] = { { L"Βιβλίο εργασίας Excel (*.xlsx)", L"*.xlsx" } };
+        dlg->SetFileTypes(1, spec); dlg->SetFileTypeIndex(1); dlg->SetDefaultExtension(L"xlsx");
+        dlg->SetTitle(L"Εξαγωγή σε Excel");
+        dlg->SetFileName(xlsx::detail::Widen(defaultName).c_str());
+        IShellItem* docs = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderItem(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&docs)))) { dlg->SetDefaultFolder(docs); docs->Release(); }
+        DWORD o = 0; dlg->GetOptions(&o); dlg->SetOptions(o | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        if (SUCCEEDED(dlg->Show(GetActiveWindow()))) {
+            IShellItem* it = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&it))) {
+                PWSTR w = nullptr;
+                if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &w))) {
+                    const int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+                    if (len > 1) { std::string b(len, '\0'); WideCharToMultiByte(CP_UTF8, 0, w, -1, b.data(), len, nullptr, nullptr); result = b.c_str(); }
+                    CoTaskMemFree(w);
+                }
+                it->Release();
+            }
+        }
+        dlg->Release();
+    }
+    if (weInit) CoUninitialize();
+#endif
+    return result;
+}
+// asks where, writes it, says how it went (a note at the bottom right with Open / Folder)
+static bool SaveWorkbook(const std::string& title, const std::vector<xlsx::Sheet>& sheets) {
+    const std::string path = SaveXlsxDialog(ExportFileName(title));
+    if (path.empty()) return false;
+    std::string err;
+    if (!xlsx::Write(path, sheets, err)) { g_exportErr = err; g_exportDone.clear(); g_exportUntil = ImGui::GetTime() + 15; errlog::Write("export", err); return false; }
+    g_exportDone = path; g_exportErr.clear(); g_exportUntil = ImGui::GetTime() + 15;
+    return true;
+}
+static void DrawExportNote() {
+    if ((g_exportDone.empty() && g_exportErr.empty()) || ImGui::GetTime() > g_exportUntil) return;
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 16, vp->WorkPos.y + vp->WorkSize.y - 16), ImGuiCond_Always, ImVec2(1, 1));
+    ImGui::SetNextWindowBgAlpha(0.96f);
+    if (ImGui::Begin("##exportnote", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+        if (!g_exportErr.empty()) ImGui::TextColored(kColOut, "Η εξαγωγή απέτυχε: %s", g_exportErr.c_str());
+        else {
+            const std::string file = std::filesystem::u8path(g_exportDone).filename().u8string();
+            ImGui::TextColored(kColIn, "Αποθηκεύτηκε σε Excel:"); ImGui::SameLine(); ImGui::TextUnformatted(file.c_str());
+#ifdef _WIN32
+            if (ImGui::SmallButton("Άνοιγμα")) { ShellExecuteW(nullptr, L"open", xlsx::detail::Widen(g_exportDone).c_str(), nullptr, nullptr, SW_SHOWNORMAL); g_exportUntil = 0; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Φάκελος")) { const std::wstring a = L"/select,\"" + xlsx::detail::Widen(g_exportDone) + L"\""; ShellExecuteW(nullptr, L"open", L"explorer.exe", a.c_str(), nullptr, SW_SHOWNORMAL); g_exportUntil = 0; }
+            ImGui::SameLine();
+#endif
+        }
+        if (ImGui::SmallButton("×")) g_exportUntil = 0;
+    }
+    ImGui::End();
+}
+// a value as shown on screen -> its Excel cell (numbers, money, dates become values; codes and phones stay text)
+static xlsx::Cell ShownCell(const std::string& s) { xlsx::Cell c; if (xlsx::ParseShown(s, c)) return c; return xlsx::T(s); }
+// the second sheet: what, when, how much
+static xlsx::Sheet ExportInfoSheet(const std::string& title, const std::vector<std::pair<std::string, std::string>>& lines) {
+    xlsx::Sheet info; info.name = "Πληροφορίες"; info.freezeRows = 0;
+    info.rows.push_back({ xlsx::T(title, xlsx::Title) });
+    info.rows.push_back({});
+    info.rows.push_back({ xlsx::T("Εξαγωγή", xlsx::SumLabel), xlsx::T(CurrentTimestampString()) });
+    for (auto& [k, v] : lines) info.rows.push_back({ xlsx::T(k, xlsx::SumLabel), xlsx::T(v) });
+    info.widths = { 28, 70 };
+    return info;
+}
+
+
+static void ListExport(const ListExportCtx& c, const std::vector<std::pair<std::string, int>>& rows, bool all, const std::string& title) {
+    std::vector<int> cols;                                       // the logical columns, in their place, that are shown and have a name
+    for (size_t d = 0; d < c.order.size(); d++) { const int l = c.order[d]; if (d < c.enabled.size() && !c.enabled[d]) continue; if (!c.defs[l].arrows || !c.defs[l].name[0]) continue; cols.push_back(l); }
+    xlsx::Sheet sh; sh.filterRow = 1; sh.freezeRows = 1;
+    sh.name = title.rfind(" - ") != std::string::npos ? title.substr(title.rfind(" - ") + 3) : title;     // the list's own name (the last part of where it is)
+    { std::vector<xlsx::Cell> h; for (int l : cols) h.push_back(xlsx::T(c.defs[l].name, xlsx::Header)); sh.rows.push_back(h); }
+    // phones, ΑΦΜ, IBAN and codes are text even when they look like numbers
+    auto textCol = [&](int l) { const std::string n = FoldGreek(c.defs[l].name); for (const char* k : { "τηλ", "αφμ", "iban", "κωδ", "τκ", "αριθμ" }) if (n.find(FoldGreek(k)) != std::string::npos) return true; return false; };
+    size_t from = 0, to = rows.size();
+    if (!all && c.pager) { from = std::min(rows.size(), (size_t)std::max(0, c.pager->offset)); to = std::min(rows.size(), from + (size_t)std::max(1, c.pager->pageSize)); }
+    for (size_t i = from; i < to; i++) {
+        std::vector<std::string> cells; std::string cur; for (char ch : rows[i].first) { if (ch == '\x1f') { cells.push_back(cur); cur.clear(); } else cur += ch; } cells.push_back(cur);
+        std::vector<xlsx::Cell> r; for (int l : cols) r.push_back(l >= (int)cells.size() ? xlsx::T("") : textCol(l) ? xlsx::T(cells[l]) : ShownCell(cells[l]));
+        sh.rows.push_back(r);
+    }
+    std::string sortText; for (auto& [col, asc] : c.sort) { if (col < 0) continue; bool known = false; for (size_t d = 0; d < c.order.size(); d++) if (c.order[d] == col) known = true; if (!known) continue;
+        if (!sortText.empty()) sortText += ", "; sortText += std::string(c.defs[col].name) + (asc ? " (αύξουσα)" : " (φθίνουσα)"); }
+    std::string filt; if (c.cf) { for (auto& [col, vals] : c.cf->in) if (!vals.empty()) { if (!filt.empty()) filt += "; "; filt += std::string(c.defs[col].name) + ": " + std::to_string(vals.size()) + " τιμές"; }
+        for (auto& [col, t] : c.cf->text) if (!t.empty()) { if (!filt.empty()) filt += "; "; filt += std::string(c.defs[col].name) + " περιέχει «" + t + "»"; } }
+    const int pages = c.pager && c.pager->pageSize > 0 ? (int)((rows.size() + c.pager->pageSize - 1) / c.pager->pageSize) : 1;
+    std::vector<xlsx::Sheet> sheets = { sh, ExportInfoSheet(title, {
+        { "Γραμμές", std::to_string(to - from) + (all ? "" : " (μία σελίδα από τις " + std::to_string(pages) + ")") },
+        { "Σελίδες", all ? "όλες (" + std::to_string(pages) + ")" : "μόνο η σελίδα " + std::to_string(c.pager ? c.pager->offset / std::max(1, c.pager->pageSize) + 1 : 1) },
+        { "Ταξινόμηση", sortText.empty() ? "όπως στη λίστα" : sortText }, { "Φίλτρα στηλών", filt.empty() ? "κανένα" : filt } }) };
+    SaveWorkbook(title, sheets);
+}
+// the «Excel» button: a small green sheet and the word, drawn so it looks the same on every machine
+static bool ExcelButton(const char* id, const char* tip) {
+    const float h = ImGui::GetFrameHeight() * 0.82f, w = ImGui::CalcTextSize("Excel").x + h + 14;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), hov ? IM_COL32(40, 110, 70, 255) : IM_COL32(30, 80, 52, 235), 4.0f);
+    dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(90, 190, 120, hov ? 255 : 150), 4.0f);
+    const float s = h - 8; const ImVec2 b(p.x + 5, p.y + 4);
+    dl->AddRectFilled(b, ImVec2(b.x + s, b.y + s), IM_COL32(33, 115, 70, 255), 2.0f);
+    dl->AddLine(ImVec2(b.x + s * 0.28f, b.y + s * 0.25f), ImVec2(b.x + s * 0.72f, b.y + s * 0.75f), IM_COL32(255, 255, 255, 255), 1.6f);
+    dl->AddLine(ImVec2(b.x + s * 0.72f, b.y + s * 0.25f), ImVec2(b.x + s * 0.28f, b.y + s * 0.75f), IM_COL32(255, 255, 255, 255), 1.6f);
+    dl->AddText(ImVec2(b.x + s + 5, p.y + (h - ImGui::GetTextLineHeight()) * 0.5f), IM_COL32(230, 250, 235, 255), "Excel");
+    if (hov && tip) ImGui::SetTooltip("%s", tip);
+    return pressed;
+}
+// After a list's table: the button above its top right corner (the place is borrowed, the layout is not changed), the question,
+// the export. Runs while the list's own function is still on the stack, so its rows can still be read.
+static void ListTableEnded(const ImRect& outer) {
+    const ListExportCtx c = g_lec; g_lec.table = 0;
+    if (!c.distinct || !*c.distinct || !c.defs) return;
+    ImGuiWindow* w = ImGui::GetCurrentWindow();
+    const ImVec2 sp = w->DC.CursorPos, spl = w->DC.CursorPosPrevLine; const ImVec2 cls = w->DC.CurrLineSize, pls = w->DC.PrevLineSize;
+    const float clb = w->DC.CurrLineTextBaseOffset, plb = w->DC.PrevLineTextBaseOffset; const bool same = w->DC.IsSameLine, setp = w->DC.IsSetPos;
+    const ImVec2 cmax = w->DC.CursorMaxPos, imax = w->DC.IdealMaxPos;
+    const float bh = ImGui::GetFrameHeight() * 0.82f, bw = ImGui::CalcTextSize("Excel").x + bh + 14;
+    w->DC.CursorPos = ImVec2(std::max(outer.Min.x, outer.Max.x - bw - 2), outer.Min.y - bh - 3);
+    ImGui::PushID((int)c.table);
+    bool click = c.key && g_exportAsked.erase(c.key) > 0;
+    if (w->DC.CursorPos.y >= w->ClipRect.Min.y - 1)              // room above the table in this window
+        click |= ExcelButton("##excel", "Εξαγωγή της λίστας σε Excel: οι στήλες όπως είναι τώρα (σειρά, φίλτρα, ταξινόμηση)");
+    w->DC.CursorPos = sp; w->DC.CursorPosPrevLine = spl; w->DC.CurrLineSize = cls; w->DC.PrevLineSize = pls; w->DC.CurrLineTextBaseOffset = clb;
+    w->DC.PrevLineTextBaseOffset = plb; w->DC.IsSameLine = same; w->DC.IsSetPos = setp; w->DC.CursorMaxPos = cmax; w->DC.IdealMaxPos = imax;
+    static std::map<ImGuiID, bool> allPages;
+    const std::string title = ExportTitle();
+    if (click) {
+        const auto rows = (*c.distinct)(kExportRows, "");
+        if (c.pager && (int)rows.size() > c.pager->pageSize) { allPages.emplace(c.table, true); ImGui::OpenPopup("Εξαγωγή σε Excel"); }
+        else ListExport(c, rows, true, title);
+    }
+    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Εξαγωγή σε Excel", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static std::vector<std::pair<std::string, int>> rows; if (ImGui::IsWindowAppearing()) rows = (*c.distinct)(kExportRows, "");
+        bool& all = allPages[c.table];
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1), "%s", title.c_str());
+        const int ps = std::max(1, c.pager ? c.pager->pageSize : 1), pages = (int)((rows.size() + ps - 1) / ps), page = c.pager ? c.pager->offset / ps + 1 : 1;
+        ImGui::TextDisabled("Η λίστα έχει %d γραμμές σε %d σελίδες. Οι στήλες θα είναι όπως φαίνονται τώρα.", (int)rows.size(), pages);
+        if (ImGui::RadioButton("Όλες οι σελίδες", all)) all = true;
+        ImGui::SameLine(); ImGui::TextDisabled("%d γραμμές, με την ίδια ταξινόμηση και τα ίδια φίλτρα", (int)rows.size());
+        if (ImGui::RadioButton("Μόνο η σελίδα που φαίνεται", !all)) all = false;
+        ImGui::SameLine(); ImGui::TextDisabled("σελίδα %d (%d γραμμές)", page, (int)std::min<size_t>(ps, rows.size() - std::min(rows.size(), (size_t)(page - 1) * ps)));
+        ImGui::Spacing();
+        if (ImGui::Button("Εξαγωγή…", ImVec2(160, 0))) { ListExport(c, rows, all, title); ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine(); if (ImGui::Button("Άκυρο", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+}
+namespace ImGui { static void EndTableHooked() {
+    ImGuiTable* t = ImGui::GetCurrentTable();
+    const bool mine = t && g_lec.table == t->ID && g_lec.frame == ImGui::GetFrameCount();
+    const ImRect outer = t ? t->OuterRect : ImRect();
+    (ImGui::EndTable)();
+    if (mine) ListTableEnded(outer);
+} }
+
 #define LC(name) { name, ImGuiTableColumnFlags_WidthFixed, 0.0f, true }
 #define LCA { "", ImGuiTableColumnFlags_WidthFixed, 0.0f, false }
 // A small list on the shared module: its rows are in memory, text(row, col) is what a column shows, cell(row, col) draws it.
@@ -1291,12 +1572,14 @@ static void DrawMiniList(const char* id, GridState& g, const ListColDef* cols, i
     if (g.order.empty()) { for (int i = 0; i < n; i++) g.order.push_back(i); g.pager.pageSize = 10; }
     ImGui::PushID(id);
     DrawListSearch(g);
+    if (ImGui::GetCursorScreenPos().y - ImGui::GetCurrentWindow()->ClipRect.Min.y < ImGui::GetFrameHeight()) {      // no room above the table for the button
+        const float bw = ImGui::CalcTextSize("Excel").x + ImGui::GetFrameHeight() * 0.82f + 14;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - bw));
+        if (ExcelButton("##excelbar", "Εξαγωγή της λίστας σε Excel: οι στήλες όπως είναι τώρα (σειρά, φίλτρα, ταξινόμηση)")) g_exportAsked.insert(&g.order);
+    }
     std::vector<const Row*> rows;
     for (auto& r : all) if (ListRowMatches(r, g, text, n)) rows.push_back(&r);
-    GridSort(rows, g.sort, [&](int c, const Row& a, const Row& b) {
-        const std::string x = text(a, c), y = text(b, c);
-        double nx = 0, ny = 0; if (ListNumber(x, nx) && ListNumber(y, ny)) return Cmp3(nx, ny);
-        return CmpText(x, y); });
+    GridSort(rows, g.sort, [&](int c, const Row& a, const Row& b) { return CmpShown(text(a, c), text(b, c)); });
     g.pager.total = (int)rows.size(); if (g.pager.offset >= g.pager.total) g.pager.Reset();
     const DistinctFn distinct = [&](int col, const std::string& q) { return ListDistinct(all, g, text, n, col, q); };
     // many columns keep their natural widths and scroll sideways (a squeezed header is unreadable); columns nobody filled in take no room
@@ -2248,6 +2531,9 @@ static bool LinkCell(const std::string& text, const std::string& needle = "") {
     TextHighlighted(text, needle);
     ImGui::PopStyleColor();
     ImVec2 p1 = ImVec2(p0.x + w, ImGui::GetCursorScreenPos().y);
+#ifdef BM_UI_TEST
+    uitest::Note(text.c_str(), p0, ImVec2(p0.x + std::min(w, ImGui::CalcTextSize(text.c_str()).x + 2), p1.y));
+#endif
     bool hov = !text.empty() && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) && ImGui::IsMouseHoveringRect(p0, p1);
     if (hov) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -2508,9 +2794,10 @@ static void DrawUsersScreen() {
         const float sp = ImGui::GetStyle().ItemSpacing.x;
         const float fpad = ImGui::GetStyle().FramePadding.x * 2.0f;
         auto NaturalW = [&](const char* s) { return ImGui::CalcTextSize(s).x + fpad; };
+        const float excelW = g_usersTableView ? ImGui::CalcTextSize("Excel").x + ImGui::GetFrameHeight() * 0.82f + 14 + sp : 0.0f;
         float groupW = NaturalW("Στοιχεία κατοικίας")
                      + NaturalW(g_usersTableView ? "Κάρτες" : "Λίστα")
-                     + sp;
+                     + sp + excelW;
 
         float contentRight = ImGui::GetContentRegionMax().x;
         float targetX = contentRight - groupW;
@@ -2519,6 +2806,11 @@ static void DrawUsersScreen() {
         }
         // else: no SameLine -> buttons wrap to the next line naturally.
 
+        if (g_usersTableView) {
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.09f);
+            if (ExcelButton("##excelbar", "Εξαγωγή της λίστας σε Excel: οι στήλες όπως είναι τώρα (σειρά, φίλτρα, ταξινόμηση)")) g_exportAsked.insert(&g_usersColOrder);
+            ImGui::SameLine();
+        }
         if (g_usersShowResidence) ImGui::PushStyleColor(ImGuiCol_Button, onCol);
         if (ImGui::Button("Στοιχεία κατοικίας")) g_usersShowResidence = !g_usersShowResidence;
         if (g_usersShowResidence) ImGui::PopStyleColor();
@@ -2561,6 +2853,16 @@ static void DrawUsersScreen() {
     g_usersPager.total = g_app.conn->countUsers(g_userSearch, g_userSearchField, lettersVec, kinds, &g_usersColFilters);
     if (g_usersPager.total > 0 && g_usersPager.offset >= g_usersPager.total) g_usersPager.Reset();
     const DistinctFn usersDistinct = [&](int col, const std::string& q) {
+        if (col == kExportRows) {
+            std::vector<std::pair<std::string, int>> out;
+            for (auto& u : g_app.conn->pageUsers(g_userSearch, g_userSearchField, lettersVec, 0, 1000000, g_usersSort.keys, kinds, &g_usersColFilters)) {
+                const bool place = u.kind == "building" || u.kind == "business";
+                const std::string c[UCOL_COUNT] = { std::to_string(u.id), place ? u.full_name : u.address, u.apartment, place ? std::string() : u.full_name, u.phone, u.area, u.postal_code,
+                                                    u.special_code, KindLabel(u.kind), u.email, u.afm, u.code, ExtraText(u.extra_json), u.manager_name };
+                std::string j; for (int k = 0; k < UCOL_COUNT; k++) { if (k) j += '\x1f'; j += c[k]; } out.push_back({ j, 0 });
+            }
+            return out;
+        }
         return g_app.conn->distinctUserValues(col, q, g_userSearch, g_userSearchField, lettersVec, kinds, &g_usersColFilters, 300); };
 
     // --- Render: table or cards (only the current page), pager below. ---
@@ -2844,11 +3146,12 @@ static void DrawServicesScreen() {
     {
         float lastRight = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
         float contentRight = ImGui::GetContentRegionMax().x;
-        const float toggleW = 90.0f;
-        float targetX = contentRight - toggleW;
+        const float toggleW = 90.0f, excelW = g_servicesTableView ? ImGui::CalcTextSize("Excel").x + ImGui::GetFrameHeight() * 0.82f + 14 + ImGui::GetStyle().ItemSpacing.x : 0.0f;
+        float targetX = contentRight - toggleW - excelW;
         if (targetX > lastRight + ImGui::GetStyle().ItemSpacing.x) {
             ImGui::SameLine(targetX);
         }
+        if (g_servicesTableView) { if (ExcelButton("##excelbar", "Εξαγωγή της λίστας σε Excel: οι στήλες όπως είναι τώρα (σειρά, φίλτρα, ταξινόμηση)")) g_exportAsked.insert(&g_servicesColOrder); ImGui::SameLine(); }
         if (ImGui::Button(g_servicesTableView ? "Κάρτες" : "Λίστα", ImVec2(toggleW, 0)))
             g_servicesTableView = !g_servicesTableView;
     }
@@ -3003,7 +3306,10 @@ static bool DrawReceiptForm(const char* id, ReceiptForm& f, double total, int pa
         if (ToCents(total) <= 0) { ImGui::TextColored(kInvalidMoneyCol, "Η απόδειξη χρειάζεται πληρωμένο ποσό μεγαλύτερο από 0."); ok = false; }
         ImGui::TextUnformatted("Ημερομηνία απόδειξης:"); ImGui::SameLine();
         DatePicker("rdate", f.date, ImVec2(0, 1));
-        if (f.date.size() != 10) { ImGui::SameLine(); ImGui::TextColored(kInvalidMoneyCol, "ορίστε την ημερομηνία"); ok = false; }
+        if (f.date.size() != 10) {
+            ImGui::SameLine(); if (ImGui::SmallButton("Σήμερα")) f.date = CurrentDateString();
+            ImGui::SameLine(); ImGui::TextColored(kInvalidMoneyCol, "ορίστε την ημερομηνία"); ok = false;
+        }
         ImGui::SetNextItemWidth(220);
         ImGui::Combo("Τρόπος πληρωμής", &f.method, kReceiptMethodNames, IM_ARRAYSIZE(kReceiptMethodNames));
         bool electronic = f.method >= 2 && f.method <= 5;
@@ -3424,7 +3730,7 @@ static void DrawJointViewWindow() {
 }
 
 // ---- list of operations (Joint Services tab: all buildings; Buildings tab: one building) ----
-// Spreadsheet view: every column sortable (◄ ▲ ▼ ►), paged. «Ποσοστό ολοκλήρωσης» = collected / total, so sorting it
+// Spreadsheet view: every column sortable (▲ ▼) and movable (drag its name), paged. «Ποσοστό ολοκλήρωσης» = collected / total, so sorting it
 // ascending shows the joint charges with the most still owed first.
 enum { JC_DATE, JC_BLD, JC_LABEL, JC_KIND, JC_TOTAL, JC_PAID, JC_LEFT, JC_PCT, JC_INC, JC_EXC, JC_ACT, JC_COUNT };
 static const ListColDef kJointCols[JC_COUNT] = {
@@ -4017,13 +4323,16 @@ static void DrawPaymentDialog() {
         ImGui::InputTextMultiline("Σημειώσεις/Σχόλιο", pb_notes.data, sizeof(pb_notes.data), ImVec2(0, 60));
         // Receipt: asked for money coming in now; future payments get theirs when resolved, payments made on the
         // client's behalf are backed by the supplier's document instead.
-        const bool askReceipt = !g_paymentDialogIsEdit && !pb_isFuture && pb_direction == 0 && !pb_plan.on;
+        // (only when money comes in now: nothing paid = nothing to give a receipt for yet, it is given when he pays)
+        double pbPaidNow = 0.0; ParseMoney(pb_paid.str(), pbPaidNow);
+        const bool askReceipt = !g_paymentDialogIsEdit && !pb_isFuture && pb_direction == 0 && !pb_plan.on && ToCents(pbPaidNow) > 0;
         if (pb_plan.on) {
             double due = 0.0; ParseMoney(pb_due.str(), due);
             amountsOk = DrawPlanReceipt("pbplanrec", pb_plan, pb_receipt, FromCents(PlanAmounts(due, pb_plan.count)[0])) && amountsOk;
         } else if (askReceipt) {
-            double paidNow = 0.0; ParseMoney(pb_paid.str(), paidNow);
-            amountsOk = DrawReceiptForm("pbrec", pb_receipt, paidNow, 1) && amountsOk;
+            amountsOk = DrawReceiptForm("pbrec", pb_receipt, pbPaidNow, 1) && amountsOk;
+        } else if (!g_paymentDialogIsEdit && !pb_isFuture && pb_direction == 0) {
+            ImGui::Spacing(); ImGui::TextDisabled("Δεν πληρώθηκε τίποτα τώρα: η απόδειξη κόβεται όταν πληρώσει (Είσπραξη).");
         } else if (g_paymentDialogIsEdit) {
             int rid = g_app.conn->getReceiptIdForPayment(g_paymentDialogId);
             Receipt rc = rid > 0 ? g_app.conn->getReceiptById(rid) : Receipt{};
@@ -4640,11 +4949,12 @@ static void DrawPaymentsScreen(int jointFilter = 0) {
     {
         float lastRight = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
         float contentRight = ImGui::GetContentRegionMax().x;
-        const float toggleW = 90.0f;
-        float targetX = contentRight - toggleW;
+        const float toggleW = 90.0f, excelW = g_paymentsTableView ? ImGui::CalcTextSize("Excel").x + ImGui::GetFrameHeight() * 0.82f + 14 + ImGui::GetStyle().ItemSpacing.x : 0.0f;
+        float targetX = contentRight - toggleW - excelW;
         if (targetX > lastRight + ImGui::GetStyle().ItemSpacing.x) {
             ImGui::SameLine(targetX);
         }
+        if (g_paymentsTableView) { if (ExcelButton("##excelbar", "Εξαγωγή της λίστας σε Excel: οι στήλες όπως είναι τώρα (σειρά, φίλτρα, ταξινόμηση)")) g_exportAsked.insert(&g_paymentsColOrder); ImGui::SameLine(); }
         if (ImGui::Button(g_paymentsTableView ? "Κάρτες" : "Λίστα", ImVec2(toggleW, 0)))
             g_paymentsTableView = !g_paymentsTableView;
     }
@@ -5054,6 +5364,141 @@ static const ListColDef kClientChargeCols[CC_COUNT] = {
     { "Οφειλές", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },      { "Κόστος", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },
     { "Πληρωμές", ImGuiTableColumnFlags_WidthFixed, 100.0f, true },    { "Κέρδος", ImGuiTableColumnFlags_WidthFixed, 100.0f, true } };
 
+// =====================================================================================================
+// ΧΡΗΣΗ ΑΝΑ ΠΕΡΙΟΔΟ -- in a client's, a service's or a package's window: that row (or column) of the cube across time. For a client:
+// what he took (services, packages or contracts) in each period; for a service or package: who took it and when. Money or quantity,
+// with the sums row and column (the same numbers as the cube's tables), and an Excel export of both.
+// modeIds: the cube views offered, each with the id the focus has in it (a package's contracts use 1000000 + its id).
+// =====================================================================================================
+struct UsageState { std::string from, to; int unit = 2, pick = 0; bool money = true; };
+static const char* kUsageModeName[] = { "Υπηρεσίες", "Πακέτα", "Συμβάσεις" };
+static const char* kUsageUnits[] = { "Ημέρα", "Εβδομάδα", "Μήνας", "Τρίμηνο", "Έτος" };
+static void DrawUsageStats(const char* id, int focusAx, const std::vector<std::pair<int, int>>& modeIds, const std::string& who) {
+    static std::map<std::string, UsageState> states; UsageState& st = states[id];
+    if (st.from.empty()) { st.to = CurrentDateString(); const int y = std::atoi(st.to.substr(0, 4).c_str()) - 1, m = std::atoi(st.to.substr(5, 2).c_str());
+        char b[16]; std::snprintf(b, sizeof b, "%04d-%02d-01", m == 12 ? y + 1 : y, m == 12 ? 1 : m + 1); st.from = b; }      // the last 12 months
+    st.pick = std::clamp(st.pick, 0, (int)modeIds.size() - 1);
+    const int mode = modeIds[st.pick].first, fid = modeIds[st.pick].second;
+    ImGui::PushID(id);
+    ImGui::AlignTextToFramePadding(); CellText("Από:"); ImGui::SameLine(); DatePicker("usfrom", st.from, ImVec2(0, 1));
+    ImGui::SameLine(); ImGui::AlignTextToFramePadding(); CellText("Έως:"); ImGui::SameLine(); DatePicker("usto", st.to, ImVec2(0, 1));
+    if (st.from > st.to) std::swap(st.from, st.to);
+    ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::Combo("##usunit", &st.unit, kUsageUnits, IM_ARRAYSIZE(kUsageUnits));
+    // the next group on this line if it fits, else on a line of its own (a narrow window)
+    const float rightEdge = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    auto radiosW = [](std::initializer_list<const char*> names) { float w = 0; for (const char* n : names) w += ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(n).x + ImGui::GetStyle().ItemSpacing.x; return w; };
+    auto nextGroup = [&](float w, float gap) { if (ImGui::GetItemRectMax().x + gap + w <= rightEdge) ImGui::SameLine(0, gap); };
+    if (modeIds.size() > 1) {
+        float w = 0; for (auto& mi : modeIds) w += radiosW({ kUsageModeName[mi.first] });
+        nextGroup(w, ImGui::GetStyle().ItemSpacing.x);
+        for (int k = 0; k < (int)modeIds.size(); k++) { if (k) ImGui::SameLine(); if (ImGui::RadioButton(kUsageModeName[modeIds[k].first], st.pick == k)) st.pick = k; }
+    }
+    nextGroup(radiosW({ "Χρήματα", "Ποσότητα" }), 18); if (ImGui::RadioButton("Χρήματα", st.money)) st.money = true; ImGui::SameLine(); if (ImGui::RadioButton("Ποσότητα", !st.money)) st.money = false;
+    static std::map<std::string, Cached<DataConn::CubeData>> dc;
+    const DataConn::CubeData& data = dc[id].get(st.from + "|" + st.to + "|" + std::to_string(st.unit) + "|" + std::to_string(mode),
+                                                [&] { return g_app.conn->historyCube(st.from, st.to, st.unit, mode); });
+    // the other axis: a client's items, or an item's clients
+    std::map<int, int> rowOf; std::vector<int> rowIds;
+    const int nb = (int)data.buckets.size();
+    std::vector<std::vector<double>> m; std::vector<std::vector<long long>> q;
+    for (auto& c : data.cells) {
+        if ((focusAx == 0 ? c.user_id : c.service_id) != fid || c.t < 0 || c.t >= nb) continue;
+        const int other = focusAx == 0 ? c.service_id : c.user_id;
+        auto it = rowOf.find(other);
+        if (it == rowOf.end()) { it = rowOf.emplace(other, (int)rowIds.size()).first; rowIds.push_back(other); m.emplace_back(nb, 0.0); q.emplace_back(nb, 0); }
+        m[it->second][c.t] += c.money; q[it->second][c.t] += c.qty;
+    }
+    std::map<int, std::string> names;
+    for (auto& k : (focusAx == 0 ? data.services : data.users)) names[k.id] = k.name;
+    const int R = (int)rowIds.size();
+    std::vector<double> rsm(R, 0.0), csm(nb, 0.0); std::vector<long long> rsq(R, 0), csq(nb, 0); double allM = 0; long long allQ = 0;
+    for (int r = 0; r < R; r++) for (int t = 0; t < nb; t++) { m[r][t] = RoundMoney(m[r][t]); rsm[r] += m[r][t]; csm[t] += m[r][t]; rsq[r] += q[r][t]; csq[t] += q[r][t]; allM += m[r][t]; allQ += q[r][t]; }
+    for (auto& v : rsm) v = RoundMoney(v); for (auto& v : csm) v = RoundMoney(v); allM = RoundMoney(allM);
+    std::vector<int> order(R); for (int r = 0; r < R; r++) order[r] = r;
+    std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return st.money ? rsm[x] > rsm[y] : rsq[x] > rsq[y]; });
+    const char* otherName = focusAx == 0 ? kUsageModeName[mode] : "Πελάτες";
+    {   // tiles
+        int best = -1; for (int t = 0; t < nb; t++) if (best < 0 || (st.money ? csm[t] > csm[best] : csq[t] > csq[best])) best = t;
+        if (ImGui::BeginTable("ustiles", 4, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); StatTile("Χρήματα στο διάστημα", Eur(allM), kColIn, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 92));
+            ImGui::TableNextColumn(); StatTile(mode == 1 ? "Πακέτα" : mode == 2 ? "Συμβάσεις (ανά βήμα)" : "Χρεώσεις", std::to_string(allQ), ImVec4(0.55f, 0.75f, 1.0f, 1), nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 92));
+            ImGui::TableNextColumn(); StatTile(otherName, std::to_string(R), ImVec4(0.75f, 0.65f, 1.0f, 1), nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 92));
+            ImGui::TableNextColumn(); StatTile("Καλύτερο βήμα", best >= 0 && (st.money ? csm[best] > 0 : csq[best] > 0) ? data.buckets[best] : std::string("—"), ImVec4(0.95f, 0.75f, 0.45f, 1),
+                                               best >= 0 && csm[best] > 0 ? Eur(csm[best]).c_str() : nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 92));
+            ImGui::EndTable();
+        }
+    }
+    auto exportBoth = [&]() {
+        auto sheet = [&](bool money) {
+            xlsx::Sheet sh; sh.name = money ? "Χρήματα" : "Ποσότητα"; sh.freezeRows = 1; sh.freezeCols = 1;
+            std::vector<xlsx::Cell> h = { xlsx::T(std::string(otherName) + " \\ " + kUsageUnits[st.unit], xlsx::Header) };
+            for (auto& b : data.buckets) h.push_back(xlsx::T(b, xlsx::Header));
+            h.push_back(xlsx::T("Σύνολο", xlsx::Header)); sh.rows.push_back(h);
+            for (int r : order) {
+                std::vector<xlsx::Cell> row = { xlsx::T(names.count(rowIds[r]) ? names[rowIds[r]] : "#" + std::to_string(rowIds[r])) };
+                for (int t = 0; t < nb; t++) row.push_back(money ? xlsx::N(m[r][t], xlsx::Money) : xlsx::N((double)q[r][t], xlsx::Int));
+                row.push_back(money ? xlsx::N(rsm[r], xlsx::SumMoney) : xlsx::N((double)rsq[r], xlsx::SumInt));
+                sh.rows.push_back(row);
+            }
+            std::vector<xlsx::Cell> sum = { xlsx::T("Σύνολο", xlsx::SumLabel) };
+            for (int t = 0; t < nb; t++) sum.push_back(money ? xlsx::N(csm[t], xlsx::SumMoney) : xlsx::N((double)csq[t], xlsx::SumInt));
+            sum.push_back(money ? xlsx::N(allM, xlsx::SumMoney) : xlsx::N((double)allQ, xlsx::SumInt));
+            sh.rows.push_back(sum);
+            return sh; };
+        const std::string title = who + " - χρήση ανά " + std::string(kUsageUnits[st.unit]).substr(0) + " (" + kUsageModeName[mode] + ")";
+        SaveWorkbook(who + " - " + kUsageModeName[mode], { sheet(true), sheet(false), ExportInfoSheet(title, { { "Διάστημα", DateGr(st.from) + " – " + DateGr(st.to) },
+            { "Βήμα χρόνου", kUsageUnits[st.unit] }, { "Γραμμές", std::to_string(R) + " " + otherName }, { "Σύνολο", Eur(allM) + " · " + std::to_string(allQ) } }) });
+    };
+    if (R == 0) { ImGui::TextDisabled("Τίποτα σε αυτό το διάστημα (%s).", kUsageModeName[mode]); ImGui::PopID(); return; }
+    {   const float bw = ImGui::CalcTextSize("Excel").x + ImGui::GetFrameHeight() * 0.82f + 14;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - bw));
+        if (ExcelButton("##usexcel", "Εξαγωγή σε Excel: χρήματα και ποσότητα, με τα σύνολα γραμμών και στηλών")) exportBoth(); }
+    // heat by rank among the non-zero cells (the cube's colours)
+    std::vector<double> nz; for (int r = 0; r < R; r++) for (int t = 0; t < nb; t++) { const double v = st.money ? m[r][t] : (double)q[r][t]; if (v != 0) nz.push_back(v); }
+    std::sort(nz.begin(), nz.end());
+    auto heat = [&](double v) -> ImU32 { if (v == 0 || nz.empty()) return 0; const size_t lo = std::lower_bound(nz.begin(), nz.end(), v) - nz.begin(), le = std::upper_bound(nz.begin(), nz.end(), v) - nz.begin();
+        const unsigned c = DataConn::Heat(nz.size() == 1 ? 0.5 : ((double)lo + (double)le - 1.0) / (2.0 * (double)(nz.size() - 1))); return (c & 0x00ffffffu) | (110u << 24); };
+    const float rowH = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().CellPadding.y * 2;
+    const float h = std::min(std::max(140.0f, ImGui::GetContentRegionAvail().y - 8), rowH * (float)(R + 3) + ImGui::GetStyle().ScrollbarSize + 10);
+    if (ImGui::BeginTable("usgrid", nb + 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit, ImVec2(0, h))) {
+        ImGui::TableSetupScrollFreeze(1, 1);
+        float lw = 140; for (int r : order) lw = std::max(lw, ImGui::CalcTextSize(names[rowIds[r]].c_str()).x + 16);
+        ImGui::TableSetupColumn(otherName, ImGuiTableColumnFlags_WidthFixed, std::min(lw, 300.0f));
+        for (int t = 0; t < nb; t++) ImGui::TableSetupColumn(data.buckets[t].c_str(), ImGuiTableColumnFlags_WidthFixed, std::max(st.money ? 80.0f : 50.0f, ImGui::CalcTextSize(data.buckets[t].c_str()).x + 12));
+        ImGui::TableSetupColumn("Σύνολο", ImGuiTableColumnFlags_WidthFixed, st.money ? 100.0f : 64.0f);
+        ImGui::TableHeadersRow();
+        auto num = [&](double v, bool sum) {
+            const std::string t = st.money ? (v != 0 ? Eur(v) : std::string()) : (v != 0 ? std::to_string((long long)v) : std::string());
+            if (t.empty()) { ImGui::TextDisabled(sum ? "–" : ""); return; }
+            const float w = ImGui::CalcTextSize(t.c_str()).x; ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - w));
+            if (sum) ImGui::TextColored(ImVec4(1.0f, 0.88f, 0.6f, 1), "%s", t.c_str()); else ImGui::TextUnformatted(t.c_str());
+        };
+        for (int r : order) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const std::string nm = names.count(rowIds[r]) ? names[rowIds[r]] : "#" + std::to_string(rowIds[r]);
+            if (focusAx == 1) { if (LinkCell(nm)) OpenUserProfile(rowIds[r]); }                  // a client: his window
+            else if (mode == 0) { if (LinkCell(nm)) OpenServiceDetail(rowIds[r]); }               // a service: its window
+            else if (mode == 1 && rowIds[r] > 0) { if (LinkCell(nm)) OpenPackageView(rowIds[r]); } // a package: its window
+            else CellText(nm.c_str());
+            for (int t = 0; t < nb; t++) {
+                ImGui::TableSetColumnIndex(t + 1);
+                const double v = st.money ? m[r][t] : (double)q[r][t];
+                if (const ImU32 c = heat(v)) ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, c);
+                num(v, false);
+            }
+            ImGui::TableSetColumnIndex(nb + 1); num(st.money ? rsm[r] : (double)rsq[r], true);
+        }
+        ImGui::TableNextRow(); ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(255, 225, 150, 28));
+        ImGui::TableSetColumnIndex(0); ImGui::TextColored(ImVec4(1.0f, 0.88f, 0.6f, 1), "Σύνολο");
+        for (int t = 0; t < nb; t++) { ImGui::TableSetColumnIndex(t + 1); num(st.money ? csm[t] : (double)csq[t], true); }
+        ImGui::TableSetColumnIndex(nb + 1); num(st.money ? allM : (double)allQ, true);
+        ImGui::EndTable();
+    }
+    ImGui::PopID();
+}
+
 static void DrawUserProfileWindow() {
     std::vector<int> ids = g_profileUserIds;
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -5153,6 +5598,10 @@ static void DrawUserProfileWindow() {
                 ImGui::EndTable();
             }
         }
+
+        // 3b. what he took, period by period (his row of the cube), with the sums
+        if (ImGui::CollapsingHeader("Χρήση ανά περίοδο: τι πήρε και πότε", ImGuiTreeNodeFlags_DefaultOpen))
+            DrawUsageStats(("usu" + suid).c_str(), 0, { {0, uid}, {1, uid}, {2, uid} }, g_app.userName(uid));
 
         // 4. what is owed right now, split: his own services / his parts of joint charges
         SectionTitle("Τρέχουσες οφειλές");
@@ -5532,6 +5981,8 @@ static void DrawServiceDetailWindow() {
             sb_label.set(s.label); sb_notes.set(s.extra_notes); sb_price = s.suggested_price; sb_cost = s.cost_price;
             g_showServiceDialog = true;
         }
+        if (ImGui::CollapsingHeader("Χρήση ανά περίοδο: ποιοι την πήραν και πότε", ImGuiTreeNodeFlags_DefaultOpen))
+            DrawUsageStats(("uss" + std::to_string(sid)).c_str(), 1, { {0, sid}, {2, sid} }, s.label);
         DrawEntityViewer("svc" + std::to_string(sid), {sid});
 
         // the very end: deleting the service
@@ -5583,6 +6034,8 @@ static void DrawPackageViewWindow() {
                 DrawMiniList("pkgcomp", g, cols, 3, comps, text, cell, [](const Service& c) { OpenServiceDetail(c.id); });
             }
         }
+        if (ImGui::CollapsingHeader("Χρήση ανά περίοδο: ποιοι το πήραν και πότε", ImGuiTreeNodeFlags_DefaultOpen))
+            DrawUsageStats(("usp" + std::to_string(pid)).c_str(), 1, { {1, pid}, {2, 1000000 + pid} }, label);
         DrawEntityViewer("pkg" + std::to_string(pid), svc);
 
         ImGui::Spacing(); ImGui::Separator();
@@ -9203,13 +9656,13 @@ static void DrawRecordPaymentDialog() {
 // Icons are drawn as shapes (no icon font needed), so they look the same on every machine.
 // =====================================================================================================
 enum Page { PAGE_HOME, PAGE_CLIENTS, PAGE_BUILDINGS, PAGE_APARTMENTS, PAGE_SERVICES, PAGE_JOINT, PAGE_PACKAGES,
-            PAGE_LEDGER, PAGE_OFFERS, PAGE_SEARCH, PAGE_NOTES, PAGE_PARTNERS, PAGE_SETTINGS, PAGE_DASHBOARD, PAGE_CASH, PAGE_SCORING, PAGE_CONTRACTS };
+            PAGE_LEDGER, PAGE_OFFERS, PAGE_SEARCH, PAGE_NOTES, PAGE_PARTNERS, PAGE_SETTINGS, PAGE_DASHBOARD, PAGE_CASH, PAGE_SCORING, PAGE_CONTRACTS, PAGE_HISTORY };
 static int g_page = PAGE_HOME;
 static int g_scoringTab = -1;
 static int g_ledgerTab = 0;   // 0 = Χρεώσεις, 1 = Πληρωμές, 2 = Αποδείξεις, 3 = Τιμολόγια
 static const float kNavBarH = 50.0f;
 enum NavIcon { IC_HOME, IC_PERSON, IC_BUILDING, IC_DOOR, IC_TAG, IC_PIE, IC_BOX, IC_COINS, IC_RECEIPT, IC_PERCENT,
-               IC_SEARCH, IC_NOTE, IC_CHART, IC_GEAR, IC_PEOPLE, IC_CONTRACT };
+               IC_SEARCH, IC_NOTE, IC_CHART, IC_GEAR, IC_PEOPLE, IC_CONTRACT, IC_CUBE };
 
 static void DrawNavIcon(ImDrawList* dl, ImVec2 c, float s, int icon, ImU32 col) {
     const float t = std::max(1.6f, s * 0.08f);          // stroke
@@ -9295,6 +9748,14 @@ static void DrawNavIcon(ImDrawList* dl, ImVec2 c, float s, int icon, ImU32 col) 
         dl->AddCircle(c, h * 0.6f, col, 24, t * 1.4f);
         dl->AddCircle(c, h * 0.22f, col, 16, t);
         break; }
+    case IC_CUBE: {                                      // a cube in perspective
+        const ImVec2 f0 = P(-0.75f, -0.35f), f1 = P(0.35f, -0.35f), f2 = P(0.35f, 0.8f), f3 = P(-0.75f, 0.8f);
+        const ImVec2 b0 = P(-0.35f, -0.8f), b1 = P(0.75f, -0.8f), b2 = P(0.75f, 0.35f);
+        dl->AddQuad(f0, f1, f2, f3, col, t);
+        dl->AddLine(f0, b0, col, t); dl->AddLine(f1, b1, col, t); dl->AddLine(f2, b2, col, t);
+        dl->AddLine(b0, b1, col, t); dl->AddLine(b1, b2, col, t);
+        dl->AddCircleFilled(P(-0.2f, 0.22f), h * 0.12f, col);
+        break; }
     case IC_CONTRACT: {                                  // a signed page with a seal
         const float w = s * 0.34f, hh = s * 0.46f;
         dl->AddRect(ImVec2(c.x - w, c.y - hh), ImVec2(c.x + w, c.y + hh), col, 2.0f, 0, t);
@@ -9305,7 +9766,922 @@ static void DrawNavIcon(ImDrawList* dl, ImVec2 c, float s, int icon, ImU32 col) 
     }
 }
 
+// =====================================================================================================
+// ΙΣΤΟΡΙΚΟ & ΑΝΑΛΥΣΗ -- the cube. Clients x services x time, what we charged our own clients.
+//   Top 60%: clients controls (15%) | two particle cubes, money and quantity (70%) | services controls (15%).
+//   Bottom 40%: the face of the cube we chose, as two tables (money, quantity) with a sums row and column.
+// The cube shows only colour (a thermogram, coloured by the database's heat()); the numbers are in the tables.
+// Axes: 0 = clients (x), 1 = services (y), 2 = time (z, towards the viewer at the start).
+// =====================================================================================================
+namespace hcube {
+static std::string from, to;
+static int unit = 0;                                  // 0 day (default), 1 week, 2 month, 3 quarter, 4 year
+static DataConn::CubeData data;
+static std::string loadedFrom, loadedTo; static int loadedUnit = -1; static long long loadedVer = -1;
+static int userKey = 0, svcKey = 0;                   // how they are named in the cube and tables
+static std::set<int> userOn, svcOn; static bool selInit = false;
+static char userFind[64] = "", svcFind[64] = "";
+// the three subtabs: what runs on the second axis. Each keeps its own selection, focus and naming.
+static int mode = 0, loadedMode = -1;                 // 0 services, 1 packages, 2 contracts
+static const char* kModeTab[] = { "Υπηρεσίες", "Πακέτα υπηρεσιών", "Συμβάσεις" };
+static const char* kModeAxis[] = { "Υπηρεσίες", "Πακέτα", "Συμβάσεις" };
+static const char* kModeOne[] = { "Η υπηρεσία", "Το πακέτο", "Η σύμβαση" };
+static const char* kQtyWord[] = { "χρεώσεις", "πακέτα", "συμβάσεις" };
+// Αντίστροφη όψη: the cube and the tables light up what does NOT sell (nothing sold = hottest, the best seller = coldest)
+static bool inverse = false; static float leverT = 0.0f;
+static const char* kUnits[] = { "Ημέρα", "Εβδομάδα", "Μήνας", "Τρίμηνο", "Έτος" };
+static const char* kAxisName[] = { "Πελάτες", "Υπηρεσίες", "Χρόνος" };
+// data axis -> space: clients run top to bottom (y), services left to right (x), time from far to near (z).
+// So the front face reads like the Excel sheet: clients down, services across, every day stacked behind.
+static const int kDim[3] = { 1, 0, 2 };
+static const float kDir[3] = { -1.0f, 1.0f, 1.0f };
+
+static std::string DateMinusDays(int days) {
+    std::time_t t = std::time(nullptr) - (std::time_t)days * 86400; std::tm tmv{}; localtime_s(&tmv, &t);
+    char b[16]; std::strftime(b, sizeof b, "%Y-%m-%d", &tmv); return b;
+}
+static const std::string& KeyText(const DataConn::CubeKey& k, int which) {
+    const std::string* s = which == 1 ? &k.code : which == 2 ? &k.special : which == 3 ? &k.address : &k.name;
+    return s->empty() ? k.name : *s;
+}
+static float Ease(float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); }
+static float EaseOutBack(float x) { x = std::clamp(x, 0.0f, 1.0f); const float c1 = 1.70158f, c3 = c1 + 1.0f; return 1.0f + c3 * (x - 1) * (x - 1) * (x - 1) + c1 * (x - 1) * (x - 1); }
+static float EaseOutCubic(float x) { x = std::clamp(x, 0.0f, 1.0f); return 1.0f - (1 - x) * (1 - x) * (1 - x); }
+static unsigned Hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+static unsigned WithAlpha(unsigned col, float a) { return (col & 0x00ffffffu) | ((unsigned)std::clamp(a * 255.0f, 0.0f, 255.0f) << 24); }
+static unsigned Shade(unsigned col, float k, float a) {
+    const unsigned r = (unsigned)std::min(255.0f, (col & 255) * k), g = (unsigned)std::min(255.0f, ((col >> 8) & 255) * k), b = (unsigned)std::min(255.0f, ((col >> 16) & 255) * k);
+    return r | (g << 8) | (b << 16) | ((unsigned)std::clamp(a * 255.0f, 0.0f, 255.0f) << 24);
+}
+
+// ---- rotation: a free trackball (no angles that can lock), eased with quaternions -------------------
+struct M3 { float m[3][3]; };
+static M3 Mul(const M3& a, const M3& b) { M3 r{}; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { float s = 0; for (int k = 0; k < 3; k++) s += a.m[i][k] * b.m[k][j]; r.m[i][j] = s; } return r; }
+static M3 RotX(float t) { const float c = std::cos(t), s = std::sin(t); return M3{ { {1, 0, 0}, {0, c, -s}, {0, s, c} } }; }
+static M3 RotY(float t) { const float c = std::cos(t), s = std::sin(t); return M3{ { {c, 0, s}, {0, 1, 0}, {-s, 0, c} } }; }
+static void Ortho(M3& r) {
+    auto nrm = [](float* v) { const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); if (l > 1e-6f) for (int i = 0; i < 3; i++) v[i] /= l; };
+    nrm(r.m[0]); const float d = r.m[1][0] * r.m[0][0] + r.m[1][1] * r.m[0][1] + r.m[1][2] * r.m[0][2];
+    for (int i = 0; i < 3; i++) r.m[1][i] -= d * r.m[0][i];
+    nrm(r.m[1]);
+    r.m[2][0] = r.m[0][1] * r.m[1][2] - r.m[0][2] * r.m[1][1]; r.m[2][1] = r.m[0][2] * r.m[1][0] - r.m[0][0] * r.m[1][2]; r.m[2][2] = r.m[0][0] * r.m[1][1] - r.m[0][1] * r.m[1][0];
+}
+static M3 Iso() { return Mul(RotX(0.40f), RotY(-0.65f)); }
+struct Qt { float w, x, y, z; };
+static Qt ToQ(const M3& r) {
+    const auto& m = r.m; Qt q; const float tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0) { const float s = std::sqrt(tr + 1.0f) * 2; q.w = 0.25f * s; q.x = (m[2][1] - m[1][2]) / s; q.y = (m[0][2] - m[2][0]) / s; q.z = (m[1][0] - m[0][1]) / s; }
+    else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) { const float s = std::sqrt(1.0f + m[0][0] - m[1][1] - m[2][2]) * 2; q.w = (m[2][1] - m[1][2]) / s; q.x = 0.25f * s; q.y = (m[0][1] + m[1][0]) / s; q.z = (m[0][2] + m[2][0]) / s; }
+    else if (m[1][1] > m[2][2]) { const float s = std::sqrt(1.0f + m[1][1] - m[0][0] - m[2][2]) * 2; q.w = (m[0][2] - m[2][0]) / s; q.x = (m[0][1] + m[1][0]) / s; q.y = 0.25f * s; q.z = (m[1][2] + m[2][1]) / s; }
+    else { const float s = std::sqrt(1.0f + m[2][2] - m[0][0] - m[1][1]) * 2; q.w = (m[1][0] - m[0][1]) / s; q.x = (m[0][2] + m[2][0]) / s; q.y = (m[1][2] + m[2][1]) / s; q.z = 0.25f * s; }
+    return q;
+}
+static M3 FromQ(Qt q) {
+    const float n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z); q.w /= n; q.x /= n; q.y /= n; q.z /= n;
+    return M3{ { { 1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w) },
+                 { 2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.x * q.w) },
+                 { 2 * (q.x * q.z - q.y * q.w), 2 * (q.y * q.z + q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y) } } };
+}
+static Qt Slerp(Qt a, Qt b, float t) {
+    float d = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+    if (d < 0) { b = { -b.w, -b.x, -b.y, -b.z }; d = -d; }
+    if (d > 0.9995f) return { a.w + (b.w - a.w) * t, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t };
+    const float th = std::acos(d), s = std::sin(th), ka = std::sin((1 - t) * th) / s, kb = std::sin(t * th) / s;
+    return { a.w * ka + b.w * kb, a.x * ka + b.x * kb, a.y * ka + b.y * kb, a.z * ka + b.z * kb };
+}
+static M3 R = Iso();
+static Qt easeA, easeB; static float easeT = 1.0f, easeDur = 0.4f; static int afterEase = 0;   // 1: then show the picked slice
+static void EaseTo(const M3& t, float dur) { easeA = ToQ(R); easeB = ToQ(t); easeT = 0; easeDur = dur; }
+// the nearest square-on view: every view axis lines up with one cube axis (one of the 24 turns of a cube)
+static M3 SnapNearest(const M3& r) {
+    static const int P[6][3] = { {0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0} };
+    int best = 0; float bs = -1;
+    for (int k = 0; k < 6; k++) { float s = 0; for (int i = 0; i < 3; i++) s += std::fabs(r.m[i][P[k][i]]); if (s > bs) { bs = s; best = k; } }
+    M3 o{}; for (int i = 0; i < 3; i++) o.m[i][P[best][i]] = r.m[i][P[best][i]] >= 0 ? 1.0f : -1.0f;
+    Ortho(o);                                        // row 2 = row 0 x row 1: always a proper turn
+    return o;
+}
+// the data axis pointing at the viewer most, how much, and from which side
+static int DepthAx(const M3& r, float* align = nullptr, float* nearS = nullptr) {
+    int b = 0; for (int ax = 1; ax < 3; ax++) if (std::fabs(r.m[2][kDim[ax]]) > std::fabs(r.m[2][kDim[b]])) b = ax;
+    if (align) *align = std::fabs(r.m[2][kDim[b]]); if (nearS) *nearS = r.m[2][kDim[b]] >= 0 ? 1.0f : -1.0f;
+    return b;
+}
+// the two other axes as the table will show them: the one lying more across the screen becomes the columns
+static void ScreenFace(const M3& r, int depth, int& rowAx, int& colAx) {
+    int o[2], n = 0; for (int ax = 0; ax < 3; ax++) if (ax != depth) o[n++] = ax;
+    if (std::fabs(r.m[0][kDim[o[0]]]) >= std::fabs(r.m[0][kDim[o[1]]])) { colAx = o[0]; rowAx = o[1]; } else { colAx = o[1]; rowAx = o[0]; }
+}
+static void DefaultFace(int depth, int& rowAx, int& colAx) { if (depth == 2) { rowAx = 0; colAx = 1; } else if (depth == 1) { rowAx = 0; colAx = 2; } else { rowAx = 1; colAx = 2; } }
+
+// ---- state of the screen --------------------------------------------------------------------------
+static int tableDepth = 2, tableRowAx = 0, tableColAx = 1, tableSlice = -1;
+static int layer = 0;                                 // the layer Προβολή shows, along the current depth axis
+static bool layerHot = false;                         // the slider is being used: that layer is lit, the rest dimmed
+static int focusAx = -1, focusId = -1;                // a client (0) or service (1) picked in the side lists
+// animation: 0 none, 1 slices collapse, 2 cells fly into the tables, 3 the cube comes back
+static int anim = 0; static float animT = 0; static int animDepth = 2, animRowAx = 0, animColAx = 1, animSlice = -1; static float animNear = 1;
+static ImVec2 lowerMin, lowerMax;
+static double testFlatAt = 0; static int testMode = 0;  // tests only
+struct ModeState { std::set<int> userOn, svcOn, svcBeforeInverse; bool selInit = false, inverse = false, hadBefore = false; int focusAx = -1, focusId = -1, svcKey = 0, tableSlice = -1; };
+static ModeState modeState[3];
+static void SwitchMode(int to) {
+    if (to == mode) return;
+    ModeState& o = modeState[mode];
+    o.userOn = userOn; o.svcOn = svcOn; o.selInit = selInit; o.inverse = inverse; o.focusAx = focusAx; o.focusId = focusId; o.svcKey = svcKey; o.tableSlice = tableSlice;
+    const ModeState& n = modeState[to];
+    userOn = n.userOn; svcOn = n.svcOn; selInit = n.selInit; inverse = n.inverse; focusAx = n.focusAx; focusId = n.focusId; svcKey = n.svcKey; tableSlice = n.tableSlice;
+    mode = to; kAxisName[1] = kModeAxis[to]; leverT = inverse ? 1.0f : 0.0f; svcFind[0] = 0;
+}
+
+// ---- the data on the axes -------------------------------------------------------------------------
+struct Axes { std::vector<const DataConn::CubeKey*> u, s; std::unordered_map<int, int> ui, si; int n[3] = { 0, 0, 0 }; };
+static Axes BuildAxes() {
+    Axes a;
+    for (auto& k : data.users) if (userOn.count(k.id)) { a.ui[k.id] = (int)a.u.size(); a.u.push_back(&k); }
+    for (auto& k : data.services) if (svcOn.count(k.id)) { a.si[k.id] = (int)a.s.size(); a.s.push_back(&k); }
+    a.n[0] = (int)a.u.size(); a.n[1] = (int)a.s.size(); a.n[2] = (int)data.buckets.size();
+    return a;
+}
+static bool CellIdx(const Axes& a, const DataConn::CubeCell& c, int idx[3]) {
+    auto i = a.ui.find(c.user_id); if (i == a.ui.end()) return false;
+    auto j = a.si.find(c.service_id); if (j == a.si.end()) return false;
+    idx[0] = i->second; idx[1] = j->second; idx[2] = c.t; return true;
+}
+static std::string AxisLabel(const Axes& a, int ax, int i) {
+    if (ax == 0) return KeyText(*a.u[i], userKey);
+    if (ax == 1) return KeyText(*a.s[i], svcKey);
+    return data.buckets[i];
+}
+static int FocusPos(const Axes& a) {
+    if (focusAx == 0) { auto it = a.ui.find(focusId); return it == a.ui.end() ? -1 : it->second; }
+    if (focusAx == 1) { auto it = a.si.find(focusId); return it == a.si.end() ? -1 : it->second; }
+    return -1;
+}
+
+// ---- a flattened face: rows x columns, the depth axis added up (or one layer of it) ---------------
+struct Face {
+    int depth = 2, rowAx = 0, colAx = 1, slice = -1, R = 0, C = 0;
+    std::vector<double> m, rsm, csm; std::vector<int> q, rsq, csq;
+    std::vector<unsigned> hm, hq, hrm, hcm, hrq, hcq; double allM = 0; long long allQ = 0;
+};
+// midpoint rank of ties among the non-zero values; reversed view: nothing sold = 1 (red), the rest 0.05..0.9 the other way round
+static double InvPos(double r) { return 0.05 + 0.85 * (1.0 - r); }
+template <class T> static void RankHeat(const std::vector<T>& v, std::vector<unsigned>& out) {
+    std::vector<T> nz; for (T x : v) if (x != 0) nz.push_back(x);
+    std::sort(nz.begin(), nz.end()); out.assign(v.size(), 0);
+    for (size_t i = 0; i < v.size(); i++) {
+        if (v[i] == 0) { if (inverse) out[i] = DataConn::Heat(1.0); continue; }
+        const size_t lo = std::lower_bound(nz.begin(), nz.end(), v[i]) - nz.begin(), le = std::upper_bound(nz.begin(), nz.end(), v[i]) - nz.begin();
+        const double r = nz.size() == 1 ? 0.5 : ((double)lo + (double)le - 1.0) / (2.0 * (double)(nz.size() - 1));
+        out[i] = DataConn::Heat(inverse ? InvPos(r) : r);
+    }
+}
+static Face BuildFace(const Axes& a, int depth, int rowAx, int colAx, int slice, const std::vector<char>* only = nullptr) {
+    Face f; f.depth = depth; f.rowAx = rowAx; f.colAx = colAx; f.slice = slice; f.R = a.n[rowAx]; f.C = a.n[colAx];
+    f.m.assign((size_t)f.R * f.C, 0.0); f.q.assign((size_t)f.R * f.C, 0);
+    int idx[3];
+    for (auto& c : data.cells) {
+        if (!CellIdx(a, c, idx)) continue;
+        if (slice >= 0 && idx[depth] != slice) continue;
+        if (only && !(*only)[idx[depth]]) continue;
+        const size_t k = (size_t)idx[rowAx] * f.C + idx[colAx];
+        f.m[k] += c.money; f.q[k] += c.qty;
+    }
+    f.rsm.assign(f.R, 0.0); f.csm.assign(f.C, 0.0); f.rsq.assign(f.R, 0); f.csq.assign(f.C, 0);
+    for (int r = 0; r < f.R; r++) for (int c = 0; c < f.C; c++) {
+        const size_t k = (size_t)r * f.C + c; f.m[k] = RoundMoney(f.m[k]);
+        f.rsm[r] += f.m[k]; f.csm[c] += f.m[k]; f.rsq[r] += f.q[k]; f.csq[c] += f.q[k]; f.allM += f.m[k]; f.allQ += f.q[k];
+    }
+    for (auto& x : f.rsm) x = RoundMoney(x); for (auto& x : f.csm) x = RoundMoney(x); f.allM = RoundMoney(f.allM);
+    RankHeat(f.m, f.hm); RankHeat(f.q, f.hq); RankHeat(f.rsm, f.hrm); RankHeat(f.csm, f.hcm); RankHeat(f.rsq, f.hrq); RankHeat(f.csq, f.hcq);
+    return f;
+}
+
+// ---- projection ---------------------------------------------------------------------------------
+struct Proj { ImVec2 c; float scale; M3 r; };
+static Proj MakeProj(ImVec2 mn, ImVec2 mx) {
+    Proj p; p.c = ImVec2((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f + 12.0f); p.scale = std::min(mx.x - mn.x, mx.y - mn.y - 40.0f) * 0.25f; p.r = R; return p;
+}
+static ImVec2 Project(const Proj& p, const float s[3], float* zOut = nullptr, float dz = 0) {
+    float v[3]; for (int i = 0; i < 3; i++) v[i] = p.r.m[i][0] * s[0] + p.r.m[i][1] * s[1] + p.r.m[i][2] * s[2];
+    v[2] += dz;
+    const float persp = 4.8f / (4.8f - v[2]);
+    if (zOut) *zOut = v[2];
+    return ImVec2(p.c.x + v[0] * p.scale * persp, p.c.y - v[1] * p.scale * persp);
+}
+static float CellCoord(int i, int n) { return n <= 0 ? 0.0f : -1.0f + (i + 0.5f) * 2.0f / n; }
+
+// ---- slices -------------------------------------------------------------------------------------
+// A stack of slices along whichever axis faces the viewer most. They part with a gap; while two axes face the
+// viewer about equally the gaps close (it is not clear which slices we look at), and as a side comes round
+// they open again for that axis, and the view settles square on it when let go.
+static const int kMaxSlabs = 24;
+static int Slabs(int n) { return std::max(1, std::min(n, kMaxSlabs)); }
+static int SlabOf(int idx, int n) { return n <= 0 ? 0 : (int)((long long)idx * Slabs(n) / n); }
+static void SliceWeights(const M3& r, float w[3]) {
+    int b = DepthAx(r); float second = 0;
+    for (int ax = 0; ax < 3; ax++) if (ax != b) second = std::max(second, std::fabs(r.m[2][kDim[ax]]));
+    w[0] = w[1] = w[2] = 0; w[b] = Ease((std::fabs(r.m[2][kDim[b]]) - second) / 0.45f);
+}
+// collapse timing: the far slices leave first, the near ones last
+static const float kLeave = 0.55f, kMove = 0.40f;
+static float SlabLocal(int slab, int S, float T) {
+    const float cs = kDir[animDepth] * (-1.0f + (slab + 0.5f) * 2.0f / S);
+    const float u = S > 1 ? ((cs * animNear) * S / (S - 1) + 1.0f) * 0.5f : 0.0f;     // 0 far .. 1 near
+    return std::clamp((T - kLeave * std::clamp(u, 0.0f, 1.0f)) / kMove, 0.0f, 1.0f);
+}
+
+// ---- what the particles are drawn from --------------------------------------------------------------
+// Normal view: one blob per cell with activity. Reversed view: one blob per slab cell (at most 24 x 24 x 24) of the whole grid,
+// empty ones included -- that is where the colour is. lo..hi: the data positions a blob covers on each axis.
+struct Blob { float base[3], half[3]; int lo[3], hi[3]; unsigned colM = 0, colQ = 0; float rM = 0, rQ = 0; };
+static void BuildBlobs(const Axes& a, std::vector<Blob>& out) {
+    out.clear(); int idx[3];
+    if (!inverse) {
+        std::vector<std::pair<double, size_t>> vm, vq;
+        for (size_t i = 0; i < data.cells.size(); i++) if (CellIdx(a, data.cells[i], idx)) { vm.push_back({ data.cells[i].money, i }); vq.push_back({ (double)data.cells[i].qty, i }); }
+        std::vector<float> rkM(data.cells.size(), 0.0f), rkQ(data.cells.size(), 0.0f);
+        auto fill = [](std::vector<std::pair<double, size_t>>& v, std::vector<float>& o) {
+            std::sort(v.begin(), v.end()); size_t j = 0;
+            for (size_t i = 0; i < v.size(); i = j) { j = i; while (j < v.size() && v[j].first == v[i].first) j++; for (size_t k = i; k < j; k++) o[v[k].second] = 0.15f + 0.85f * (v.size() == 1 ? 0.5f : (float)(i + j - 1) / (2.0f * (float)(v.size() - 1))); }
+        };
+        fill(vm, rkM); fill(vq, rkQ);
+        for (size_t i = 0; i < data.cells.size(); i++) {
+            const auto& c = data.cells[i]; if (!CellIdx(a, c, idx)) continue;
+            Blob b; for (int ax = 0; ax < 3; ax++) { b.base[ax] = CellCoord(idx[ax], a.n[ax]); b.half[ax] = a.n[ax] ? 0.9f / a.n[ax] : 0.0f; b.lo[ax] = b.hi[ax] = idx[ax]; }
+            b.colM = c.heat_money; b.colQ = c.heat_qty; b.rM = rkM[i]; b.rQ = rkQ[i]; out.push_back(b);
+        }
+        return;
+    }
+    // Reversed: an empty cell glows as much as its service (or client) failed to sell over the whole period -- a service that
+    // never sold is a solid red slice, an empty day of a best seller hardly shows; a cell that did sell is a few cold points.
+    const int S[3] = { Slabs(a.n[0]), Slabs(a.n[1]), Slabs(a.n[2]) };
+    const size_t N = (size_t)S[0] * S[1] * S[2];
+    std::vector<double> m(N, 0.0), q(N, 0.0), mU(S[0], 0.0), qU(S[0], 0.0), mS(S[1], 0.0), qS(S[1], 0.0);
+    for (auto& c : data.cells) if (CellIdx(a, c, idx)) {
+        const int u = SlabOf(idx[0], a.n[0]), sv = SlabOf(idx[1], a.n[1]);
+        const size_t k = ((size_t)u * S[1] + sv) * S[2] + SlabOf(idx[2], a.n[2]);
+        m[k] += c.money; q[k] += c.qty; mU[u] += c.money; qU[u] += c.qty; mS[sv] += c.money; qS[sv] += c.qty;
+    }
+    auto inv = [](const std::vector<double>& v, std::vector<float>& r) {           // 1 = nothing at all, then 0.05..0.9 the less the hotter
+        std::vector<double> nz; for (double x : v) if (x > 0) nz.push_back(x);
+        std::sort(nz.begin(), nz.end()); r.assign(v.size(), 1.0f);
+        for (size_t i = 0; i < v.size(); i++) if (v[i] > 0) {
+            const size_t lo = std::lower_bound(nz.begin(), nz.end(), v[i]) - nz.begin(), le = std::upper_bound(nz.begin(), nz.end(), v[i]) - nz.begin();
+            r[i] = (float)InvPos(nz.size() == 1 ? 0.5 : ((double)lo + (double)le - 1.0) / (2.0 * (double)(nz.size() - 1)));
+        }
+    };
+    std::vector<float> rm, rq, rmU, rqU, rmS, rqS; inv(m, rm); inv(q, rq); inv(mU, rmU); inv(qU, rqU); inv(mS, rmS); inv(qS, rqS);
+    out.reserve(N);
+    for (int s0 = 0; s0 < S[0]; s0++) for (int s1 = 0; s1 < S[1]; s1++) for (int s2 = 0; s2 < S[2]; s2++) {
+        const size_t k = ((size_t)s0 * S[1] + s1) * S[2] + s2; const int sv[3] = { s0, s1, s2 };
+        Blob b;
+        for (int ax = 0; ax < 3; ax++) { b.base[ax] = -1.0f + (sv[ax] + 0.5f) * 2.0f / S[ax]; b.half[ax] = 0.9f / S[ax]; b.lo[ax] = (sv[ax] * a.n[ax] + S[ax] - 1) / S[ax]; b.hi[ax] = ((sv[ax] + 1) * a.n[ax] + S[ax] - 1) / S[ax] - 1; }
+        auto pick = [](double v, float cellR, float rowR, float colR, float& r, unsigned& col) {
+            if (v > 0) { r = 0.10f; col = DataConn::Heat(cellR); }                 // it sold here: a few points, cold for a big sale
+            else { r = std::max(rowR, colR); r = r * r; col = DataConn::Heat(std::max(rowR, colR)); }
+        };
+        pick(m[k], rm[k], rmU[s0], rmS[s1], b.rM, b.colM);
+        pick(q[k], rq[k], rqU[s0], rqS[s1], b.rQ, b.colQ);
+        out.push_back(b);
+    }
+}
+
+static void PlaneQuad(const Proj& p, int dim, float at, ImVec2 out[4]) {
+    const int o1 = (dim + 1) % 3, o2 = (dim + 2) % 3; const float u[4] = { -1, 1, 1, -1 }, v[4] = { -1, -1, 1, 1 };
+    for (int k = 0; k < 4; k++) { float s[3]; s[dim] = at; s[o1] = u[k]; s[o2] = v[k]; out[k] = Project(p, s); }
+}
+static void DrawSliceFrames(ImDrawList* dl, const Proj& p, const Axes& a, const float w[3], float alpha, int focusPos) {
+    for (int ax = 0; ax < 3; ax++) {
+        if (w[ax] < 0.03f || alpha <= 0.01f) continue;
+        const int S = Slabs(a.n[ax]);
+        for (int sI = 0; sI < S; sI++) {
+            ImVec2 q[4]; PlaneQuad(p, kDim[ax], kDir[ax] * (-1.0f + (sI + 0.5f) * 2.0f / S), q);
+            dl->AddQuadFilled(q[0], q[1], q[2], q[3], IM_COL32(110, 140, 200, (int)(9 * w[ax] * alpha)));
+            dl->AddQuad(q[0], q[1], q[2], q[3], IM_COL32(140, 170, 220, (int)(38 * w[ax] * alpha)), 1.0f);
+        }
+    }
+    if (focusAx >= 0 && focusPos >= 0) {                         // the picked client / service: its own slice, lit
+        ImVec2 q[4]; PlaneQuad(p, kDim[focusAx], kDir[focusAx] * CellCoord(focusPos, a.n[focusAx]), q);
+        dl->AddQuadFilled(q[0], q[1], q[2], q[3], IM_COL32(255, 220, 140, (int)(22 * alpha)));
+        dl->AddQuad(q[0], q[1], q[2], q[3], IM_COL32(255, 220, 140, (int)(170 * alpha)), 1.5f);
+    }
+}
+// the three axes, drawn along the cube's edges from its lowest corner, named at the middle of each edge (outside)
+static void DrawAxes(ImDrawList* dl, const Proj& p, const Axes& a, float alpha) {
+    float best[3] = { 0, 0, 0 }; float by = -1e9f;
+    for (int k = 0; k < 8; k++) { float s[3] = { (k & 1) ? 1.f : -1.f, (k & 2) ? 1.f : -1.f, (k & 4) ? 1.f : -1.f }; const ImVec2 sp = Project(p, s); const float sc = sp.y - sp.x * 0.8f; /* the bottom-left corner */ if (sc > by) { by = sc; for (int i = 0; i < 3; i++) best[i] = s[i]; } }
+    const float zero[3] = { 0, 0, 0 }; const ImVec2 cen = Project(p, zero);
+    for (int ax = 0; ax < 3; ax++) {
+        const int d = kDim[ax]; float e[3] = { best[0], best[1], best[2] }; e[d] = -e[d];
+        const ImVec2 s0 = Project(p, best), s1 = Project(p, e);
+        dl->AddLine(s0, s1, IM_COL32(170, 190, 225, (int)(150 * alpha)), 1.4f);
+        // arrow towards the growing end (later days, further down the list)
+        const ImVec2 from = best[d] * kDir[ax] < 0 ? s0 : s1, tip = best[d] * kDir[ax] < 0 ? s1 : s0;
+        ImVec2 dir(tip.x - from.x, tip.y - from.y); const float l = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+        if (l > 20) { dir.x /= l; dir.y /= l; const ImVec2 nrm(-dir.y, dir.x);
+            dl->AddTriangleFilled(tip, ImVec2(tip.x - dir.x * 9 + nrm.x * 4, tip.y - dir.y * 9 + nrm.y * 4), ImVec2(tip.x - dir.x * 9 - nrm.x * 4, tip.y - dir.y * 9 - nrm.y * 4), IM_COL32(170, 190, 225, (int)(200 * alpha))); }
+        char b[96]; std::snprintf(b, sizeof b, "%s (%d)", kAxisName[ax], a.n[ax]);
+        const ImVec2 mid((s0.x + s1.x) * 0.5f, (s0.y + s1.y) * 0.5f); ImVec2 out(mid.x - cen.x, mid.y - cen.y);
+        const float ol = std::max(1.0f, std::sqrt(out.x * out.x + out.y * out.y)); out.x /= ol; out.y /= ol;
+        const ImVec2 ts = ImGui::CalcTextSize(b);
+        ImVec2 at(mid.x + out.x * (14 + ts.x * 0.5f) - ts.x * 0.5f, mid.y + out.y * (12 + ts.y * 0.5f) - ts.y * 0.5f);
+        const ImVec2 cmn = dl->GetClipRectMin(), cmx = dl->GetClipRectMax();                    // keep it inside the cube's area
+        at.x = std::clamp(at.x, cmn.x + 6, std::max(cmn.x + 6, cmx.x - ts.x - 6)); at.y = std::clamp(at.y, cmn.y + 28, std::max(cmn.y + 28, cmx.y - ts.y - 4));
+        dl->AddText(at, IM_COL32(205, 215, 235, (int)(235 * alpha)), b);
+    }
+}
+// a face cell as a flat quad on the near plane: corners (row lo,col lo) (row lo,col hi) (row hi,col hi) (row hi,col lo)
+static void FaceQuad(const Proj& p, const Face& f, int r, int c, float nearS, ImVec2 out[4]) {
+    const float r0 = -1.0f + r * 2.0f / f.R, r1 = r0 + 2.0f / f.R, c0 = -1.0f + c * 2.0f / f.C, c1 = c0 + 2.0f / f.C;
+    const float rr[4] = { r0, r0, r1, r1 }, cc[4] = { c0, c1, c1, c0 };
+    for (int k = 0; k < 4; k++) { float s[3]; s[kDim[f.rowAx]] = kDir[f.rowAx] * rr[k]; s[kDim[f.colAx]] = kDir[f.colAx] * cc[k]; s[kDim[f.depth]] = nearS; out[k] = Project(p, s); }
+}
+
+// one cube: glowing particles in slices; colour from the database (heat), density from the cell's rank
+static void DrawCube(ImDrawList* dl, ImVec2 mn, ImVec2 mx, const Axes& a, bool money, const std::vector<Blob>& blobs, const Face* partial) {
+    if (inverse) dl->AddRectFilledMultiColor(mn, mx, IM_COL32(34, 22, 30, 255), IM_COL32(34, 22, 30, 255), IM_COL32(16, 10, 14, 255), IM_COL32(16, 10, 14, 255));
+    else dl->AddRectFilledMultiColor(mn, mx, IM_COL32(24, 29, 40, 255), IM_COL32(24, 29, 40, 255), IM_COL32(12, 14, 20, 255), IM_COL32(12, 14, 20, 255));
+    char title[96]; std::snprintf(title, sizeof title, money ? "%s (€)" : "%s (%s)", money ? (inverse ? "Χρήματα που ΔΕΝ μπήκαν" : "Χρήματα") : (inverse ? "Ποσότητα που ΔΕΝ πουλήθηκε" : "Ποσότητα"), kQtyWord[mode]);
+    dl->AddText(ImVec2(mn.x + 10, mn.y + 8), inverse ? IM_COL32(255, 190, 170, 255) : IM_COL32(225, 232, 245, 255), title);
+    if (anim == 2) return;                                     // the cells are in the air
+    dl->PushClipRect(mn, mx, true);
+    const Proj p = MakeProj(mn, mx);
+    const int fpos = FocusPos(a);
+    float w[3]; SliceWeights(R, w);
+    const bool collapsing = anim == 1, rebuilding = anim == 3;
+    const float alpha = rebuilding ? Ease(animT * 1.4f) : 1.0f;
+    float frameAlpha = alpha;
+    if (collapsing) { w[0] = w[1] = w[2] = 0; w[animDepth] = 1.0f - Ease(animT * 2.5f); frameAlpha = 1.0f - Ease((animT - 0.5f) * 3.0f); }
+    DrawSliceFrames(dl, p, a, w, frameAlpha, collapsing ? -1 : fpos);
+    // the layer the slider picks (for Προβολή): an outline always when square on a side, lit while the slider is used
+    float lal = 0, lns = 1; const int ldep = DepthAx(R, &lal, &lns);
+    const bool showLayer = !collapsing && !rebuilding && lal > 0.92f && a.n[ldep] > 0 && fpos < 0;
+    if (showLayer) {
+        const int lS = Slabs(a.n[ldep]), lSl = SlabOf(std::min(layer, a.n[ldep] - 1), a.n[ldep]);
+        ImVec2 q[4]; PlaneQuad(p, kDim[ldep], kDir[ldep] * (-1.0f + (lSl + 0.5f) * 2.0f / lS), q);
+        dl->AddQuadFilled(q[0], q[1], q[2], q[3], IM_COL32(140, 220, 255, layerHot ? 30 : 8));
+        dl->AddQuad(q[0], q[1], q[2], q[3], IM_COL32(140, 220, 255, layerHot ? 220 : 90), layerHot ? 2.0f : 1.0f);
+    }
+    int visible = 0; float sumR = 0; for (auto& b : blobs) { const float r = money ? b.rM : b.rQ; if (r > 0) { visible++; sumR += r; } }
+    const int perMax = std::clamp(visible > 0 ? 11000 / visible : 1, 2, 24);   // a draw list holds 65536 vertices here (OpenGL 3.0)
+    const float perR = sumR > 0 ? std::clamp(6000.0f / sumR, 0.02f, 24.0f) : 1.0f;   // reversed view: a budget spread by intensity (measured: ~7 vertices a point)
+    const int vtxStop = 60000;                                // never past what one draw list can hold here (OpenGL 3.0: 65536), whatever the data
+    const int Sd = Slabs(a.n[animDepth]);
+    size_t bi = 0;
+    for (auto& b : blobs) {
+        const size_t me = bi++;
+        if (dl->VtxBuffer.Size > vtxStop) break;
+        const float r = money ? b.rM : b.rQ; if (r <= 0) continue;
+        float sc[3];                                              // per data axis: the centre of its slice
+        for (int ax = 0; ax < 3; ax++) { const int S = Slabs(a.n[ax]); sc[ax] = -1.0f + (SlabOf(b.lo[ax], a.n[ax]) + 0.5f) * 2.0f / S; }
+        const unsigned col = money ? b.colM : b.colQ;
+        int k;
+        if (inverse) { const float e = r * perR; k = (int)e; if ((Hash((unsigned)me * 2246822519u + (money ? 7u : 1u)) & 0xffff) / 65535.0f < e - (float)k) k++; if (k <= 0) continue; }
+        else k = 1 + (int)(r * (perMax - 1));
+        auto has = [&](int ax, int i) { return i >= b.lo[ax] && i <= b.hi[ax]; };
+        float fade = alpha, local = 0, dz = 0;
+        if (!collapsing && fpos >= 0 && !has(focusAx, fpos)) fade *= 0.13f;      // the picked slice stands out
+        if (showLayer && layerHot && !has(ldep, layer)) fade *= 0.15f;            // the slider's layer stands out
+        const bool chosen = animSlice < 0 || has(animDepth, animSlice);
+        if (collapsing) {
+            local = SlabLocal(SlabOf(b.lo[animDepth], a.n[animDepth]), Sd, animT);
+            if (!chosen) { dz = -3.0f * EaseOutCubic(local); fade *= 1.0f - local; }    // Προβολή: the other slices fall away
+            else if (local >= 1.0f) continue;                                           // arrived: part of the flat table now
+            else fade *= 1.0f - Ease((local - 0.8f) * 5.0f);
+        }
+        if (rebuilding) { const float lt = std::clamp(animT * 1.6f - 0.6f * (float)SlabOf(b.lo[2], a.n[2]) / Slabs(a.n[2]), 0.0f, 1.0f); dz = -2.5f * (1.0f - EaseOutCubic(lt)); fade *= lt; }
+        if (fade <= 0.01f) continue;
+        for (int j = 0; j < k; j++) {
+            const unsigned h = Hash((unsigned)me * 131u + (unsigned)j * 7919u + (money ? 17u : 3u));
+            float dpos[3];
+            for (int ax = 0; ax < 3; ax++) {
+                float q = b.base[ax] + (((Hash(h + ax * 2654435761u) & 0xffff) / 65535.0f) * 2.0f - 1.0f) * b.half[ax];
+                dpos[ax] = sc[ax] + (q - sc[ax]) * (1.0f - 0.6f * w[ax]);            // pulled into its slice: the gaps
+            }
+            float s[3]; for (int ax = 0; ax < 3; ax++) s[kDim[ax]] = kDir[ax] * dpos[ax];
+            if (collapsing && chosen) {
+                const float e = Ease(local), dd = kDim[animDepth];
+                s[(int)dd] += (animNear - s[(int)dd]) * e;
+                const float sq = 1.0f - 0.07f * std::sin(local * 3.14159f);           // pressed like a sheet on the way
+                for (int d = 0; d < 3; d++) if (d != (int)dd) s[d] *= sq;
+            }
+            float z2; const ImVec2 sp = Project(p, s, &z2, dz);
+            const float fog = std::clamp(0.55f + 0.45f * (z2 + 1.7f) / 3.4f, 0.4f, 1.0f);
+            const float sz = 0.8f + 0.45f * (z2 + 1.2f);
+            const float A = std::clamp(0.45f + 0.5f * r, 0.0f, 1.0f) * fade;
+            if ((j & 3) == 0) { const ImDrawListFlags fl = dl->Flags; dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;          // a soft glow, cheap
+                                dl->AddCircleFilled(sp, sz * 3.2f, Shade(col, fog, A * 0.16f), 6); dl->Flags = fl; }
+            dl->AddRectFilled(ImVec2(sp.x - sz, sp.y - sz), ImVec2(sp.x + sz, sp.y + sz), Shade(col, fog * 1.1f, A));
+        }
+    }
+    // the flat table builds up on the near plane as the slices arrive (colours re-ranked on the running sums)
+    if (collapsing && partial && partial->R > 0 && partial->C > 0) {
+        const Face& f = *partial;
+        for (int r = 0; r < f.R; r++) for (int cc = 0; cc < f.C; cc++) {
+            const size_t kk = (size_t)r * f.C + cc; const unsigned col = money ? f.hm[kk] : f.hq[kk]; if (!col) continue;
+            ImVec2 qd[4]; FaceQuad(p, f, r, cc, animNear, qd);
+            dl->AddQuadFilled(qd[0], qd[1], qd[2], qd[3], WithAlpha(col, 0.86f));
+        }
+        ImVec2 fr[4]; PlaneQuad(p, kDim[animDepth], animNear, fr);
+        const float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 10.0f);
+        dl->AddQuad(fr[0], fr[1], fr[2], fr[3], IM_COL32(255, 235, 170, (int)(70 + 100 * pulse)), 2.0f);
+        int arrived = 0; for (int sI = 0; sI < Sd; sI++) if (SlabLocal(sI, Sd, animT) >= 1.0f) arrived++;
+        char b[128]; std::snprintf(b, sizeof b, animSlice < 0 ? "Ισοπέδωση του άξονα «%s»: %d / %d στρώσεις" : "Προβολή μίας στρώσης του άξονα «%s»: %d / %d", kAxisName[animDepth], arrived, Sd);
+        const ImVec2 ts = ImGui::CalcTextSize(b);
+        dl->AddText(ImVec2((mn.x + mx.x - ts.x) * 0.5f, mx.y - ts.y - 8), IM_COL32(255, 230, 150, 255), b);
+    }
+    // the axes, as a small compass in the corner: turns with the cube, never on it
+    {   const ImVec2 o(mn.x + 74, mx.y - 66); const float L = 36.0f;
+        static const ImU32 cols[3] = { IM_COL32(110, 175, 255, 255), IM_COL32(255, 175, 90, 255), IM_COL32(120, 220, 140, 255) };
+        int order[3] = { 0, 1, 2 };
+        std::sort(order, order + 3, [](int x, int y) { return R.m[2][kDim[x]] * kDir[x] < R.m[2][kDim[y]] * kDir[y]; });   // far first
+        dl->AddCircleFilled(o, 50, IM_COL32(255, 255, 255, 7), 40); dl->AddCircle(o, 50, IM_COL32(255, 255, 255, 18), 40, 1.0f);
+        dl->AddCircleFilled(o, 3, IM_COL32(220, 225, 235, 200));
+        for (int k = 0; k < 3; k++) {
+            const int ax = order[k];
+            const float sx = R.m[0][kDim[ax]] * kDir[ax], sy = -R.m[1][kDim[ax]] * kDir[ax], sz = R.m[2][kDim[ax]] * kDir[ax];
+            const float A = (sz < 0 ? 0.45f : 1.0f) * alpha;
+            const ImVec2 tip(o.x + sx * L, o.y + sy * L);
+            const ImU32 c = WithAlpha(cols[ax], A);
+            dl->AddLine(o, tip, c, 2.0f);
+            const float l = std::sqrt(sx * sx + sy * sy);
+            if (l > 0.15f) { const ImVec2 d(sx / l, sy / l), n(-d.y, d.x);
+                dl->AddTriangleFilled(ImVec2(tip.x + d.x * 6, tip.y + d.y * 6), ImVec2(tip.x - n.x * 4, tip.y - n.y * 4), ImVec2(tip.x + n.x * 4, tip.y + n.y * 4), c); }
+            else dl->AddCircleFilled(tip, 4, c);
+            char b[64]; std::snprintf(b, sizeof b, "%s %d", kAxisName[ax], a.n[ax]);
+            const ImVec2 ts = ImGui::CalcTextSize(b);
+            const ImVec2 dir = l > 0.15f ? ImVec2(sx / l, sy / l) : ImVec2(-0.75f, -0.66f);      // an axis pointing at you: its name up-left, clear of the others
+            ImVec2 at(tip.x + dir.x * (10 + ts.x * 0.5f) - ts.x * 0.5f, tip.y + dir.y * (8 + ts.y * 0.5f) - ts.y * 0.5f);
+            at.x = std::clamp(at.x, mn.x + 4, mx.x - ts.x - 4); at.y = std::clamp(at.y, mn.y + 26, mx.y - ts.y - 2);
+            dl->AddText(at, c, b);
+        }
+    }
+    dl->PopClipRect();
+}
+
+// ---- the tables: a scrolling grid, with the row labels, column headers and both sums held outside it ----
+struct TableGeo { bool ok = false; float x0 = 0, cw = 0, y0 = 0, rh = 0; ImVec2 cmin, cmax; };
+static TableGeo tgeo[2];
+static std::string Num(double v, bool money) {
+    if (!money) return std::to_string((long long)std::llround(v));
+    long long c = ToCents(v); const bool neg = c < 0; if (neg) c = -c;
+    const std::string whole = std::to_string(c / 100); std::string g;
+    for (size_t i = 0; i < whole.size(); i++) { if (i && (whole.size() - i) % 3 == 0) g += '.'; g += whole[i]; }
+    if (c % 100) { char b[8]; std::snprintf(b, sizeof b, ",%02lld", c % 100); g += b; }
+    return (neg ? "-" : "") + g;
+}
+static void CellBox(ImDrawList* dl, ImVec2 a, ImVec2 b, unsigned heat, const std::string& txt, bool right, ImU32 emptyBg, float bgAlpha = 0.55f) {
+    if (heat) dl->AddRectFilled(ImVec2(a.x + 1, a.y + 1), ImVec2(b.x - 1, b.y - 1), WithAlpha(heat, bgAlpha), 3.0f);
+    else dl->AddRectFilled(ImVec2(a.x + 1, a.y + 1), ImVec2(b.x - 1, b.y - 1), emptyBg, 3.0f);
+    if (txt.empty()) return;
+    const ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+    const float lum = heat ? (0.30f * (heat & 255) + 0.59f * ((heat >> 8) & 255) + 0.11f * ((heat >> 16) & 255)) / 255.0f : 0.0f;
+    const ImU32 tc = heat && lum * bgAlpha > 0.42f ? IM_COL32(15, 18, 25, 255) : IM_COL32(232, 238, 248, 255);
+    dl->PushClipRect(a, b, true);
+    dl->AddText(ImVec2(right ? b.x - ts.x - 6 : a.x + 6, (a.y + b.y - ts.y) * 0.5f), tc, txt.c_str());
+    dl->PopClipRect();
+}
+static void DrawFaceGrid(const char* id, const Face& f, const Axes& a, bool money, float flash, ImVec2 size, bool resetScroll) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float rowH = ImGui::GetTextLineHeight() + 9, headH = rowH + 6, gapS = 6;
+    float labelW = 110, cellW = money ? 86 : 54; const float sumW = money ? 104 : 66;
+    for (int r = 0; r < f.R && r < 2000; r++) labelW = std::max(labelW, ImGui::CalcTextSize(AxisLabel(a, f.rowAx, r).c_str()).x + 14);
+    for (int c = 0; c < f.C && c < 2000; c++) cellW = std::max(cellW, ImGui::CalcTextSize(AxisLabel(a, f.colAx, c).c_str()).x + 12);
+    labelW = std::min(labelW, std::max(110.0f, size.x * 0.32f)); cellW = std::min(cellW, 170.0f);
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // the grid box: as big as needed, at most what is left after the labels and the sums
+    const float maxW = std::max(60.0f, size.x - labelW - sumW - gapS), maxH = std::max(40.0f, size.y - headH - rowH - gapS);
+    const float needW = f.C * cellW, needH = f.R * rowH;
+    const bool sbY = needH > maxH, sbX = needW + (sbY ? st.ScrollbarSize : 0) > maxW;
+    const float gw = std::min(maxW, needW + (sbY ? st.ScrollbarSize : 0)), gh = std::min(maxH, needH + (sbX ? st.ScrollbarSize : 0));
+    const ImVec2 g0(o.x + labelW, o.y + headH);
+    ImGui::SetCursorScreenPos(g0);
+    ImGui::SetNextWindowContentSize(ImVec2(needW, needH));
+    if (resetScroll) ImGui::SetNextWindowScroll(ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(16, 19, 26, 255));
+    ImGui::BeginChild(id, ImVec2(gw, gh), false, ImGuiWindowFlags_HorizontalScrollbar);
+    const float sx = ImGui::GetScrollX(), sy = ImGui::GetScrollY();
+    ImGuiWindow* win = ImGui::GetCurrentWindow();
+    const float visW = gw - (win->ScrollbarY ? st.ScrollbarSize : 0), visH = gh - (win->ScrollbarX ? st.ScrollbarSize : 0);
+    const ImVec2 wp = ImGui::GetWindowPos();
+    ImDrawList* gdl = ImGui::GetWindowDrawList();
+    const int r0 = std::max(0, (int)(sy / rowH)), r1 = std::min(f.R, (int)((sy + visH) / rowH) + 1);
+    const int c0 = std::max(0, (int)(sx / cellW)), c1 = std::min(f.C, (int)((sx + visW) / cellW) + 1);
+    const ImVec2 mouse = ImGui::GetIO().MousePos; int hr = -1, hc = -1;
+    if (ImGui::IsWindowHovered() && mouse.x < wp.x + visW && mouse.y < wp.y + visH) { hc = (int)((mouse.x - wp.x + sx) / cellW); hr = (int)((mouse.y - wp.y + sy) / rowH); if (hc >= f.C || hr >= f.R) hr = hc = -1; }
+    for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
+        const size_t k = (size_t)r * f.C + c; const double v = money ? f.m[k] : f.q[k];
+        const ImVec2 p0(wp.x - sx + c * cellW, wp.y - sy + r * rowH);
+        const bool cross = r == hr || c == hc;
+        CellBox(gdl, p0, ImVec2(p0.x + cellW, p0.y + rowH), money ? f.hm[k] : f.hq[k], v != 0 ? Num(v, money) : std::string(inverse ? "0" : ""), true,
+                cross ? IM_COL32(255, 255, 255, 14) : IM_COL32(255, 255, 255, 5), cross ? 0.72f : 0.55f);
+    }
+    if (hr >= 0) {
+        const size_t k = (size_t)hr * f.C + hc;
+        ImGui::SetTooltip("%s\n%s\n%s%s", AxisLabel(a, f.rowAx, hr).c_str(), AxisLabel(a, f.colAx, hc).c_str(), money ? Eur(f.m[k]).c_str() : (std::to_string(f.q[k]) + " " + kQtyWord[mode]).c_str(),
+                          inverse && (money ? f.m[k] == 0 : f.q[k] == 0) ? "\nΤίποτα σε αυτό το διάστημα" : "");
+    }
+    TableGeo& g = tgeo[money ? 0 : 1];
+    g.ok = true; g.x0 = wp.x - sx; g.y0 = wp.y - sy; g.cw = cellW; g.rh = rowH; g.cmin = wp; g.cmax = ImVec2(wp.x + visW, wp.y + visH);
+    ImGui::EndChild();
+    ImGui::PopStyleColor(); ImGui::PopStyleVar();
+    // column headers above the grid, row labels on its left (they follow its scrolling)
+    const ImU32 head = IM_COL32(190, 205, 230, 255);
+    dl->PushClipRect(ImVec2(g0.x, o.y), ImVec2(g0.x + visW, g0.y), true);
+    for (int c = c0; c < c1; c++) {
+        const ImVec2 p0(g0.x - sx + c * cellW, o.y);
+        dl->PushClipRect(ImVec2(p0.x + 2, p0.y), ImVec2(p0.x + cellW - 2, g0.y), true);
+        const std::string t = AxisLabel(a, f.colAx, c);
+        dl->AddText(ImVec2(p0.x + 4, o.y + (headH - ImGui::GetTextLineHeight()) * 0.5f), c == hc ? IM_COL32(255, 230, 150, 255) : head, t.c_str());
+        dl->PopClipRect();
+    }
+    dl->PopClipRect();
+    dl->PushClipRect(ImVec2(o.x, g0.y), ImVec2(g0.x, g0.y + visH), true);
+    for (int r = r0; r < r1; r++) {
+        const ImVec2 p0(o.x, g0.y - sy + r * rowH);
+        dl->PushClipRect(p0, ImVec2(g0.x - 4, p0.y + rowH), true);
+        dl->AddText(ImVec2(p0.x + 4, p0.y + 4), r == hr ? IM_COL32(255, 230, 150, 255) : head, AxisLabel(a, f.rowAx, r).c_str());
+        dl->PopClipRect();
+    }
+    dl->PopClipRect();
+    // the corner says what runs where
+    { char b[96]; std::snprintf(b, sizeof b, "%s \\ %s", kAxisName[f.rowAx], kAxisName[f.colAx]);
+      dl->PushClipRect(o, ImVec2(g0.x - 4, g0.y), true); dl->AddText(ImVec2(o.x + 4, o.y + (headH - ImGui::GetTextLineHeight()) * 0.5f), IM_COL32(140, 155, 180, 255), b); dl->PopClipRect(); }
+    // the sums, outside the box: a column on the right (one per row), a row underneath (one per column)
+    const ImU32 sumBg = flash > 0 ? IM_COL32(255, 230, 150, (int)(40 + 90 * flash)) : IM_COL32(255, 255, 255, 12);
+    const float xs = g0.x + gw + gapS, ys = g0.y + gh + gapS;
+    dl->AddText(ImVec2(xs + 6, o.y + (headH - ImGui::GetTextLineHeight()) * 0.5f), IM_COL32(255, 225, 150, 255), "Σύνολο");
+    dl->PushClipRect(ImVec2(xs, g0.y), ImVec2(xs + sumW, g0.y + visH), true);
+    for (int r = r0; r < r1; r++) {
+        const ImVec2 p0(xs, g0.y - sy + r * rowH); const double v = money ? f.rsm[r] : f.rsq[r];
+        CellBox(dl, p0, ImVec2(p0.x + sumW, p0.y + rowH), flash > 0 ? 0 : (money ? f.hrm[r] : f.hrq[r]), v != 0 ? Num(v, money) : std::string(inverse ? "0" : "–"), true, sumBg, inverse ? 0.55f : 0.35f);
+    }
+    dl->PopClipRect();
+    dl->AddText(ImVec2(o.x + 4, ys + 4), IM_COL32(255, 225, 150, 255), "Σύνολο");
+    dl->PushClipRect(ImVec2(g0.x, ys), ImVec2(g0.x + visW, ys + rowH), true);
+    for (int c = c0; c < c1; c++) {
+        const ImVec2 p0(g0.x - sx + c * cellW, ys); const double v = money ? f.csm[c] : f.csq[c];
+        CellBox(dl, p0, ImVec2(p0.x + cellW, p0.y + rowH), flash > 0 ? 0 : (money ? f.hcm[c] : f.hcq[c]), v != 0 ? Num(v, money) : std::string(inverse ? "0" : "–"), true, sumBg, inverse ? 0.55f : 0.35f);
+    }
+    dl->PopClipRect();
+    CellBox(dl, ImVec2(xs, ys), ImVec2(xs + sumW, ys + rowH), 0, Num(money ? f.allM : (double)f.allQ, money), true, IM_COL32(255, 225, 150, flash > 0 ? 120 : 45));
+    ImGui::SetCursorScreenPos(o); ImGui::Dummy(size);
+}
+
+// phase 2: the flat face turns into a straight grid the way the table lies (rows down, columns across), then
+// every cell flies to its own cell in the table below, in a wave from the top-left, lifting on the way and
+// overshooting a little as it lands. Cells whose place is scrolled out of the table dissolve in the air.
+static void DrawFlight(ImVec2 mn, ImVec2 mx, const Face& f, bool money, float T) {
+    const TableGeo& g = tgeo[money ? 0 : 1];
+    ImDrawList* fg = ImGui::GetForegroundDrawList();
+    fg->PushClipRect(ImVec2(lowerMin.x, mn.y), lowerMax, true);
+    const Proj p = MakeProj(mn, mx);
+    const int span = std::max(1, f.R + f.C - 2);
+    const float cs = std::min((mx.x - mn.x) * 0.80f / std::max(1, f.C), (mx.y - mn.y) * 0.72f / std::max(1, f.R));
+    const float gx = (mn.x + mx.x - cs * f.C) * 0.5f, gy = (mn.y + mx.y - cs * f.R) * 0.5f + 8.0f;
+    const float turn = Ease(T / 0.28f);
+    for (int r = 0; r < f.R; r++) for (int c = 0; c < f.C; c++) {
+        const size_t k = (size_t)r * f.C + c; const unsigned col = money ? f.hm[k] : f.hq[k]; if (!col) continue;
+        ImVec2 src[4]; FaceQuad(p, f, r, c, animNear, src);
+        const ImVec2 m0(gx + c * cs, gy + r * cs), m1(m0.x + cs - 1, m0.y + cs - 1);
+        const ImVec2 mid[4] = { m0, ImVec2(m1.x, m0.y), m1, ImVec2(m0.x, m1.y) };
+        const float delay = 0.28f + 0.22f * (float)(r + c) / span, local = std::clamp((T - delay) / 0.48f, 0.0f, 1.0f);
+        ImVec2 d0(g.x0 + c * g.cw + 1, g.y0 + r * g.rh + 1), d1(d0.x + g.cw - 2, d0.y + g.rh - 2);
+        const bool hidden = !g.ok || d1.y > g.cmax.y + 1 || d1.x > g.cmax.x + 1 || d0.x < g.cmin.x - 1 || d0.y < g.cmin.y - 1;
+        if (hidden) { d0 = ImVec2(m0.x, m0.y + 50); d1 = ImVec2(m1.x, m1.y + 50); }
+        const ImVec2 dst[4] = { d0, ImVec2(d1.x, d0.y), d1, ImVec2(d0.x, d1.y) };
+        const float e = hidden ? EaseOutCubic(local) : EaseOutBack(local), lift = hidden ? 0.0f : std::sin(local * 3.14159f) * 36.0f;
+        ImVec2 q[4];
+        for (int i = 0; i < 4; i++) { const ImVec2 a0(src[i].x + (mid[i].x - src[i].x) * turn, src[i].y + (mid[i].y - src[i].y) * turn); q[i] = ImVec2(a0.x + (dst[i].x - a0.x) * e, a0.y + (dst[i].y - a0.y) * e - lift); }
+        const float A = hidden ? 1.0f - local : (local >= 1.0f ? 0.75f : 1.0f);
+        if (A <= 0.01f) continue;
+        fg->AddQuadFilled(q[0], q[1], q[2], q[3], WithAlpha(col, 0.92f * A));
+        if (local > 0.0f && local < 1.0f && !hidden) fg->AddQuad(q[0], q[1], q[2], q[3], IM_COL32(255, 255, 255, (int)(140 * std::sin(local * 3.14159f))), 1.0f);
+    }
+    fg->PopClipRect();
+}
+
+// the controls of one side: how they are named, search, which ones are in; clicking a name picks it
+static void DrawKeyPanel(const char* title, int ax, std::vector<DataConn::CubeKey>& keys, std::set<int>& on, int& key, const char* const* keyNames, int nKeys, char* find, size_t findSz) {
+    SectionTitle(title);
+    ImGui::TextDisabled("Εμφάνιση ως"); ImGui::SetNextItemWidth(-1);
+    ImGui::Combo("##key", &key, keyNames, nKeys);
+    ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##find", "Αναζήτηση", find, findSz);
+    if (ImGui::SmallButton("Όλοι")) for (auto& k : keys) on.insert(k.id);
+    ImGui::SameLine(); if (ImGui::SmallButton("Κανείς")) on.clear();
+    ImGui::SameLine();
+    if (!inverse) { if (ImGui::SmallButton("Top 20")) { on.clear(); for (size_t i = 0; i < keys.size() && i < 20; i++) on.insert(keys[i].id); } }
+    else if (ImGui::SmallButton("Τελευταία 20")) { on.clear(); for (size_t i = keys.size(); i > 0 && keys.size() - i < 20; i--) on.insert(keys[i - 1].id); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(inverse ? "Τα 20 με τα λιγότερα χρήματα στο διάστημα (και όσα δεν πούλησαν τίποτα)" : "Τα 20 με τα περισσότερα χρήματα στο διάστημα");
+    int none = 0; for (auto& k : keys) if (k.qty == 0) none++;
+    ImGui::TextDisabled("%d από %d · κλικ στο όνομα: επιλογή", (int)on.size(), (int)keys.size());
+    if (none > 0) ImGui::TextColored(inverse ? ImVec4(1.0f, 0.45f, 0.35f, 1) : ImVec4(0.55f, 0.58f, 0.65f, 1), "%d χωρίς τίποτα στο διάστημα", none);
+    const std::string f = FoldGreek(find);
+    std::vector<DataConn::CubeKey*> shown;
+    for (auto& k : keys) if (f.empty() || FoldGreek(KeyText(k, key)).find(f) != std::string::npos || FoldGreek(k.name).find(f) != std::string::npos) shown.push_back(&k);
+    if (inverse) std::reverse(shown.begin(), shown.end());           // what sells least first
+    ImGui::BeginChild("##keys", ImVec2(0, 0), true);
+    ImGuiListClipper clip; clip.Begin((int)shown.size());
+    while (clip.Step()) for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+        auto& k = *shown[i]; bool b = on.count(k.id) > 0;
+        ImGui::PushID(k.id);
+        if (ImGui::Checkbox("##on", &b)) { if (b) on.insert(k.id); else { on.erase(k.id); if (focusAx == ax && focusId == k.id) focusAx = focusId = -1; } }
+        ImGui::SameLine();
+        const bool sel = focusAx == ax && focusId == k.id;
+        if (k.qty == 0) ImGui::PushStyleColor(ImGuiCol_Text, inverse ? ImVec4(1.0f, 0.55f, 0.45f, 1) : ImVec4(0.55f, 0.58f, 0.65f, 1));
+        if (ImGui::Selectable(KeyText(k, key).c_str(), sel)) { if (sel) { focusAx = focusId = -1; } else { focusAx = ax; focusId = k.id; on.insert(k.id); } }
+        if (k.qty == 0) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s · %d %s%s", k.name.c_str(), Eur(k.money).c_str(), k.qty, ax == 0 ? kQtyWord[mode] : kQtyWord[mode], k.qty == 0 ? "\nτίποτα σε αυτό το διάστημα" : "");
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+static void StartFlatten(int depth, float nearS, int slice) {
+    anim = 1; animT = 0; animDepth = depth; animNear = nearS; animSlice = slice; ScreenFace(R, depth, animRowAx, animColAx);
+}
+// turn square on to the picked client's / service's slice, with time running across
+static void GoToFocusAcrossTime() {
+    M3 t{}; const int tdim = kDim[2];
+    t.m[0][tdim] = 1.0f;                                   // view x: time, later to the right
+    if (focusAx == 0) t.m[1][kDim[1]] = 1.0f; else t.m[1][kDim[0]] = 1.0f;   // view y: the other list
+    Ortho(t);
+    EaseTo(t, 0.7f); afterEase = 1;
+}
+} // namespace hcube
+
+// a lever (a small switch): the text beside it says which view is on now
+static bool Lever(const char* id, bool* v, float* anim, const char* offText, const char* onText, const char* tip) {
+    const float h = ImGui::GetFrameHeight() * 0.86f, w = h * 2.0f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(w, h));
+    bool changed = false;
+    if (ImGui::IsItemClicked()) { *v = !*v; changed = true; }
+    const bool hov = ImGui::IsItemHovered();
+    *anim += ((*v ? 1.0f : 0.0f) - *anim) * std::min(1.0f, ImGui::GetIO().DeltaTime * 12.0f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float t = *anim;
+    const ImU32 off = IM_COL32(70, 82, 104, 255), on = IM_COL32(215, 75, 60, 255);
+    auto mix = [](ImU32 a, ImU32 b, float k) { auto c = [&](int sh) { return (int)(((a >> sh) & 255) * (1 - k) + ((b >> sh) & 255) * k); }; return IM_COL32(c(0), c(8), c(16), 255); };
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), mix(off, on, t), h * 0.5f);
+    if (hov) dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(255, 255, 255, 90), h * 0.5f, 0, 1.5f);
+    const float r = h * 0.5f - 2.0f;
+    dl->AddCircleFilled(ImVec2(p.x + h * 0.5f + t * (w - h), p.y + h * 0.5f), r, IM_COL32(245, 247, 250, 255), 20);
+    ImGui::SameLine(0, 8); ImGui::AlignTextToFramePadding();
+    if (*v) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1), "%s", onText); else ImGui::TextDisabled("%s", offText);
+    if ((hov || ImGui::IsItemHovered()) && tip) ImGui::SetTooltip("%s", tip);
+    if (ImGui::IsItemClicked()) { *v = !*v; changed = true; }          // the text switches too
+    return changed;
+}
+
+static void DrawHistoryScreen() {
+    using namespace hcube;
+    if (from.empty()) {
+        to = CurrentDateString(); from = DateMinusDays(29);
+        // tests only: BM_TEST_CUBE = "days,yaw,pitch,mode", angles in milliradians;
+        // mode 1 flattens the face in view 8 s after start, mode 2 picks the top client and shows it across time
+        if (const char* e = std::getenv("BM_TEST_CUBE")) { int d = 29, ym = -650, pm = 400; testMode = 0;
+            std::sscanf(e, "%d,%d,%d,%d", &d, &ym, &pm, &testMode); from = DateMinusDays(d); R = Mul(RotX(pm / 1000.0f), RotY(ym / 1000.0f)); if (testMode) testFlatAt = ImGui::GetTime() + 8.0; }
+    }
+    // ---- the three subtabs: what the second axis is ----
+    if (ImGui::BeginTabBar("##hcmodes")) {
+        for (int m = 0; m < 3; m++) {
+            if (ImGui::BeginTabItem(kModeTab[m])) { if (anim == 0) SwitchMode(m); ImGui::EndTabItem(); }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(m == 0 ? "Πελάτες × υπηρεσίες × χρόνος: κάθε γραμμή υπηρεσίας (και μέσα σε πακέτα και συμβάσεις)"
+                                                         : m == 1 ? "Πελάτες × πακέτα υπηρεσιών × χρόνος: μία πώληση = μία χρέωση πακέτου"
+                                                                  : "Πελάτες × συμβάσεις (για ποια υπηρεσία ή πακέτο) × χρόνος: οι δόσεις τους");
+        }
+        ImGui::EndTabBar();
+    }
+    // ---- top bar: the period and the time step ----
+    ImGui::AlignTextToFramePadding(); CellText("Από:"); ImGui::SameLine(); DatePicker("hcfrom", from, ImVec2(0, 1));
+    ImGui::SameLine(); ImGui::AlignTextToFramePadding(); CellText("Έως:"); ImGui::SameLine(); DatePicker("hcto", to, ImVec2(0, 1));
+    ImGui::SameLine(0, 24); ImGui::AlignTextToFramePadding(); CellText("Βήμα χρόνου:"); ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+    { const ImVec2 cp = ImGui::GetCursorScreenPos(); UI_NOTE("##unit", cp, ImVec2(cp.x + 110, cp.y + ImGui::GetFrameHeight())); }
+    ImGui::Combo("##unit", &unit, kUnits, IM_ARRAYSIZE(kUnits));
+    if (from > to) std::swap(from, to);
+    const long long ver = g_app.conn->dataVersion();
+    if (from != loadedFrom || to != loadedTo || unit != loadedUnit || ver != loadedVer || mode != loadedMode) {
+        data = g_app.conn->historyCube(from, to, unit, mode);
+        loadedFrom = from; loadedTo = to; loadedUnit = unit; loadedVer = ver; loadedMode = mode;
+        if (!selInit) {         // the 20 with the most money on each side (only those with something in the period)
+            for (size_t i = 0; i < data.users.size() && i < 20; i++) if (data.users[i].qty > 0) userOn.insert(data.users[i].id);
+            for (size_t i = 0; i < data.services.size() && i < 20; i++) if (data.services[i].qty > 0) svcOn.insert(data.services[i].id);
+            selInit = true;
+        }
+    }
+    ImGui::SameLine(0, 24);
+    ImGui::TextDisabled("%d χρονικά βήματα · %d κελιά με κίνηση", (int)data.buckets.size(), (int)data.cells.size());
+    if (data.buckets.size() > 500) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Πολλά βήματα: διαλέξτε μεγαλύτερο βήμα χρόνου."); }
+
+    Axes a = BuildAxes();
+    static std::vector<Blob> blobs; BuildBlobs(a, blobs);
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float topH = std::floor(avail.y * 0.60f), sideW = std::floor(avail.x * 0.15f), midW = avail.x - 2 * sideW - 2 * ImGui::GetStyle().ItemSpacing.x;
+    static const char* uKeys[] = { "Όνομα", "ΚΩΔ", "Ειδικός κωδικός", "Διεύθυνση" };
+    static const char* sKeys[] = { "Όνομα", "Κωδικός" };
+
+    ImGui::BeginChild("##hcleft", ImVec2(sideW, topH), true);
+    DrawKeyPanel("Πελάτες", 0, data.users, userOn, userKey, uKeys, 4, userFind, sizeof userFind);
+    ImGui::EndChild();
+    ImGui::SameLine();
+    // ---- centre: the two cubes ----
+    ImGui::BeginChild("##hcmid", ImVec2(midW, topH), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const float dt = ImGui::GetIO().DeltaTime;
+    if (easeT < 1.0f) {
+        easeT = std::min(1.0f, easeT + dt / easeDur); R = FromQ(Slerp(easeA, easeB, Ease(easeT)));
+        if (easeT >= 1.0f && afterEase == 1) {
+            afterEase = 0; const int fp = FocusPos(a);
+            if (fp >= 0 && anim == 0) { float ns; DepthAx(R, nullptr, &ns); StartFlatten(focusAx, ns, fp); }
+        }
+    }
+    float align = 0, nearS = 1; const int depth = DepthAx(R, &align, &nearS);
+    const bool nearFace = align > 0.92f;
+    const int nDepth = a.n[depth];
+    layer = std::clamp(layer, 0, std::max(0, nDepth - 1));
+    if (testFlatAt > 0 && ImGui::GetTime() > testFlatAt && anim == 0) {
+        testFlatAt = 0;
+        if (testMode == 2 && !a.u.empty()) { focusAx = 0; focusId = a.u[0]->id; GoToFocusAcrossTime(); }
+        else StartFlatten(depth, nearS, -1);
+    }
+    const bool busy = anim != 0 || easeT < 1.0f;
+    float leverX = 0;
+    {   // controls of the cubes
+        ImGui::BeginDisabled(!nearFace || busy || a.n[0] == 0 || a.n[1] == 0);
+        if (ImGui::Button("Ισοπέδωση")) StartFlatten(depth, nearS, -1);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Όλες οι στρώσεις του άξονα «%s» προστίθενται σε έναν πίνακα.", kAxisName[depth]);
+        ImGui::SameLine();
+        if (ImGui::Button("Προβολή")) StartFlatten(depth, nearS, layer);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Μόνο μία στρώση του άξονα «%s», χωρίς άθροιση.", kAxisName[depth]);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(std::min(220.0f, midW * 0.22f));
+        leverX = ImGui::GetCursorScreenPos().x;
+        if (nDepth > 0) {
+            const std::string lab = AxisLabel(a, depth, layer);
+            const bool moved = ImGui::SliderInt("##layer", &layer, 0, nDepth - 1, lab.c_str());
+            if ((moved || ImGui::IsItemActivated()) && anim == 0) {          // the tables follow the slider: that one layer, at once
+                tableDepth = depth; ScreenFace(R, depth, tableRowAx, tableColAx); tableSlice = layer;
+            }
+            layerHot = ImGui::IsItemActive() || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Στρώση του βάθους (%s): οι πίνακες κάτω δείχνουν αμέσως μόνο αυτή τη στρώση.\nΣτον κύβο φωτίζεται με γαλάζιο πλαίσιο. «Όλο το βάθος» κάτω: ξανά τα αθροίσματα.\n«Προβολή» κάνει το ίδιο με κίνηση· η «Ισοπέδωση» τις αθροίζει όλες.", kAxisName[depth]);
+        } else layerHot = false;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Επαναφορά")) { EaseTo(Iso(), 0.6f); afterEase = 0; }
+        ImGui::SameLine();
+        const int fp = FocusPos(a);
+        if (fp >= 0) {
+            const std::string nm = AxisLabel(a, focusAx, fp);
+            ImGui::BeginDisabled(busy);
+            if (ImGui::Button(focusAx == 0 ? "Ο πελάτης στον χρόνο" : (std::string(kModeOne[mode]) + " στον χρόνο").c_str())) GoToFocusAcrossTime();
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s: %s ανά βήμα χρόνου", nm.c_str(), focusAx == 0 ? "ό,τι αγόρασε" : "οι πελάτες");
+            ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.86f, 0.55f, 1), "%s", nm.c_str());
+            ImGui::SameLine(); if (ImGui::SmallButton("×")) focusAx = focusId = -1;
+        } else if (nearFace) {
+            int ra, ca; ScreenFace(R, depth, ra, ca);
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1), "Γραμμές: %s · Στήλες: %s · Βάθος: %s", kAxisName[ra], kAxisName[ca], kAxisName[depth]);
+        } else ImGui::TextDisabled("Σύρετε για να γυρίσετε · διπλό κλικ: αρχική θέση");
+    }
+    {   // under the depth slider: the lever for the reversed view
+        ImGui::SetCursorScreenPos(ImVec2(leverX, ImGui::GetCursorScreenPos().y));
+        const bool was = inverse;
+        Lever("##inverse", &inverse, &leverT, "Κανονική όψη: ό,τι πουλάει φωτίζει", "Αντίστροφη όψη: ό,τι ΔΕΝ πουλάει φωτίζει",
+              "Αντίστροφη όψη: φωτίζει ό,τι δεν πουλάει.\nΚόκκινο = τίποτα σε αυτό το διάστημα, μπλε = ό,τι πουλάει περισσότερο.\nΙσχύει και για τους πίνακες κάτω (τα μηδενικά κελιά και σύνολα γίνονται κόκκινα).");
+        if (inverse != was) {
+            ModeState& ms = modeState[mode];
+            if (inverse) {          // every catalog entry joins the cube, so what never sells is there to see (back as it was when switched off)
+                ms.svcBeforeInverse = svcOn; ms.hadBefore = true;
+                if (data.services.size() <= 60) for (auto& k : data.services) svcOn.insert(k.id);
+                else for (size_t i = data.services.size(); i > 0 && data.services.size() - i < 60; i--) svcOn.insert(data.services[i - 1].id);
+            } else if (ms.hadBefore) { svcOn = ms.svcBeforeInverse; ms.hadBefore = false; if (focusAx == 1 && !svcOn.count(focusId)) focusAx = focusId = -1; }
+        }
+    }
+    const ImVec2 cmn = ImGui::GetCursorScreenPos(), csz = ImGui::GetContentRegionAvail();
+    ImGui::InvisibleButton("##cubes", ImVec2(std::max(1.0f, csz.x), std::max(1.0f, csz.y)));
+    if (ImGui::IsItemActive() && anim == 0 && afterEase == 0) {
+        const ImVec2 d = ImGui::GetIO().MouseDelta;
+        if (d.x != 0 || d.y != 0) { R = Mul(RotX(d.y * 0.008f), Mul(RotY(d.x * 0.008f), R)); Ortho(R); easeT = 1.0f; }
+    }
+    if (ImGui::IsItemDeactivated() && anim == 0 && afterEase == 0) { float al; DepthAx(R, &al); if (al > 0.88f) EaseTo(SnapNearest(R), 0.35f); }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0) && anim == 0) EaseTo(Iso(), 0.6f);
+    // animation: 1 the slices collapse onto the near side, 2 the cells fly into the tables, 3 the cube comes back
+    static Face full, partial;
+    bool resetScroll = false;
+    if (anim != 0) {
+        const float dur = anim == 1 ? 2.4f : anim == 2 ? 1.7f : 1.3f;
+        const bool first = anim == 1 && animT == 0.0f;
+        animT += dt / dur;
+        if (anim == 1) {
+            if (first) full = BuildFace(a, animDepth, animRowAx, animColAx, animSlice);
+            std::vector<char> arrived(a.n[animDepth], 0); const int Sd = Slabs(a.n[animDepth]);
+            for (int i = 0; i < a.n[animDepth]; i++) arrived[i] = SlabLocal(SlabOf(i, a.n[animDepth]), Sd, animT) >= 1.0f;
+            partial = BuildFace(a, animDepth, animRowAx, animColAx, animSlice, &arrived);
+        }
+        if (animT >= 1.0f) {
+            animT = 0;
+            if (anim == 1) { anim = 2; tableDepth = animDepth; tableRowAx = animRowAx; tableColAx = animColAx; tableSlice = animSlice; resetScroll = true; }
+            else if (anim == 2) { anim = 3; EaseTo(Iso(), 1.1f); }
+            else anim = 0;
+        }
+        if (anim == 2) resetScroll = true;
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float gap = 8.0f, halfW = (csz.x - gap) * 0.5f;
+    const ImVec2 m0 = cmn, m1 = ImVec2(cmn.x + halfW, cmn.y + csz.y), q0 = ImVec2(cmn.x + halfW + gap, cmn.y), q1 = ImVec2(cmn.x + csz.x, cmn.y + csz.y);
+    if (a.n[0] == 0 || a.n[1] == 0) {
+        char b[160]; std::snprintf(b, sizeof b, data.cells.empty() && !inverse ? "Δεν υπάρχει τίποτα στο διάστημα (%s)." : "Διαλέξτε πελάτες αριστερά και %s δεξιά.", kModeAxis[mode]);
+        dl->AddText(ImVec2(cmn.x + 20, cmn.y + 20), IM_COL32(200, 200, 200, 255), b);
+    } else {
+        // each cube in its own (see-through, mouse-transparent) child: its own draw list, so neither runs out of vertices
+        auto cubeIn = [&](const char* id, ImVec2 c0, ImVec2 c1, bool money) {
+            ImGui::SetCursorScreenPos(c0);
+            ImGui::BeginChild(id, ImVec2(c1.x - c0.x, c1.y - c0.y), false, ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
+            DrawCube(ImGui::GetWindowDrawList(), c0, c1, a, money, blobs, anim == 1 ? &partial : nullptr);
+            ImGui::EndChild(); };
+        cubeIn("##cubeM", m0, m1, true); cubeIn("##cubeQ", q0, q1, false);
+        if (anim == 2) { DrawFlight(m0, m1, full, true, animT); DrawFlight(q0, q1, full, false, animT); }
+        const char* lo = inverse ? "πουλάνε" : "λιγότερα"; const char* hi = inverse ? "δεν πουλάνε" : "περισσότερα";
+        const float lw = 120, hw = ImGui::CalcTextSize(hi).x, lx = cmn.x + csz.x - hw - lw - 12, ly = cmn.y + 10;
+        for (int i = 0; i < 40; i++) dl->AddRectFilled(ImVec2(lx + i * lw / 40, ly), ImVec2(lx + (i + 1) * lw / 40, ly + 8), DataConn::Heat(i / 39.0));
+        dl->AddText(ImVec2(lx - ImGui::CalcTextSize(lo).x - 6, ly - 4), IM_COL32(170, 182, 205, 255), lo); dl->AddText(ImVec2(lx + lw + 6, ly - 4), inverse ? IM_COL32(255, 160, 140, 255) : IM_COL32(170, 182, 205, 255), hi);
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("##hcright", ImVec2(sideW, topH), true);
+    DrawKeyPanel(kModeAxis[mode], 1, data.services, svcOn, svcKey, sKeys, 2, svcFind, sizeof svcFind);
+    ImGui::EndChild();
+
+    // ---- bottom 40%: the chosen face as two tables ----
+    lowerMin = ImGui::GetCursorScreenPos();
+    static bool faceExport = false;
+    ImGui::BeginChild("##hclow", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    lowerMax = ImVec2(lowerMin.x + ImGui::GetWindowWidth(), lowerMin.y + ImGui::GetWindowHeight());
+    {   char f0[96], f1[96], f2[96];
+        std::snprintf(f0, sizeof f0, "Πελάτες × %s (βάθος: χρόνος)", kAxisName[1]); std::snprintf(f1, sizeof f1, "Πελάτες × Χρόνος (βάθος: %s)", kAxisName[1]);
+        std::snprintf(f2, sizeof f2, "%s × Χρόνος (βάθος: πελάτες)", kAxisName[1]);
+        const char* faces[] = { f0, f1, f2 };
+        int fsel = tableDepth == 2 ? 0 : tableDepth == 1 ? 1 : 2;
+        ImGui::AlignTextToFramePadding(); CellText("Πλευρά:"); ImGui::SameLine(); ImGui::SetNextItemWidth(310);
+        if (ImGui::Combo("##face", &fsel, faces, 3)) { tableDepth = fsel == 0 ? 2 : fsel == 1 ? 1 : 0; DefaultFace(tableDepth, tableRowAx, tableColAx); tableSlice = -1; }
+        ImGui::SameLine();
+        if (tableSlice >= a.n[tableDepth]) tableSlice = -1;
+        if (tableSlice >= 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.86f, 0.55f, 1), "Μόνο %s: %s", kAxisName[tableDepth], AxisLabel(a, tableDepth, tableSlice).c_str());
+            ImGui::SameLine(); if (ImGui::SmallButton("Όλο το βάθος")) tableSlice = -1;
+        } else ImGui::TextDisabled("Κάθε κελί = άθροισμα όλου του άξονα «%s» (%s – %s). Δεξιά και κάτω: τα σύνολα.", kAxisName[tableDepth], DateGr(from).c_str(), DateGr(to).c_str());
+        if (inverse) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1), "· Αντίστροφη όψη: κόκκινο = δεν πούλησε"); }
+        {   const float bw = ImGui::CalcTextSize("Excel").x + ImGui::GetFrameHeight() * 0.82f + 14;
+            ImGui::SameLine(); ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - bw));
+            if (ExcelButton("##cubeexcel", "Εξαγωγή των δύο πινάκων σε Excel (χρήματα και ποσότητα), με τη στήλη και τη γραμμή των συνόλων")) faceExport = true; }
+    }
+    if (a.n[0] && a.n[1]) {
+        const Face f = BuildFace(a, tableDepth, tableRowAx, tableColAx, tableSlice);
+        if (faceExport) {
+            faceExport = false;
+            auto sheet = [&](bool money) {
+                xlsx::Sheet sh; sh.name = money ? "Χρήματα" : std::string("Ποσότητα (") + kQtyWord[mode] + ")"; sh.freezeRows = 1; sh.freezeCols = 1;
+                std::vector<xlsx::Cell> h = { xlsx::T(std::string(kAxisName[f.rowAx]) + " \\ " + kAxisName[f.colAx], xlsx::Header) };
+                for (int c = 0; c < f.C; c++) h.push_back(xlsx::T(AxisLabel(a, f.colAx, c), xlsx::Header));
+                h.push_back(xlsx::T("Σύνολο", xlsx::Header)); sh.rows.push_back(h);
+                for (int r = 0; r < f.R; r++) {
+                    std::vector<xlsx::Cell> row = { xlsx::T(AxisLabel(a, f.rowAx, r)) };
+                    for (int c = 0; c < f.C; c++) { const size_t k = (size_t)r * f.C + c; row.push_back(money ? xlsx::N(f.m[k], xlsx::Money) : xlsx::N((double)f.q[k], xlsx::Int)); }
+                    row.push_back(money ? xlsx::N(f.rsm[r], xlsx::SumMoney) : xlsx::N((double)f.rsq[r], xlsx::SumInt));
+                    sh.rows.push_back(row);
+                }
+                std::vector<xlsx::Cell> sum = { xlsx::T("Σύνολο", xlsx::SumLabel) };
+                for (int c = 0; c < f.C; c++) sum.push_back(money ? xlsx::N(f.csm[c], xlsx::SumMoney) : xlsx::N((double)f.csq[c], xlsx::SumInt));
+                sum.push_back(money ? xlsx::N(f.allM, xlsx::SumMoney) : xlsx::N((double)f.allQ, xlsx::SumInt));
+                sh.rows.push_back(sum);
+                return sh; };
+            const std::string face = std::string(kAxisName[f.rowAx]) + " × " + kAxisName[f.colAx];
+            const std::string depthText = tableSlice >= 0 ? std::string("μόνο ") + kAxisName[tableDepth] + ": " + AxisLabel(a, tableDepth, tableSlice) : std::string("άθροισμα όλου του άξονα «") + kAxisName[tableDepth] + "»";
+            const std::string title = std::string("Ιστορικό & Ανάλυση - ") + kModeTab[mode] + " - " + face;
+            SaveWorkbook(title, { sheet(true), sheet(false), ExportInfoSheet(title, { { "Διάστημα", DateGr(from) + " – " + DateGr(to) }, { "Βήμα χρόνου", kUnits[unit] },
+                { "Πλευρά", face }, { "Βάθος", depthText }, { "Όψη", inverse ? "Αντίστροφη (ό,τι δεν πουλάει)" : "Κανονική" },
+                { "Επιλογή", std::to_string(a.n[0]) + " πελάτες, " + std::to_string(a.n[1]) + " " + kModeAxis[mode] } }) });
+        }
+        const ImVec2 av = ImGui::GetContentRegionAvail();
+        const float w = (av.x - 16) * 0.5f, h = av.y - ImGui::GetTextLineHeightWithSpacing();
+        const float tAlpha = anim == 2 ? 0.18f : anim == 3 ? 0.18f + 0.82f * Ease(animT * 2.5f) : 1.0f;
+        const float flash = anim == 3 ? 1.0f - Ease(animT) : 0.0f;
+        const ImVec2 t0 = ImGui::GetCursorScreenPos();
+        char qt[64]; std::snprintf(qt, sizeof qt, "Ποσότητα (%s)", kQtyWord[mode]);
+        ImGui::BeginGroup(); CellText("Χρήματα (€)"); DrawFaceGrid("##hcgm", f, a, true, flash, ImVec2(w, h), resetScroll); ImGui::EndGroup();
+        ImGui::SameLine(0, 16);
+        ImGui::BeginGroup(); CellText(qt); DrawFaceGrid("##hcgq", f, a, false, flash, ImVec2(w, h), resetScroll); ImGui::EndGroup();
+        if (tAlpha < 1.0f) ImGui::GetWindowDrawList()->AddRectFilled(t0, lowerMax, WithAlpha(ImGui::GetColorU32(ImGuiCol_WindowBg), 0.85f * (1.0f - tAlpha)));
+    }
+    ImGui::EndChild();
+}
+
 struct NavItem { int page; int icon; const char* label; };
+static const char* PageLabel(int page);
 static const NavItem kNavItems[] = {
     { PAGE_HOME, IC_HOME, "Αρχική" },              { PAGE_CLIENTS, IC_PERSON, "Πελάτες" },
     { PAGE_JOINT, IC_PIE, "Διαχείριση" },          { PAGE_SERVICES, IC_TAG, "Υπηρεσίες" },
@@ -9316,6 +10692,35 @@ static const NavItem kNavItems[] = {
     { PAGE_NOTES, IC_NOTE, "Σημειώσεις" },
 };
 
+static const char* PageLabel(int page) {
+    for (auto& it : kNavItems) if (it.page == page) return it.label;
+    return page == PAGE_HISTORY ? "Ιστορικό & Ανάλυση" : page == PAGE_SETTINGS ? "Ρυθμίσεις" : page == PAGE_DASHBOARD ? "Αναλυτικά σύνολα" : "BManager";
+}
+static std::string ExportTitle() {
+    ImGuiContext& g = *GImGui;
+    std::string t;
+    if (ImGuiWindow* w = ImGui::GetCurrentWindow()) {
+        const std::string root = w->RootWindow ? w->RootWindow->Name : "";
+        if (root.rfind("PropertyManagerMain", 0) == 0) t = PageLabel(g_page);
+        else { t = root.substr(0, root.find("##")); if (t.empty()) t = PageLabel(g_page); }
+    }
+    std::vector<std::string> parts = { t };
+    for (int i = 0; i < g.CurrentTabBarStack.Size; i++) {
+        const ImGuiPtrOrIndex& ref = g.CurrentTabBarStack[i];
+        ImGuiTabBar* tb = ref.Ptr ? (ImGuiTabBar*)ref.Ptr : g.TabBars.GetByIndex(ref.Index);
+        if (!tb) continue;
+        if (tb->Window && ImGui::GetCurrentWindow() && tb->Window->RootWindow != ImGui::GetCurrentWindow()->RootWindow) continue;     // a tab of the page behind this window
+        ImGuiTabItem* tab = ImGui::TabBarFindTabByID(tb, tb->VisibleTabId);
+        const char* n = tab ? ImGui::TabBarGetTabName(tb, tab) : nullptr;
+        if (!n || !*n) continue;
+        std::string nm = n; nm = nm.substr(0, nm.find("##"));
+        if (nm.empty() || std::find(parts.begin(), parts.end(), nm) != parts.end()) continue;
+        if (parts.size() == 1 && parts[0].find(nm) != std::string::npos) parts[0] = nm;      // «Χρεώσεις Πληρωμές Αποδείξεις» + «Αποδείξεις» -> «Αποδείξεις»
+        else parts.push_back(nm);
+    }
+    std::string out; for (auto& x : parts) { if (!out.empty()) out += " - "; out += x; }
+    return out;
+}
 static void DrawNavBar() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
@@ -9332,7 +10737,7 @@ static void DrawNavBar() {
         ImGui::PushID(page);
         ImVec2 p = ImGui::GetCursorScreenPos();
         const bool sel = g_page == page;
-        if (ImGui::InvisibleButton("nav", ImVec2(itemW, kNavBarH))) g_page = page;
+        if (ImGui::InvisibleButton(label, ImVec2(itemW, kNavBarH))) g_page = page;
         const bool hov = ImGui::IsItemHovered();
         if (hov) ImGui::SetTooltip("%s", label);
         if (sel) dl->AddRectFilled(p, ImVec2(p.x + itemW, p.y + kNavBarH), ImGui::GetColorU32(ImVec4(0.20f, 0.42f, 0.62f, 0.55f)));
@@ -9343,6 +10748,28 @@ static void DrawNavBar() {
         ImGui::PopID();
     };
     for (auto& it : kNavItems) { item(it.page, it.icon, it.label); ImGui::SameLine(); }
+    // Ιστορικό & Ανάλυση: a wider button with its name, in the middle of the free space between the icons and the settings
+    {   const float rowEnd = ImGui::GetCursorPosX(), gearX = ImGui::GetWindowWidth() - itemW - 6.0f;
+        const char* label = "Ιστορικό & Ανάλυση";
+        const float w = ImGui::CalcTextSize(label).x + 64.0f;
+        if (gearX - rowEnd > w + 12.0f) {
+            ImGui::SetCursorPosX(rowEnd + (gearX - rowEnd - w) * 0.5f);
+            ImGui::PushID(PAGE_HISTORY);
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const bool sel = g_page == PAGE_HISTORY;
+            if (ImGui::InvisibleButton(label, ImVec2(w, kNavBarH))) g_page = PAGE_HISTORY;
+            const bool hov = ImGui::IsItemHovered();
+            if (hov) ImGui::SetTooltip("Ο κύβος: πελάτες × υπηρεσίες / πακέτα / συμβάσεις × χρόνος");
+            const ImVec2 q0(p.x + 4, p.y + 8), q1(p.x + w - 4, p.y + kNavBarH - 8);
+            dl->AddRectFilled(q0, q1, ImGui::GetColorU32(sel ? ImVec4(0.20f, 0.42f, 0.62f, 0.75f) : hov ? ImVec4(0.22f, 0.30f, 0.42f, 0.9f) : ImVec4(0.16f, 0.20f, 0.28f, 0.9f)), 8.0f);
+            dl->AddRect(q0, q1, ImGui::GetColorU32(sel ? kColLink : ImVec4(0.40f, 0.52f, 0.70f, 0.6f)), 8.0f, 0, 1.2f);
+            const ImU32 col = ImGui::GetColorU32(sel ? ImVec4(0.92f, 0.96f, 1.0f, 1) : ImVec4(0.78f, 0.84f, 0.92f, 1));
+            DrawNavIcon(dl, ImVec2(p.x + 24, p.y + kNavBarH * 0.5f), 20.0f, IC_CUBE, col);
+            dl->AddText(ImVec2(p.x + 44, p.y + (kNavBarH - ImGui::GetTextLineHeight()) * 0.5f), col, label);
+            ImGui::PopID();
+        } else { item(PAGE_HISTORY, IC_CUBE, label); }         // a narrow window: just the icon
+        ImGui::SameLine();
+    }
     // settings at the far end (a developer page; it will not stay in the final product)
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - itemW - 6.0f));
     item(PAGE_SETTINGS, IC_GEAR, "Ρυθμίσεις");
@@ -9379,6 +10806,8 @@ static void DrawContractViewWindows() {
         ImGui::SetNextWindowSize(ImVec2(760, 620), ImGuiCond_FirstUseEver);
         std::string title = "Σύμβαση: " + v.c.label + " · " + v.c.user_name + "###contract_" + std::to_string(id);
         ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse);
+        if (ImGui::SmallButton("Κλείσιμο")) open = false;
+        ImGui::SameLine();
         if (LinkCell(v.c.user_name)) OpenUserProfile(v.c.user_id);
         ImGui::SameLine(); ImGui::TextDisabled("%s – %s · %d δόσεις · %s", DateGr(v.c.start_date).c_str(), DateGr(v.c.end_date).c_str(), v.c.installments, v.c.cancelled ? (v.c.open ? "ακυρωμένη, εκκρεμεί οφειλή" : "ακυρωμένη, ολοκληρώθηκε") : v.c.open ? "σε ισχύ" : "παλιά: ολοκληρώθηκε και εξοφλήθηκε");
         ImGui::TextDisabled("Δημιουργήθηκε: %s · ενεργή έως %s", v.c.created_at.c_str(), DateGr(v.c.end_date).c_str());
@@ -11242,6 +12671,7 @@ static void DrawBillsManaged() {
     DrawJointOpsTable(-1, "bills_managed");
 }
 
+static void DrawBuildingPartnersLedger(const char* id, int defaultState);
 static void DrawBillsScreen() {
     ImGui::SetWindowFontScale(1.2f); CellText("Χρεώσεις"); ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine(); ImGui::TextDisabled("  χρεώσαμε → οφείλεται → εισπράττουμε (όλο ή μέρος, κάθε φορά με απόδειξη) → εξοφλείται");
@@ -11250,6 +12680,7 @@ static void DrawBillsScreen() {
         if (ImGui::BeginTabItem("Συμβάσεις")) { DrawBillsClients<7>(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Διαχείριση")) { DrawBillsManaged(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Συνεργάτες (κόστη μας)")) { DrawBillsPartners(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Συνεργάτες πολυκατοικιών")) { DrawBuildingPartnersLedger("bplc", 0); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 }
@@ -13175,14 +14606,305 @@ static void DrawScoringScreen() {
 }
 
 // ---- Μηνιαία έξοδα: log the month's expenses, collect from the residents, then pay the cost (with the deposit if needed).
+// =====================================================================================================
+// ΣΥΝΕΡΓΑΤΕΣ ΠΟΛΥΚΑΤΟΙΚΙΑΣ: whoever a managed building pays (ΔΕΗ, the cleaner, the lift company...). A list of its own per building
+// (one of our partners can be copied in to start it). A line of a monthly cost can name one: owed while that month's cost is open,
+// paid when the cost is paid. ΣΥΝΤΟΜΕΥΣΕΙΣ ΕΞΟΔΩΝ: the lines logged once come back next month with the last price, all editable.
+// =====================================================================================================
+static std::string IbanPretty(const std::string& iban) { std::string o; int k = 0; for (char c : iban) { if (c == ' ') continue; if (k && k % 4 == 0) o += ' '; o += c; k++; } return o; }
+// a star you click on and off (drawn, so it looks the same on every machine)
+static bool StarToggle(const char* id, bool* v, const char* tipOn, const char* tipOff) {
+    const float sz = ImGui::GetFrameHeight();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(sz, sz));
+    if (clicked) *v = !*v;
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 c(p.x + sz * 0.5f, p.y + sz * 0.5f); const float R = sz * 0.40f, r = R * 0.45f;
+    ImVec2 pts[10]; for (int i = 0; i < 10; i++) { const float a = -IM_PI / 2 + i * IM_PI / 5; const float rr = (i & 1) ? r : R; pts[i] = ImVec2(c.x + std::cos(a) * rr, c.y + std::sin(a) * rr); }
+    const ImU32 col = *v ? IM_COL32(255, 205, 70, 255) : (hov ? IM_COL32(200, 200, 210, 255) : IM_COL32(110, 115, 130, 255));
+    if (*v) dl->AddConcavePolyFilled(pts, 10, col); else dl->AddPolyline(pts, 10, col, ImDrawFlags_Closed, 1.4f);
+    if (hov) ImGui::SetTooltip("%s", *v ? tipOn : tipOff);
+    return clicked;
+}
+static int g_bpReq = 0;                       // which place asked for the partner dialog: 1 the partners tab, 2 the monthly cost popup, 3 a ledger
+static DataConn::BuildingPartner g_bpEdit;
+static TextBuf bp_name, bp_trade, bp_addr, bp_phone, bp_email, bp_afm, bp_iban, bp_notes;
+static std::string g_bpErr;
+static int g_bpCreated = -1;                  // the partner the dialog just saved (the cost popup puts a new one on its line)
+static int g_bpCard = -1;                     // the partner whose card is open
+static void OpenBuildingPartnerEdit(int buildingId, int partnerId, int from) {
+    g_bpEdit = partnerId > 0 ? g_app.conn->getBuildingPartner(partnerId) : DataConn::BuildingPartner{};
+    if (partnerId <= 0) g_bpEdit.building_id = buildingId;
+    bp_name.set(g_bpEdit.name); bp_trade.set(g_bpEdit.trade); bp_addr.set(g_bpEdit.address); bp_phone.set(g_bpEdit.phone);
+    bp_email.set(g_bpEdit.email); bp_afm.set(g_bpEdit.afm); bp_iban.set(g_bpEdit.iban); bp_notes.set(g_bpEdit.notes);
+    g_bpErr.clear(); g_bpReq = from; g_bpCreated = -1;
+}
+static void DrawBuildingPartnerDialog(int from) {
+    if (g_bpReq == from) { ImGui::OpenPopup("Συνεργάτης πολυκατοικίας"); g_bpReq = 0; }
+    if (!ImGui::BeginPopupModal("Συνεργάτης πολυκατοικίας", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    const bool isNew = g_bpEdit.id < 0;
+    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.45f, 1), "%s", g_app.conn->getBuildingById(g_bpEdit.building_id).address.c_str());
+    ImGui::SameLine(); ImGui::TextDisabled(isNew ? "· νέος συνεργάτης της πολυκατοικίας" : "· επεξεργασία");
+    if (isNew) {   // start from one of our partners: the details are copied, the two stay separate from then on
+        static PickerState ps;
+        if (ImGui::Button("Αντιγραφή από τους συνεργάτες μας  ▼")) { ps = PickerState{}; ImGui::OpenPopup("bpcopy"); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ένας από τους δικούς μας συνεργάτες γίνεται και συνεργάτης της πολυκατοικίας (αντίγραφο των στοιχείων του).");
+        PickerPopup("bpcopy", ps, "Αναζήτηση συνεργάτη…", [&](const std::string& q, int off, bool& done) {
+            static Cached<std::pair<std::vector<Partner>, int>> cache;
+            const auto& res = cache.get(q + "#" + std::to_string(off), [&] { return std::make_pair(g_app.conn->pagePartners(q, true, {}, off, kPickPage), g_app.conn->countPartners(q, true)); });
+            for (auto& pr : res.first) {
+                ImGui::PushID(pr.id);
+                if (ImGui::Selectable((pr.name + (pr.trade.empty() ? "" : "  ·  " + pr.trade)).c_str())) {
+                    const Partner f = g_app.conn->getPartner(pr.id);
+                    bp_name.set(f.name); bp_trade.set(f.trade); bp_phone.set(f.phone); bp_email.set(f.email); bp_afm.set(f.afm); bp_iban.set(f.iban); bp_notes.set(f.notes);
+                    g_bpEdit.source_partner_id = f.id; done = true;
+                }
+                ImGui::PopID();
+            }
+            if (res.first.empty()) ImGui::TextDisabled("Κανένας συνεργάτης.");
+            return res.second; });
+        if (g_bpEdit.source_partner_id > 0) { ImGui::SameLine(); ImGui::TextDisabled("αντίγραφο του #%d", g_bpEdit.source_partner_id); }
+    }
+    auto field = [&](const char* label, const char* id, TextBuf& b, const char* hint, float w = 380.0f) {
+        ImGui::AlignTextToFramePadding(); CellText(label); ImGui::SameLine(120);
+        ImGui::SetNextItemWidth(w); ImGui::InputTextWithHint(id, hint, b.data, sizeof(b.data));
+    };
+    field("Όνομα:", "##bpn", bp_name, "π.χ. ΔΕΗ, Καθαρίστρια Μαρία, Ανελκυστήρες Α.Ε.");
+    field("Ειδικότητα:", "##bpt", bp_trade, "π.χ. ρεύμα, καθαριότητα, ανελκυστήρας");
+    field("Διεύθυνση:", "##bpa", bp_addr, "");
+    field("Τηλέφωνο:", "##bpp", bp_phone, "", 200.0f);
+    field("Email:", "##bpe", bp_email, "");
+    field("ΑΦΜ:", "##bpf", bp_afm, "9 ψηφία", 160.0f);
+    field("IBAN:", "##bpi", bp_iban, "GR..");
+    ImGui::AlignTextToFramePadding(); CellText("Σημειώσεις:"); ImGui::SameLine(120);
+    ImGui::InputTextMultiline("##bpno", bp_notes.data, sizeof(bp_notes.data), ImVec2(380, 54));
+    if (!g_bpErr.empty()) ImGui::TextColored(kColOut, "%s", g_bpErr.c_str());
+    const bool ok = bp_name.str().find_first_not_of(" \t") != std::string::npos;
+    ImGui::BeginDisabled(!ok);
+    if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) {
+        DataConn::BuildingPartner p = g_bpEdit;
+        p.name = bp_name.str(); p.trade = bp_trade.str(); p.address = bp_addr.str(); p.phone = bp_phone.str(); p.email = bp_email.str();
+        p.afm = bp_afm.str(); p.iban = bp_iban.str(); p.notes = bp_notes.str();
+        const int id = g_app.conn->saveBuildingPartner(p);
+        if (id > 0) { g_bpCreated = id; ImGui::CloseCurrentPopup(); } else g_bpErr = g_app.conn->takeLastError();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(); if (ImGui::Button("Άκυρο", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+// a combo of the building's partners for one cost line; "+ Νέος" opens the dialog (the new partner lands on this line)
+static bool BuildingPartnerCombo(const char* id, int bid, int& partnerId, float width, int* wantNewFor = nullptr, int line = -1) {
+    static Cached<std::vector<DataConn::BuildingPartner>> pc;
+    const auto& parts = pc.get(std::to_string(bid), [&] { return g_app.conn->getBuildingPartners(bid); });
+    std::string cur = "— χωρίς συνεργάτη";
+    for (auto& p : parts) if (p.id == partnerId) cur = p.name;
+    bool ch = false;
+    ImGui::SetNextItemWidth(width);
+    const ImVec2 cp = ImGui::GetCursorScreenPos(); UI_NOTE(id, cp, ImVec2(cp.x + width, cp.y + ImGui::GetFrameHeight()));
+    if (ImGui::BeginCombo(id, cur.c_str(), ImGuiComboFlags_HeightLarge)) {
+        if (ImGui::Selectable("— χωρίς συνεργάτη", partnerId <= 0)) { partnerId = -1; ch = true; }
+        for (auto& p : parts) { ImGui::PushID(p.id); if (ImGui::Selectable((p.name + (p.trade.empty() ? "" : "  ·  " + p.trade)).c_str(), p.id == partnerId)) { partnerId = p.id; ch = true; } ImGui::PopID(); }
+        if (wantNewFor) { ImGui::Separator(); if (ImGui::Selectable("+ Νέος συνεργάτης πολυκατοικίας…")) *wantNewFor = line; }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered() && partnerId <= 0) ImGui::SetTooltip("Σε ποιον χρωστάει η πολυκατοικία αυτό το έξοδο (προαιρετικό)");
+    return ch;
+}
+// the lines that name building partners: what is owed (costs still open) and what was paid (with the day)
+static void DrawBuildingPartnerLines(const char* id, const std::vector<DataConn::BuildingPartnerLine>& lines, bool showBuilding);
+static void OpenBillWindowById(int billId, int buildingId, const std::string& ym);
+static void DrawBuildingPartnerLines(const char* id, const std::vector<DataConn::BuildingPartnerLine>& lines, bool showBuilding) {
+    using L = DataConn::BuildingPartnerLine;
+    static std::map<std::string, GridState> gs;
+    enum { BL_YM, BL_BLD, BL_PARTNER, BL_WHY, BL_AMT, BL_STATE, BL_PAID, BL_N };
+    static const ListColDef cols[BL_N] = { LC("Μήνας"), LC("Πολυκατοικία"), LC("Συνεργάτης"), LC("Αιτία"), LC("Ποσό"), LC("Κατάσταση"), LC("Πληρώθηκε") };
+    auto text = [showBuilding](const L& l, int c) -> std::string {
+        switch (c) { case BL_YM: return l.ym; case BL_BLD: return showBuilding ? l.building : std::string(); case BL_PARTNER: return l.partner; case BL_WHY: return l.reason;
+                     case BL_AMT: return Eur(l.amount); case BL_STATE: return l.status == "resolved" ? "Πληρώθηκε" : "Οφείλεται"; case BL_PAID: return l.status == "resolved" ? DateGr(l.paid_date) : std::string(); default: return ""; } };
+    DrawMiniList(id, gs[id], cols, BL_N, lines, text, [&](const L& l, int c) {
+        if (c == BL_PARTNER) { if (LinkCell(l.partner)) g_bpCard = l.partner_id; }
+        else if (c == BL_STATE) ImGui::TextColored(l.status == "resolved" ? kColIn : kColWeOwe, "%s", text(l, c).c_str());
+        else if (c == BL_AMT) ImGui::TextColored(l.status == "resolved" ? kColOut : kColWeOwe, "%s", Eur(l.amount).c_str());
+        else CellText(text(l, c).c_str()); }, [](const L& l) { OpenBillWindowById(l.bill_id, l.building_id, l.ym); });
+}
+// the partner's card: his details, what he is owed and was paid, every line that names him
+static void DrawBuildingPartnerCard() {
+    if (g_bpCard <= 0) return;
+    static Cached<DataConn::BuildingPartner> pc; static Cached<std::vector<DataConn::BuildingPartnerLine>> lc;
+    const auto& p = pc.get(std::to_string(g_bpCard), [] { return g_app.conn->getBuildingPartner(g_bpCard); });
+    if (p.id < 0) { g_bpCard = -1; return; }
+    const auto& lines = lc.get(std::to_string(g_bpCard), [] { return g_app.conn->getBuildingPartnerLines(-1, g_bpCard, 0); });
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(820, 560), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin(("Συνεργάτης πολυκατοικίας · " + p.name + "###bpcard").c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::SetWindowFontScale(1.25f); ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.45f, 1), "%s", p.name.c_str()); ImGui::SetWindowFontScale(1.0f);
+        if (!p.trade.empty()) { ImGui::SameLine(); ImGui::TextDisabled("· %s", p.trade.c_str()); }
+        if (!p.active) { ImGui::SameLine(); ImGui::TextColored(kColOwed, "(διαγραμμένος)"); }
+        ImGui::TextDisabled("Πολυκατοικία: %s", p.building.c_str());
+        auto kv = [](const char* k, const std::string& v) { if (v.empty()) return; ImGui::TextDisabled("%s", k); ImGui::SameLine(110); ImGui::TextUnformatted(v.c_str()); };
+        kv("Διεύθυνση", p.address); kv("Τηλέφωνο", p.phone); kv("Email", p.email); kv("ΑΦΜ", p.afm); kv("IBAN", IbanPretty(p.iban)); kv("Σημειώσεις", p.notes);
+        if (p.active) { if (ImGui::Button("Επεξεργασία στοιχείων")) OpenBuildingPartnerEdit(p.building_id, p.id, 4); ImGui::SameLine(); }
+        if (ImGui::Button("Κλείσιμο")) open = false;
+        DrawBuildingPartnerDialog(4);
+        if (ImGui::BeginTable("bpctiles", 3, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); StatTile("Του χρωστάμε", Eur(p.owed), p.owed > 0.005 ? kColWeOwe : kColMuted, "από κόστη που δεν πληρώθηκαν", ImVec2(ImGui::GetContentRegionAvail().x, 90));
+            ImGui::TableNextColumn(); StatTile("Πληρώθηκε", Eur(p.paid), p.paid > 0.005 ? kColOut : kColMuted, p.last_paid.empty() ? "ακόμα τίποτα" : ("τελευταία " + DateGr(p.last_paid)).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 90));
+            ImGui::TableNextColumn(); StatTile("Γραμμές εξόδων", std::to_string(p.lines), ImVec4(0.55f, 0.75f, 1.0f, 1), nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 90));
+            ImGui::EndTable();
+        }
+        SectionTitle("Τα έξοδα της πολυκατοικίας που τον αφορούν");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Οφείλεται όσο το κόστος του μήνα είναι ανοιχτό· πληρώνεται μαζί με την «Πληρωμή κόστους». Κλικ σε γραμμή: το κόστος του μήνα.");
+        ImGui::PopStyleColor();
+        if (lines.empty()) ImGui::TextDisabled("Κανένα έξοδο ακόμα.");
+        else DrawBuildingPartnerLines("bpcardlines", lines, false);
+    }
+    ImGui::End();
+    if (!open) g_bpCard = -1;
+}
+
+// ---- the building window's tab: its partners
+static void DrawBuildingPartnersTab(int bid) {
+    static Cached<std::vector<DataConn::BuildingPartner>> pc;
+    const auto& parts = pc.get(std::to_string(bid), [&] { return g_app.conn->getBuildingPartners(bid); });
+    double owed = 0, paid = 0; for (auto& p : parts) { owed = FromCents(ToCents(owed) + ToCents(p.owed)); paid = FromCents(ToCents(paid) + ToCents(p.paid)); }
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.42f, 0.30f, 1));
+    if (ImGui::Button("+ Νέος συνεργάτης πολυκατοικίας")) OpenBuildingPartnerEdit(bid, -1, 1);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(); ImGui::TextDisabled("Όποιος πληρώνεται από την πολυκατοικία: ΔΕΗ, νερό, καθαριότητα, ανελκυστήρας... Οι ένοικοι χρωστάνε σε εμάς, εμείς σε αυτούς.");
+    static std::string err; static int removeId = -1; static std::string removeName; static bool askRemove = false;
+    DrawBuildingPartnerDialog(1);
+    if (ImGui::BeginTable("bptiles", 3, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); StatTile("Συνεργάτες", std::to_string(parts.size()), ImVec4(0.55f, 0.75f, 1.0f, 1), nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 90));
+        ImGui::TableNextColumn(); StatTile("Τους χρωστάμε", Eur(owed), owed > 0.005 ? kColWeOwe : kColMuted, "από κόστη μηνών που δεν πληρώθηκαν", ImVec2(ImGui::GetContentRegionAvail().x, 90));
+        ImGui::TableNextColumn(); StatTile("Τους πληρώσαμε", Eur(paid), paid > 0.005 ? kColOut : kColMuted, "μαζί με το κόστος κάθε μήνα", ImVec2(ImGui::GetContentRegionAvail().x, 90));
+        ImGui::EndTable();
+    }
+    if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
+    if (parts.empty()) { ImGui::Spacing(); ImGui::TextDisabled("Κανένας συνεργάτης ακόμα. «+ Νέος συνεργάτης πολυκατοικίας» (ή αντιγραφή ενός δικού μας)."); }
+    else {
+        using P = DataConn::BuildingPartner;
+        static std::map<int, GridState> gs;
+        enum { BP_NAME, BP_TRADE, BP_PHONE, BP_EMAIL, BP_AFM, BP_IBAN, BP_ADDR, BP_OWED, BP_PAID, BP_LAST, BP_ACT, BP_N };
+        static const ListColDef cols[BP_N] = { LC("Όνομα"), LC("Ειδικότητα"), LC("Τηλέφωνο"), LC("Email"), LC("ΑΦΜ"), LC("IBAN"), LC("Διεύθυνση"), LC("Του χρωστάμε"), LC("Πληρώσαμε"), LC("Τελευταία πληρωμή"), LCA };
+        auto text = [](const P& p, int c) -> std::string {
+            switch (c) { case BP_NAME: return p.name; case BP_TRADE: return p.trade; case BP_PHONE: return p.phone; case BP_EMAIL: return p.email; case BP_AFM: return p.afm; case BP_IBAN: return IbanPretty(p.iban);
+                         case BP_ADDR: return p.address; case BP_OWED: return Eur(p.owed); case BP_PAID: return Eur(p.paid); case BP_LAST: return p.last_paid.empty() ? std::string() : DateGr(p.last_paid); default: return ""; } };
+        const float rowH = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2 + 2;
+        const float boxH = std::clamp(ImGui::GetFrameHeightWithSpacing() * 2.6f + rowH * 2.2f + rowH * (float)std::min<size_t>(parts.size(), 10) + ImGui::GetStyle().ScrollbarSize,
+                                      150.0f, std::max(150.0f, ImGui::GetContentRegionAvail().y * 0.55f));
+        ImGui::BeginChild("##bplistbox", ImVec2(0, boxH), ImGuiChildFlags_None);
+        DrawMiniList("bplist", gs[bid], cols, BP_N, parts, text, [&](const P& p, int c) {
+            if (c == BP_NAME) { if (LinkCell(p.name)) g_bpCard = p.id; }
+            else if (c == BP_OWED) { if (ToCents(p.owed) > 0) ImGui::TextColored(kColWeOwe, "%s", Eur(p.owed).c_str()); else ImGui::TextDisabled("—"); }
+            else if (c == BP_PAID) { if (ToCents(p.paid) > 0) ImGui::TextColored(kColOut, "%s", Eur(p.paid).c_str()); else ImGui::TextDisabled("—"); }
+            else if (c == BP_ACT) {
+                if (ImGui::SmallButton("Επεξεργασία")) OpenBuildingPartnerEdit(bid, p.id, 1);
+                ImGui::SameLine(); if (ImGui::SmallButton("Διαγραφή")) { removeId = p.id; removeName = p.name; err.clear(); askRemove = true; }
+            }
+            else CellText(text(p, c).c_str()); }, [](const P& p) { g_bpCard = p.id; });
+        ImGui::EndChild();
+    }
+    if (askRemove) { ImGui::OpenPopup("Διαγραφή συνεργάτη πολυκατοικίας"); askRemove = false; }     // opened here: the same id scope as the popup
+    if (ImGui::BeginPopupModal("Διαγραφή συνεργάτη πολυκατοικίας", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Διαγραφή του «%s» από τους συνεργάτες της πολυκατοικίας;", removeName.c_str());
+        ImGui::TextDisabled("Κρύβεται από τις λίστες· τα έξοδα που τον αναφέρουν μένουν όπως ήταν.");
+        if (ImGui::Button("Διαγραφή", ImVec2(150, 0))) { if (!g_app.conn->removeBuildingPartner(removeId)) err = g_app.conn->takeLastError(); removeId = -1; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine(); if (ImGui::Button("Πίσω", ImVec2(120, 0))) { removeId = -1; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+    static Cached<std::vector<DataConn::BuildingPartnerLine>> lc;
+    const auto& lines = lc.get(std::to_string(bid), [&] { return g_app.conn->getBuildingPartnerLines(bid, -1, 0); });
+    SectionTitle("Τι χρωστάει η πολυκατοικία και τι πλήρωσε");
+    if (lines.empty()) ImGui::TextDisabled("Κανένα έξοδο με συνεργάτη ακόμα. Στην «+ Καταχώριση εξόδων μήνα» κάθε γραμμή μπορεί να έχει συνεργάτη.");
+    else DrawBuildingPartnerLines(("bplines" + std::to_string(bid)).c_str(), lines, false);
+}
+
+// ---- the building window's tab: the shortcuts for logging next month's costs
+static void DrawExpenseShortcutsTab(int bid) {
+    static Cached<std::vector<DataConn::ExpenseShortcut>> sc;
+    const auto& list = sc.get(std::to_string(bid), [&] { return g_app.conn->getExpenseShortcuts(bid); });
+    static DataConn::ExpenseShortcut ed; static TextBuf edLabel, edAmt; static std::string err; static bool ask = false;
+    auto open = [&](const DataConn::ExpenseShortcut* x) { ed = x ? *x : DataConn::ExpenseShortcut{}; ed.building_id = bid; edLabel.set(ed.label); edAmt.set(x ? FormatMoney(ed.amount) : ""); err.clear(); ask = true; };
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.42f, 0.30f, 1));
+    if (ImGui::Button("+ Νέα συντόμευση")) open(nullptr);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(); ImGui::TextDisabled("Ό,τι καταχωρίζεται στα έξοδα του μήνα μένει εδώ με την τελευταία τιμή του και ξαναμπαίνει με ένα κλικ τον επόμενο μήνα (όλα αλλάζουν).");
+    auto popup = [&]() {
+    if (ask) { ImGui::OpenPopup("Συντόμευση εξόδου"); ask = false; }
+    if (ImGui::BeginPopupModal("Συντόμευση εξόδου", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::SetNextItemWidth(320); ImGui::InputTextWithHint("Αιτία", "π.χ. ΔΕΗ κοινοχρήστων", edLabel.data, sizeof(edLabel.data));
+        ImGui::SetNextItemWidth(140); ImGui::InputTextWithHint("Προτεινόμενη τιμή (€)", "0,00", edAmt.data, sizeof(edAmt.data));
+        ImGui::AlignTextToFramePadding(); CellText("Συνεργάτης:"); ImGui::SameLine(); BuildingPartnerCombo("##scp", bid, ed.partner_id, 260);
+        double v = 0; const bool okAmt = edAmt.str().empty() || (ParseMoney(edAmt.str(), v) && ToCents(v) >= 0);
+        if (!okAmt) ImGui::TextColored(kColOut, "Μη έγκυρο ποσό.");
+        if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
+        ImGui::BeginDisabled(edLabel.str().find_first_not_of(" \t") == std::string::npos || !okAmt);
+        if (ImGui::Button("Αποθήκευση", ImVec2(150, 0))) { ed.label = edLabel.str(); ed.amount = v; if (g_app.conn->saveExpenseShortcut(ed) > 0) ImGui::CloseCurrentPopup(); else err = g_app.conn->takeLastError(); }
+        ImGui::EndDisabled();
+        ImGui::SameLine(); if (ImGui::Button("Άκυρο", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    } };
+    if (list.empty()) { ImGui::Spacing(); ImGui::TextDisabled("Καμία συντόμευση ακόμα: δημιουργούνται μόνες τους με την πρώτη «+ Καταχώριση εξόδων μήνα»."); popup(); return; }
+    using X = DataConn::ExpenseShortcut;
+    static std::map<int, GridState> gs;
+    enum { ES_LABEL, ES_AMT, ES_PARTNER, ES_USES, ES_LAST, ES_ACT, ES_N };
+    static const ListColDef cols[ES_N] = { LC("Αιτία"), LC("Προτεινόμενη τιμή"), LC("Συνεργάτης"), LC("Χρήσεις"), LC("Τελευταία χρήση"), LCA };
+    auto text = [](const X& x, int c) -> std::string { switch (c) { case ES_LABEL: return x.label; case ES_AMT: return Eur(x.amount); case ES_PARTNER: return x.partner; case ES_USES: return std::to_string(x.uses); case ES_LAST: return x.last_used.empty() ? std::string() : DateGr(x.last_used); default: return ""; } };
+    static int delId = -1;
+    DrawMiniList("eslist", gs[bid], cols, ES_N, list, text, [&](const X& x, int c) {
+        if (c == ES_PARTNER) { if (x.partner_id > 0) { if (LinkCell(x.partner)) g_bpCard = x.partner_id; } else ImGui::TextDisabled("—"); }
+        else if (c == ES_ACT) { if (ImGui::SmallButton("Επεξεργασία")) open(&x); ImGui::SameLine(); if (ImGui::SmallButton("Διαγραφή")) delId = x.id; }
+        else CellText(text(x, c).c_str()); }, [](const X&) {});
+    if (delId > 0) { g_app.conn->removeExpenseShortcut(delId); delId = -1; }
+    popup();                                                  // once per frame, at the tab's own level (also for an edit asked from inside the list)
+}
+
+// the building partners of every building, for the money sections (Χρεώσεις / Πληρωμές / Αποδείξεις). state: 0 all, 1 owed, 2 paid
+static void DrawBuildingPartnersLedger(const char* id, int defaultState) {
+    struct St { int building = -1, partner = -1, state = -1; };
+    static std::map<std::string, St> sts; St& s = sts[id];
+    if (s.state < 0) s.state = defaultState;
+    ImGui::PushID(id);
+    ImGui::TextDisabled("Οι συνεργάτες των πολυκατοικιών που διαχειριζόμαστε: τι τους χρωστάει κάθε πολυκατοικία (κόστη μηνών ανοιχτά) και τι τους πληρώθηκε (με την «Πληρωμή κόστους»).");
+    ImGui::AlignTextToFramePadding(); CellText("Πολυκατοικία:"); ImGui::SameLine();
+    if (PickBuilding("bplb", s.building, 280, "Όλες")) s.partner = -1;
+    ImGui::SameLine(); ImGui::SetNextItemWidth(170); ImGui::Combo("##st", &s.state, "Όλα\0Τους χρωστάμε\0Πληρώθηκαν\0");
+    static Cached<std::vector<DataConn::BuildingPartner>> pc;
+    const auto& parts = pc.get(std::string(id) + "|" + std::to_string(s.building), [&] { return g_app.conn->getBuildingPartners(s.building > 0 ? s.building : -1, true); });
+    ImGui::SameLine();
+    {   std::string cur = "Όλοι οι συνεργάτες"; for (auto& p : parts) if (p.id == s.partner) cur = p.name + " · " + p.building;
+        ImGui::SetNextItemWidth(280);
+        if (ImGui::BeginCombo("##bpp", cur.c_str(), ImGuiComboFlags_HeightLarge)) {
+            if (ImGui::Selectable("Όλοι οι συνεργάτες", s.partner < 0)) s.partner = -1;
+            for (auto& p : parts) { ImGui::PushID(p.id); if (ImGui::Selectable((p.name + "  ·  " + p.building).c_str(), p.id == s.partner)) s.partner = p.id; ImGui::PopID(); }
+            ImGui::EndCombo();
+        }
+    }
+    double owed = 0, paid = 0; for (auto& p : parts) if (s.partner < 0 || p.id == s.partner) { owed = FromCents(ToCents(owed) + ToCents(p.owed)); paid = FromCents(ToCents(paid) + ToCents(p.paid)); }
+    ImGui::TextColored(kColWeOwe, "Χρωστάνε οι πολυκατοικίες: %s", Eur(owed).c_str()); ImGui::SameLine(); ImGui::TextColored(kColOut, "· πληρώθηκαν: %s", Eur(paid).c_str());
+    ImGui::SameLine(); ImGui::TextDisabled("· %d συνεργάτες", (int)parts.size());
+    static Cached<std::vector<DataConn::BuildingPartnerLine>> lc;
+    const auto& lines = lc.get(std::string(id) + "|" + std::to_string(s.building) + "|" + std::to_string(s.partner) + "|" + std::to_string(s.state),
+                               [&] { return g_app.conn->getBuildingPartnerLines(s.building > 0 ? s.building : -1, s.partner, s.state); });
+    if (parts.empty()) ImGui::TextDisabled("Καμία πολυκατοικία δεν έχει δικούς της συνεργάτες ακόμα (Διαχείριση › πολυκατοικία › Συνεργάτες πολυκατοικίας).");
+    else if (lines.empty()) ImGui::TextDisabled("Καμία γραμμή εξόδων με αυτά τα φίλτρα.");
+    else DrawBuildingPartnerLines("lines", lines, true);
+    ImGui::PopID();
+}
+
 static void DrawNewBillPopup(int bid) {
     static std::string ym;
     if (ImGui::IsWindowAppearing()) ym = CurrentDateString().substr(0, 7);
-    struct R { TextBuf why, amt; };
+    struct R { TextBuf why, amt; int partner = -1; bool keep = true; };
     struct S { int user, apt; std::string name, apt_label; TextBuf amt; };
     static std::vector<R> reasons; static std::vector<S> shares; static TextBuf note; static std::string err;
+    static int newPartnerFor = -1;                    // the line whose "+ Νέος συνεργάτης" was chosen
     if (ImGui::IsWindowAppearing()) {
-        reasons.clear(); reasons.emplace_back(); shares.clear(); note.set(""); err.clear();
+        reasons.clear(); reasons.emplace_back(); shares.clear(); note.set(""); err.clear(); newPartnerFor = -1;
         for (auto& r : g_app.conn->getResidents(bid, false)) { S x; x.user = r.user_id; x.apt = r.apartment_id; x.name = r.full_name; x.apt_label = r.apartment; shares.push_back(x); }
         std::sort(shares.begin(), shares.end(), [](const S& a, const S& b) { return a.apt_label < b.apt_label; });
     }
@@ -13192,49 +14914,89 @@ static void DrawNewBillPopup(int bid) {
         ImGui::SameLine(); ImGui::Text("%s", ym.c_str()); ImGui::SameLine();
         if (ImGui::ArrowButton("##bym1", ImGuiDir_Right)) shift(1);
         ImGui::SameLine(); ImGui::TextDisabled("· οι ένοικοι χρωστάνε αμέσως το μερίδιό τους."); }
+    // a line from a shortcut (or a suggestion): into the empty last line, or a new one
+    auto addLine = [&](const std::string& why, double amount, int partner) {
+        if (reasons.empty() || !reasons.back().why.str().empty() || !reasons.back().amt.str().empty()) reasons.emplace_back();
+        R& r = reasons.back(); r.why.set(why); r.amt.set(ToCents(amount) > 0 ? FormatMoney(amount) : std::string()); r.partner = partner; r.keep = true;
+    };
+    auto hasLine = [&](const std::string& why) { const std::string f = FoldGreek(why); for (auto& r : reasons) if (FoldGreek(r.why.str()) == f) return true; return false; };
+    {   // the shortcuts of this building: what was logged before, with the last price (one click puts it in, everything stays editable)
+        static Cached<std::vector<DataConn::ExpenseShortcut>> sc;
+        const auto& list = sc.get(std::to_string(bid), [&] { return g_app.conn->getExpenseShortcuts(bid); });
+        if (!list.empty()) {
+            SectionTitle("Συντομεύσεις: τα έξοδα που καταχωρίσατε παλιότερα · κλικ = προσθήκη (η τιμή αλλάζει)");
+            if (ImGui::SmallButton("+ Όλες")) for (auto& x : list) if (!hasLine(x.label)) addLine(x.label, x.amount, x.partner_id);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Όλες οι συντομεύσεις μαζί, με τις τελευταίες τιμές τους");
+            ImGui::SameLine();
+            const float wrapW = 690.0f, sp = ImGui::GetStyle().ItemSpacing.x; float x = ImGui::CalcTextSize("+ Όλες").x + 2 * ImGui::GetStyle().FramePadding.x + sp;
+            for (auto& s : list) {
+                const std::string lbl = s.label + "  " + (ToCents(s.amount) > 0 ? Eur(s.amount) : std::string("—")) + (s.partner_id > 0 ? "  · " + s.partner : std::string());
+                const float w = ImGui::CalcTextSize(lbl.c_str()).x + 2 * ImGui::GetStyle().FramePadding.x;
+                if (x > 0 && x + w > wrapW) x = 0; else if (x > 0) ImGui::SameLine();
+                const bool used = hasLine(s.label);
+                ImGui::PushID(s.id);
+                ImGui::PushStyleColor(ImGuiCol_Button, used ? ImVec4(0.20f, 0.24f, 0.30f, 1) : ImVec4(0.22f, 0.36f, 0.50f, 1));
+                ImGui::BeginDisabled(used);
+                if (ImGui::SmallButton(lbl.c_str())) addLine(s.label, s.amount, s.partner_id);
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(used ? "Είναι ήδη στα έξοδα του μήνα" : "Χρησιμοποιήθηκε %d φορές%s", s.uses, s.last_used.empty() ? "" : (", τελευταία " + DateGr(s.last_used)).c_str());
+                ImGui::PopID();
+                x += w + sp;
+            }
+        }
+    }
     {   // suggestions only: nothing joins the cost unless it is added here
         static std::vector<DataConn::BillSuggestion> sug; static std::set<int> added;
         if (ImGui::IsWindowAppearing()) { sug = g_app.conn->billSuggestions(bid); added.clear(); }
         if (!sug.empty()) {
             SectionTitle("Προτάσεις: οφειλές και ό,τι προσφέραμε τις τελευταίες 30 ημέρες");
-            ImGui::BeginChild("##billsug", ImVec2(560, std::min(130.0f, 26.0f * (float)sug.size() + 8.0f)));
+            ImGui::BeginChild("##billsug", ImVec2(690, std::min(130.0f, 26.0f * (float)sug.size() + 8.0f)));
             for (auto& b : sug) {
                 ImGui::PushID(b.charge_id);
                 const double amount = ToCents(b.owed) > 0 ? b.owed : b.due;
                 ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s%s · %s", b.contract ? "Σύμβαση: " : "", b.label.c_str(), DateGr(b.date).c_str()); ImGui::SameLine(330);
+                ImGui::Text("%s%s · %s", b.contract ? "Σύμβαση: " : "", b.label.c_str(), DateGr(b.date).c_str()); ImGui::SameLine(360);
                 if (ToCents(b.owed) > 0) ImGui::TextColored(kColOwed, "χρωστάει %s", Eur(b.owed).c_str()); else ImGui::TextDisabled("εξοφλημένο %s", Eur(b.due).c_str());
-                ImGui::SameLine(480);
+                ImGui::SameLine(540);
                 if (added.count(b.charge_id)) ImGui::TextDisabled("προστέθηκε");
-                else if (ImGui::SmallButton("Προσθήκη")) {
-                    if (reasons.empty() || !reasons.back().why.str().empty() || !reasons.back().amt.str().empty()) reasons.emplace_back();
-                    reasons.back().why.set(b.label); reasons.back().amt.set(FormatMoney(amount)); added.insert(b.charge_id);
-                }
+                else if (ImGui::SmallButton("Προσθήκη")) { addLine(b.label, amount, -1); reasons.back().keep = false; added.insert(b.charge_id); }
                 ImGui::PopID();
             }
             ImGui::EndChild();
         }
     }
     long long total = 0, sum = 0; bool ok = true;
-    SectionTitle("Ανάλυση εξόδων (αιτία και ποσό)");
+    SectionTitle("Ανάλυση εξόδων (αιτία, ποσό, σε ποιον τα χρωστάει η πολυκατοικία)");
+    ImGui::TextDisabled("Το αστέρι: η γραμμή μένει ως συντόμευση για τον επόμενο μήνα (με αυτή την τιμή και τον συνεργάτη).");
     for (size_t i = 0; i < reasons.size(); ) {
         ImGui::PushID((int)i);
-        ImGui::SetNextItemWidth(320); ImGui::InputTextWithHint("##w", "αιτία (π.χ. ΔΕΗ κοινοχρήστων)", reasons[i].why.data, sizeof(reasons[i].why.data)); ImGui::SameLine();
-        ImGui::SetNextItemWidth(110); ImGui::InputTextWithHint("##a", "ποσό", reasons[i].amt.data, sizeof(reasons[i].amt.data)); ImGui::SameLine();
+        ImGui::SetNextItemWidth(250); ImGui::InputTextWithHint("##w", "αιτία (π.χ. ΔΕΗ κοινοχρήστων)", reasons[i].why.data, sizeof(reasons[i].why.data)); ImGui::SameLine();
+        ImGui::SetNextItemWidth(100); ImGui::InputTextWithHint("##a", "ποσό", reasons[i].amt.data, sizeof(reasons[i].amt.data)); ImGui::SameLine();
+        int want = -1;
+        BuildingPartnerCombo("##p", bid, reasons[i].partner, 210, &want, (int)i); ImGui::SameLine();
+        if (want >= 0) { newPartnerFor = want; OpenBuildingPartnerEdit(bid, -1, 2); }
+        StarToggle("##keep", &reasons[i].keep, "Θα μείνει ως συντόμευση για τον επόμενο μήνα (κλικ: όχι)", "Μόνο αυτή τη φορά (κλικ: να μείνει ως συντόμευση)");
+        ImGui::SameLine();
         double v = 0; if (!ParseMoney(reasons[i].amt.str(), v) || ToCents(v) <= 0 || reasons[i].why.str().empty()) ok = false; else total += ToCents(v);
         bool gone = ImGui::SmallButton("x") && reasons.size() > 1;
         ImGui::PopID();
         if (gone) reasons.erase(reasons.begin() + i); else i++;
     }
+    DrawBuildingPartnerDialog(2);
+    if (newPartnerFor >= 0 && g_bpCreated > 0) { if (newPartnerFor < (int)reasons.size()) reasons[newPartnerFor].partner = g_bpCreated; newPartnerFor = -1; g_bpCreated = -1; }
+    else if (newPartnerFor >= 0 && g_bpReq != 2 && !ImGui::IsPopupOpen("Συνεργάτης πολυκατοικίας")) newPartnerFor = -1;      // the dialog was closed without saving
     if (ImGui::SmallButton("+ Προσθήκη εξόδου")) reasons.emplace_back();
     ImGui::SetWindowFontScale(1.15f); ImGui::TextColored(kColOut, "Σύνολο εξόδων: %s", Eur(FromCents(total)).c_str()); ImGui::SetWindowFontScale(1.0f);
+    {   long long toPartners = 0; for (auto& r : reasons) { double v = 0; if (r.partner > 0 && ParseMoney(r.amt.str(), v)) toPartners += ToCents(v); }
+        if (toPartners > 0) { ImGui::SameLine(); ImGui::TextColored(kColWeOwe, "  · σε συνεργάτες της πολυκατοικίας %s", Eur(FromCents(toPartners)).c_str()); } }
     SectionTitle("Ανάλυση ανά ένοικο");
-    if (shares.empty()) ImGui::TextColored(kColOwed, "Η πολυκατοικία δεν έχει ενοίκους.");
+    if (shares.empty()) ImGui::TextColored(kColOwed, "Η πολυκατοικία δεν έχει ενοίκους (Διαμερίσματα & ένοικοι).");
     else if (ImGui::SmallButton("Ίσα σε όλους")) {
         const long long each = total / (long long)shares.size(), rest = total - each * (long long)shares.size();
         for (size_t i = 0; i < shares.size(); i++) shares[i].amt.set(FormatMoney(FromCents(each + ((long long)i < rest ? 1 : 0))));
     }
-    ImGui::BeginChild("##billshares", ImVec2(560, std::min(260.0f, 30.0f * (float)shares.size() + 10.0f)));
+    ImGui::BeginChild("##billshares", ImVec2(690, std::min(300.0f, ImGui::GetFrameHeightWithSpacing() * (float)shares.size() + 8.0f)));
     for (size_t i = 0; i < shares.size(); i++) {
         ImGui::PushID((int)i);
         ImGui::AlignTextToFramePadding(); ImGui::Text("%s · %s", shares[i].apt_label.c_str(), shares[i].name.c_str()); ImGui::SameLine(420);
@@ -13249,10 +15011,14 @@ static void DrawNewBillPopup(int bid) {
     if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
     ImGui::BeginDisabled(!ok || !match);
     if (ImGui::Button("Καταχώριση και χρέωση ενοίκων", ImVec2(280, 0))) {
-        std::vector<DataConn::BillReason> rs; for (auto& r : reasons) { DataConn::BillReason x; x.reason = r.why.str(); ParseMoney(r.amt.str(), x.amount); rs.push_back(x); }
+        std::vector<DataConn::BillReason> rs, keep;
+        for (auto& r : reasons) { DataConn::BillReason x; x.reason = r.why.str(); ParseMoney(r.amt.str(), x.amount); x.partner_id = r.partner; rs.push_back(x); if (r.keep) keep.push_back(x); }
         std::vector<JointShare> sh;
         for (auto& x : shares) { double v = 0; if (!x.amt.str().empty()) ParseMoney(x.amt.str(), v); if (ToCents(v) <= 0) continue; JointShare j; j.apartment_id = x.apt; j.user_id = x.user; j.amount = v; sh.push_back(j); }
-        if (g_app.conn->addMonthlyBill(bid, ym, note.str(), rs, sh) > 0) ImGui::CloseCurrentPopup(); else err = g_app.conn->takeLastError();
+        if (g_app.conn->addMonthlyBill(bid, ym, note.str(), rs, sh) > 0) {
+            if (!keep.empty() && !g_app.conn->rememberExpenseShortcuts(bid, keep)) g_app.conn->takeLastError();     // the cost is logged; a shortcut failing is not worth a refusal
+            ImGui::CloseCurrentPopup();
+        } else err = g_app.conn->takeLastError();
     }
     ImGui::EndDisabled();
     ImGui::SameLine(); if (ImGui::Button("Ακύρωση", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
@@ -13265,6 +15031,10 @@ static void OpenBillWindow(const DataConn::MonthlyBill& b) {
     for (auto& w : g_billWins) if (w.id == b.id) return;
     g_billWins.push_back({b.id, b.building_id, b.ym});
 }
+static void OpenBillWindowById(int billId, int buildingId, const std::string& ym) {
+    for (auto& w : g_billWins) if (w.id == billId) return;
+    g_billWins.push_back({billId, buildingId, ym});
+}
 static void DrawBillShares(const char* id, const std::vector<DataConn::BillShare>& shares) {
     static std::map<std::string, GridState> gs; static const ListColDef cols[6] = { LC("Διαμ."), LC("Ένοικος"), LC("Μερίδιο"), LC("Πλήρωσε"), LC("Οφείλει"), LCA };
     auto text = [](const DataConn::BillShare& x, int c) -> std::string { switch (c) { case 0: return x.apartment; case 1: return x.name; case 2: return Eur(x.amount); case 3: return Eur(x.paid); case 4: return Eur(x.balance); default: return ""; } };
@@ -13275,10 +15045,15 @@ static void DrawBillShares(const char* id, const std::vector<DataConn::BillShare
         else if (c == 5) { if (ToCents(x.balance) > 0 && ImGui::SmallButton("Είσπραξη")) { DataConn::ContractInstallment in; in.charges = x.charges; CollectInstallments(x.user_id, {in}); } }
         else CellText(text(x, c).c_str()); }, [](const DataConn::BillShare&) {});
 }
-static void DrawBillReasons(const char* id, const std::vector<DataConn::BillReason>& reasons) {
-    static std::map<std::string, GridState> gs; static const ListColDef cols[2] = { LC("Αιτία"), LC("Ποσό") };
-    auto text = [](const DataConn::BillReason& r, int c) -> std::string { return c == 0 ? r.reason : Eur(r.amount); };
-    DrawMiniList(id, gs[id], cols, 2, reasons, text, [&](const DataConn::BillReason& r, int c) { CellText(text(r, c).c_str()); }, [](const DataConn::BillReason&) {});
+static void DrawBillReasons(const char* id, const std::vector<DataConn::BillReason>& reasons, bool paid = false, const std::string& paidDate = "") {
+    static std::map<std::string, GridState> gs; static const ListColDef cols[4] = { LC("Αιτία"), LC("Συνεργάτης"), LC("Ποσό"), LC("Κατάσταση") };
+    auto text = [paid, paidDate](const DataConn::BillReason& r, int c) -> std::string {
+        switch (c) { case 0: return r.reason; case 1: return r.partner; case 2: return Eur(r.amount);
+                     case 3: return r.partner_id > 0 ? (paid ? "Πληρώθηκε " + DateGr(paidDate) : std::string("Του χρωστάμε")) : std::string(); default: return ""; } };
+    DrawMiniList(id, gs[id], cols, 4, reasons, text, [&](const DataConn::BillReason& r, int c) {
+        if (c == 1) { if (r.partner_id > 0) { if (LinkCell(r.partner)) g_bpCard = r.partner_id; } else ImGui::TextDisabled("—"); }
+        else if (c == 3) { if (r.partner_id > 0) ImGui::TextColored(paid ? kColIn : kColWeOwe, "%s", text(r, c).c_str()); }
+        else CellText(text(r, c).c_str()); }, [](const DataConn::BillReason&) {});
 }
 static void DrawBillWindows() {
     std::vector<BillWin> wins = g_billWins;
@@ -13299,6 +15074,8 @@ static void DrawBillWindows() {
             if (res) { ImGui::TextColored(kColIn, "Πληρώθηκε %s", DateGr(b.resolved_date).c_str()); if (ToCents(b.covered) > 0) { ImGui::SameLine(); ImGui::TextDisabled("(από το αποθεματικό %s)", Eur(b.covered).c_str()); } }
             else {
                 ImGui::TextColored(kColWeOwe, "Ενεργό κόστος"); ImGui::SameLine();
+                {   double toP = 0; for (auto& r : v.reasons) if (r.partner_id > 0) toP = FromCents(ToCents(toP) + ToCents(r.amount));
+                    if (ToCents(toP) > 0) { ImGui::TextColored(kColWeOwe, "· σε συνεργάτες %s", Eur(toP).c_str()); ImGui::SameLine(); } }
                 if (ToCents(b.collected) == 0) {
                     if (ImGui::SmallButton("Ακύρωση καταχώρισης")) { const int bid2 = w.id; const std::string lbl = "Έξοδα " + w.ym + " · " + Eur(b.total);
                         RequestConfirm("Ακύρωση καταχώρισης", { {"Κόστος", lbl, "(ακύρωση)"} }, [bid2]() { g_app.conn->cancelMonthlyBill(bid2); }); }
@@ -13325,8 +15102,9 @@ static void DrawBillWindows() {
                 }
             }
             if (!b.note.empty()) ImGui::TextDisabled("%s", b.note.c_str());
+            if (ImGui::SmallButton("Κλείσιμο")) open = false;
             SectionTitle("Ανάλυση εξόδων");
-            DrawBillReasons(("why" + std::to_string(w.id)).c_str(), v.reasons);
+            DrawBillReasons(("why" + std::to_string(w.id)).c_str(), v.reasons, res, b.resolved_date);
             SectionTitle("Ανά ένοικο");
             DrawBillShares(("who" + std::to_string(w.id)).c_str(), v.shares);
         }
@@ -13363,7 +15141,9 @@ static void DrawActiveExpenses(int bid) {
     ImGui::Spacing();
     if (v.active.empty()) { ImGui::Spacing(); ImGui::SetWindowFontScale(1.2f); ImGui::TextDisabled("Κανένα ενεργό έξοδο. Αναμένεται στο τέλος του μήνα."); ImGui::SetWindowFontScale(1.0f); return; }
     static std::map<int, Cached<std::map<int, std::pair<std::vector<DataConn::BillReason>, std::vector<DataConn::BillShare>>>>> dc;
-    const auto& det = dc[bid].get("", [&] { std::map<int, std::pair<std::vector<DataConn::BillReason>, std::vector<DataConn::BillShare>>> m; for (auto& b : v.active) m[b.id] = { g_app.conn->getBillReasons(b.id), g_app.conn->getBillShares(b.id) }; return m; });
+    // keyed by the bills too: a month logged in this very frame changed the data after `v` was read, and must not be left out
+    std::string detKey; for (auto& b : v.active) detKey += std::to_string(b.id) + ",";
+    const auto& det = dc[bid].get(detKey, [&] { std::map<int, std::pair<std::vector<DataConn::BillReason>, std::vector<DataConn::BillShare>>> m; for (auto& b : v.active) m[b.id] = { g_app.conn->getBillReasons(b.id), g_app.conn->getBillShares(b.id) }; return m; });
     ImGui::BeginChild("##activebills");
     for (auto& b : v.active) {
         ImGui::PushID(b.id);
@@ -13381,6 +15161,66 @@ static void DrawActiveExpenses(int bid) {
         ImGui::PopID();
     }
     ImGui::EndChild();
+}
+
+// The Αποθεματικό as a gauge: the bar is the money there now, the lighter part what comes back when the residents pay what it
+// covered, the yellow mark the limit it must stay above. Drag the mark (or click on the bar) to move the limit, then save it.
+static void DepositGauge(int bid, double deposit, double minDep, double comesBack) {
+    static int pendB = -1; static double pending = -1; static std::string err;
+    if (pendB != bid) { pendB = bid; pending = -1; err.clear(); }
+    const double shownMin = pending >= 0 ? pending : minDep;
+    const double top = std::max({ deposit + comesBack, shownMin, minDep, 100.0 }) * 1.25;
+    const float H = 40.0f, W = std::max(200.0f, ImGui::GetContentRegionAvail().x - 12.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 b0(p0.x + 6, p0.y + 22), b1(p0.x + 6 + W, p0.y + 22 + H);
+    auto X = [&](double v) { return b0.x + (float)(std::clamp(v, 0.0, top) / top) * W; };
+    const bool hasMin = ToCents(shownMin) > 0, neg = ToCents(deposit) < 0, below = hasMin && ToCents(deposit) < ToCents(shownMin);
+    dl->AddRectFilled(b0, b1, IM_COL32(28, 32, 42, 255), 6.0f);
+    if (hasMin) dl->AddRectFilled(b0, ImVec2(X(shownMin), b1.y), IM_COL32(120, 40, 40, 70), 6.0f, ImDrawFlags_RoundCornersLeft);   // the danger zone under the limit
+    if (deposit > 0.005) dl->AddRectFilled(b0, ImVec2(std::max(b0.x + 6, X(deposit)), b1.y), below ? IM_COL32(215, 80, 65, 255) : IM_COL32(70, 185, 105, 255), 6.0f);
+    if (neg) { dl->AddRectFilled(b0, ImVec2(b0.x + 10, b1.y), IM_COL32(230, 60, 50, 255), 6.0f, ImDrawFlags_RoundCornersLeft); }
+    if (comesBack > 0.005) {                              // what comes back when the residents pay what the deposit covered
+        const float x0 = X(std::max(0.0, deposit)), x1 = X(std::max(0.0, deposit) + comesBack);
+        dl->AddRectFilled(ImVec2(x0, b0.y + 7), ImVec2(x1, b1.y - 7), IM_COL32(240, 170, 70, 120), 3.0f);
+        for (float x = x0 + 4; x < x1 - 2; x += 8) dl->AddLine(ImVec2(x, b1.y - 8), ImVec2(std::min(x + 6, x1), b0.y + 8), IM_COL32(255, 210, 140, 90), 1.0f);
+    }
+    dl->AddRect(b0, b1, IM_COL32(90, 100, 120, 255), 6.0f);
+    // the amounts: now, and 0 / the scale's end
+    {   char b[64]; std::snprintf(b, sizeof b, "%s", Eur(deposit).c_str());
+        const ImVec2 ts = ImGui::CalcTextSize(b); const float tx = std::clamp(X(std::max(0.0, deposit)) - ts.x - 8, b0.x + 6, b1.x - ts.x - 6);
+        dl->AddText(ImVec2(tx, (b0.y + b1.y - ts.y) * 0.5f), IM_COL32(245, 248, 252, 255), b);
+        dl->AddText(ImVec2(b0.x, b1.y + 3), IM_COL32(140, 150, 170, 255), "0");
+        const std::string e = Eur(top); dl->AddText(ImVec2(b1.x - ImGui::CalcTextSize(e.c_str()).x, b1.y + 3), IM_COL32(140, 150, 170, 255), e.c_str()); }
+    // the limit: a yellow mark with a handle on top
+    const float lx = X(shownMin);
+    const ImU32 yc = pending >= 0 ? IM_COL32(255, 235, 120, 255) : IM_COL32(250, 200, 60, 255);
+    if (hasMin || pending >= 0) {
+        dl->AddLine(ImVec2(lx, b0.y - 6), ImVec2(lx, b1.y + 2), yc, 3.0f);
+        dl->AddTriangleFilled(ImVec2(lx - 8, b0.y - 16), ImVec2(lx + 8, b0.y - 16), ImVec2(lx, b0.y - 4), yc);
+        char b[64]; std::snprintf(b, sizeof b, "όριο %s", Eur(shownMin).c_str());
+        const ImVec2 ts = ImGui::CalcTextSize(b);
+        dl->AddText(ImVec2(std::clamp(lx + 12, b0.x, b1.x - ts.x), b0.y - 20), yc, b);
+    } else dl->AddText(ImVec2(b0.x + 4, b0.y - 20), IM_COL32(150, 160, 180, 255), "Χωρίς όριο: σύρετε πάνω στην μπάρα για να βάλετε");
+    // drag anywhere on the bar: the limit follows (rounded to 10 €, 1 € with Shift)
+    ImGui::SetCursorScreenPos(ImVec2(b0.x, b0.y - 18));
+    ImGui::InvisibleButton("##depgauge", ImVec2(W, H + 18));
+    if (ImGui::IsItemHovered()) { ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        ImGui::SetTooltip("Αποθεματικό τώρα %s%s\nΣύρετε (ή κάντε κλικ) για να μετακινήσετε το όριο · Shift: ανά 1 €", Eur(deposit).c_str(), comesBack > 0.005 ? ("\nΕπιστρέφουν " + Eur(comesBack) + " όταν πληρώσουν οι ένοικοι (ριγέ)").c_str() : ""); }
+    if (ImGui::IsItemActive()) {
+        const double v = std::clamp((double)(ImGui::GetIO().MousePos.x - b0.x) / W, 0.0, 1.0) * top;
+        const double step = ImGui::GetIO().KeyShift ? 1.0 : 10.0;
+        pending = std::round(v / step) * step; err.clear();
+    }
+    ImGui::SetCursorScreenPos(ImVec2(p0.x, b1.y + 24));
+    if (pending >= 0 && ToCents(pending) != ToCents(minDep)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.90f, 0.45f, 1), "Νέο όριο: %s (ήταν %s)", Eur(pending).c_str(), ToCents(minDep) > 0 ? Eur(minDep).c_str() : "χωρίς όριο");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Αποθήκευση ορίου")) { if (g_app.conn->setDepositMin(bid, pending)) pending = -1; else err = g_app.conn->takeLastError(); }
+        ImGui::SameLine(); if (ImGui::SmallButton("Άκυρο")) pending = -1;
+        ImGui::SameLine(); if (ImGui::SmallButton("Χωρίς όριο")) pending = 0;
+    } else if (pending >= 0) pending = -1;
+    if (!err.empty()) ImGui::TextColored(kColOut, "%s", err.c_str());
 }
 
 static void DrawDepositTab(int bid) {
@@ -13406,15 +15246,10 @@ static void DrawDepositTab(int bid) {
     const bool hasMin = ToCents(v.minDep) > 0, below = hasMin && ToCents(v.deposit) < ToCents(v.minDep);
     if (ToCents(v.deposit) < 0) ImGui::TextColored(kColOut, "ΠΡΟΒΛΗΜΑ: το αποθεματικό είναι αρνητικό.");
     else if (below) ImGui::TextColored(kColOut, "ΠΡΟΒΛΗΜΑ: το αποθεματικό είναι %s κάτω από το όριο των %s.", Eur(MoneySub(v.minDep, v.deposit)).c_str(), Eur(v.minDep).c_str());
-    else if (hasMin) ImGui::TextColored(kColIn, "Εντάξει: πάνω από το όριο των %s.", Eur(v.minDep).c_str());
+    else if (hasMin) ImGui::TextColored(kColIn, "Εντάξει: %s πάνω από το όριο των %s.", Eur(MoneySub(v.deposit, v.minDep)).c_str(), Eur(v.minDep).c_str());
     else ImGui::TextDisabled("Δεν έχει οριστεί ελάχιστο όριο.");
     if (toDeposit > 0) { ImGui::SameLine(); ImGui::TextColored(kColOwed, " Χρωστούν %s για να ξαναγεμίσει.", Eur(FromCents(toDeposit)).c_str()); }
-    if (hasMin) {
-        const float fr = (float)std::max(0.0, std::min(1.0, v.deposit / v.minDep));
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, below ? kColOut : kColIn);
-        ImGui::ProgressBar(fr, ImVec2(-1, 0), (Eur(v.deposit) + " / όριο " + Eur(v.minDep)).c_str());
-        ImGui::PopStyleColor();
-    }
+    DepositGauge(bid, v.deposit, v.minDep, FromCents(toDeposit));
     ImGui::Spacing();
     if (ImGui::BeginTable("mbtiles", 2, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
@@ -13479,6 +15314,14 @@ static void DrawManagedBuilding(int bid) {
     ImGui::Spacing();
     ImGui::SetWindowFontScale(1.2f); ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.45f, 1), "%s", agg->displayName.c_str()); ImGui::SetWindowFontScale(1.0f);
     ImGui::TextDisabled("ΑΦΜ %s · %d διαμερίσματα · %d ένοικοι", agg->b.afm.empty() ? "—" : agg->b.afm.c_str(), agg->totalApts, (int)g_app.conn->getResidents(bid, false).size());
+    {   // the fund at a glance, against its limit (the monitoring bar is in «Αποθεματικό»)
+        const BillTabData& bd = BillData(bid);
+        const bool hasMin = ToCents(bd.minDep) > 0, low = ToCents(bd.deposit) < 0 || (hasMin && ToCents(bd.deposit) < ToCents(bd.minDep));
+        ImGui::SameLine(); ImGui::TextDisabled("·"); ImGui::SameLine();
+        ImGui::TextColored(low ? kColOut : kColIn, "Αποθεματικό %s", Eur(bd.deposit).c_str());
+        ImGui::SameLine(); if (hasMin) ImGui::TextColored(low ? kColOut : kColMuted, low ? "κάτω από το όριο %s" : "(όριο %s)", Eur(bd.minDep).c_str()); else ImGui::TextDisabled("(χωρίς όριο)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Το όριο αλλάζει στην καρτέλα «Αποθεματικό»");
+    }
     ImGui::SameLine(ImGui::GetContentRegionMax().x - 170);
     if (ImGui::Button("Τέλος διαχείρισης", ImVec2(170, 0))) {
         std::string name = agg->displayName;
@@ -13514,10 +15357,11 @@ static void DrawManagedBuilding(int bid) {
         if (tab("Κινήσεις αποθεματικού", 6)) { DrawFundTab(bid, 1); ImGui::EndTabItem(); }
         if (tab("Ιστορικό εξόδων", 7)) { DrawExpenseHistoryTab(bid); ImGui::EndTabItem(); }
         if (tab("Διαμερίσματα & ένοικοι", 4)) { DrawAptResidentsTab(*agg); ImGui::EndTabItem(); }
+        if (tab("Συνεργάτες πολυκατοικίας", 8)) { DrawBuildingPartnersTab(bid); ImGui::EndTabItem(); }
+        if (tab("Συντομεύσεις εξόδων", 9)) { DrawExpenseShortcutsTab(bid); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
         g_mgTab = -1;
     }
-    DrawBillWindows();
     // an action clicked anywhere (a funding, an expense, our fee): its report in its own window
     static int actionWin = 0;
     if (g_expenseOpen != 0) { actionWin = g_expenseOpen; g_expenseOpen = 0; ImGui::SetNextWindowFocus(); }
@@ -13688,6 +15532,9 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);   // let the OS scale the window frame on HiDPI
 
+#ifdef BM_UI_TEST
+    uitest::BeforeWindow();
+#endif
     GLFWwindow* window = glfwCreateWindow(1400, 900, "PropertyManager", nullptr, nullptr);
     g_glfwWindow = window;
     glfwSetWindowSizeLimits(window, 1100, 700, GLFW_DONT_CARE, GLFW_DONT_CARE);      // small enough to fit a laptop, big enough that the tables never crumple
@@ -13838,11 +15685,17 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     glfwSetDropCallback(window, OnFilesDropped);      // drag & drop files onto «Συνημμένα» panels
     ImGui_ImplOpenGL3_Init(glsl_version);
+#ifdef BM_UI_TEST
+    uitest::Init(window, dbPath);
+#endif
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
         ImGui_ImplOpenGL3_NewFrame();
+#ifdef BM_UI_TEST
+        if (uitest::Active()) uitest::NewFrame(window); else
+#endif
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
@@ -13860,6 +15713,8 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
             static long long seen = g_app.conn->dataVersion();
             if (seen != g_app.conn->dataVersion()) { seen = g_app.conn->dataVersion(); g_app.reloadUsers(); g_app.reloadServices(); g_app.reloadJoint(); g_app.reloadNotes(); }
         }
+        { static bool once = false; if (!once) { once = true; if (const char* e = std::getenv("BM_TEST_PAGE")) g_page = std::atoi(e); } }   // tests only
+        g_frameDataVersion = g_app.conn->dataVersion();
         if (g_tabToApartments) { g_page = PAGE_JOINT; g_tabToApartments = false; }      // buildings live in Διαχείριση now
         ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX(), kNavBarH + 6.0f));
         ImGui::BeginChild("pagecontent", ImVec2(0, 0), false);
@@ -13869,6 +15724,7 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
             case PAGE_BUILDINGS:
             case PAGE_APARTMENTS: DrawApartmentsScreen(); break;      // one page: buildings -> apartments -> residents
             case PAGE_SERVICES:   DrawServicesScreen(); break;
+            case PAGE_HISTORY:    DrawHistoryScreen(); break;
             case PAGE_JOINT:      DrawManagementScreen(); break;
             case PAGE_PACKAGES:   DrawMasterServicesScreen(); break;
             case PAGE_LEDGER:
@@ -13895,6 +15751,10 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                             }
                             if (ImGui::BeginTabItem("Συνεργάτες (κόστη μας)")) {
                                 DrawBillsPartners();
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Συνεργάτες πολυκατοικιών")) {
+                                DrawBuildingPartnersLedger("bplp", 2);
                                 ImGui::EndTabItem();
                             }
                             ImGui::EndTabBar();
@@ -13927,6 +15787,10 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
                                 ImGui::TextDisabled("Ό,τι πληρώσαμε εμείς: σε συνεργάτες, ή χωρίς καταχωρημένο συνεργάτη (#-1). «Άνοιγμα» δείχνει τη χρέωση και τις πληρωμές της.");
                                 if (DrawDateRange("rcpaydates", pf, pt)) pm.g.pager.Reset();
                                 DrawPartnerJobsModel("rcpay", 0, 1, pf, pt, pm, true, std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.4f));
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Συνεργάτες πολυκατοικιών")) {
+                                DrawBuildingPartnersLedger("bplr", 2);
                                 ImGui::EndTabItem();
                             }
                             ImGui::EndTabBar();
@@ -13967,12 +15831,15 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         // the "close one window and then NOTHING reopens until restart" report exactly).
         // Fix: call each of these exactly once per frame, only here.
         DrawConfirmModal();
+        DrawBillWindows();
+        DrawBuildingPartnerCard();
         DrawUserProfileWindow();
         DrawContractViewWindows();
         DrawServiceDetailWindow();
         DrawPackageViewWindow();
         DrawResidentLedgerWindow();
         DrawErrorBanner();
+        DrawExportNote();
         PrefsSaveIfChanged();
         DrawPaymentViewWindow();
         DrawJointViewWindow();
@@ -14003,6 +15870,9 @@ int RunApp(DataConn* conn, const std::string& dbPath) {
         glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+#ifdef BM_UI_TEST
+        uitest::AfterRender(window);
+#endif
         glfwSwapBuffers(window);
     }
 

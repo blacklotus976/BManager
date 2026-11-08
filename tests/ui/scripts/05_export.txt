@@ -1,0 +1,48 @@
+# Part E (after A-D): Excel exports from lists (one page / all pages), the cube's tables, a client's and a service's usage panel
+wait 10
+log ---- E1. the clients list (one page: no question, straight to the file)
+click Πελάτες | win=##nav
+wait 3
+shot E1_clients_with_excel
+click ##excelbar
+wait 10
+log ---- E2. the charges list
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+click Χρεώσεις | win=pagecontent
+click Πελάτες | win=pagecontent
+wait 3
+shot E2_charges_with_excel
+click ##excel | n=1
+wait 10
+log ---- E3. receipts
+click Αποδείξεις | win=pagecontent
+wait 3
+click ##excel | n=1
+wait 10
+log ---- E4. a building's fund moves and its partners (lists inside the building window)
+click Διαχείριση | win=##nav
+click ##row
+wait 5
+click Συνεργάτες πολυκατοικίας | win=mgwindow
+wait 3
+shot E4_partners_excel
+click ##excelbar | win=mgwindow
+wait 10
+click ##mgback
+log ---- E5. the cube's two tables, with their sums
+click Ιστορικό & Ανάλυση | win=##nav
+wait 20
+click ##cubeexcel
+wait 10
+log ---- E6. a client's usage panel and its export
+click Πελάτες | win=##nav
+wait 3
+click 5 | win=userstable
+wait 10
+shot E6_client_usage
+scrollto ##usexcel
+wait 3
+shot E6b_client_usage_table
+click ##usexcel
+wait 10
+quit

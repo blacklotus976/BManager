@@ -1,0 +1,145 @@
+# Part B (after part A, same database): month costs tied to partners, shortcuts, a resident pays, the cost is paid, the ledgers
+wait 10
+log ---- B1. this month's costs: lines owed to the building's partners; the shortcuts are remembered
+click Διαχείριση | win=##nav
+click ##row
+wait 5
+click Ενεργά έξοδα
+click + Καταχώριση εξόδων μήνα
+wait 3
+field ##w | win=Μηνιαία έξοδα = ΔΕΗ κοινοχρήστων
+field ##a | win=Μηνιαία έξοδα = 45,50
+click ##p | win=Μηνιαία έξοδα
+click ΔΕΗ  ·  ρεύμα κοινοχρήστων | win=##Combo
+click + Προσθήκη εξόδου
+field ##w | win=Μηνιαία έξοδα | n=2 = Καθαριότητα κλιμακοστασίου
+field ##a | win=Μηνιαία έξοδα | n=2 = 60
+click ##p | win=Μηνιαία έξοδα | n=2
+click Καθαρίστρια Μαρία  ·  καθαριότητα | win=##Combo
+click + Προσθήκη εξόδου
+field ##w | win=Μηνιαία έξοδα | n=3 = Λάμπες κλιμακοστασίου
+field ##a | win=Μηνιαία έξοδα | n=3 = 12
+click ##keep | win=Μηνιαία έξοδα | n=3
+log a new partner straight from a line's list
+click + Προσθήκη εξόδου
+field ##w | win=Μηνιαία έξοδα | n=4 = Νερό κοινοχρήστων
+field ##a | win=Μηνιαία έξοδα | n=4 = 18,40
+click ##p | win=Μηνιαία έξοδα | n=4
+click + Νέος συνεργάτης πολυκατοικίας… | win=##Combo
+field ##bpn = ΕΥΔΑΠ
+field ##bpt = νερό
+click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
+wait 3
+click Ίσα σε όλους
+wait 2
+shot B1_month_filled
+click Καταχώριση και χρέωση ενοίκων
+wait 5
+check SELECT COUNT(*) FROM monthly_bills => 1
+check SELECT printf('%.2f', total) FROM monthly_bills => 135.90
+check SELECT COUNT(*) FROM monthly_bill_reasons WHERE partner_id IS NOT NULL => 3
+check SELECT p.name FROM monthly_bill_reasons r JOIN building_partners p ON p.id = r.partner_id WHERE r.reason = 'Νερό κοινοχρήστων' => ΕΥΔΑΠ
+check SELECT COUNT(*) FROM building_expense_shortcuts => 3
+check SELECT COUNT(*) FROM building_expense_shortcuts WHERE label = 'Λάμπες κλιμακοστασίου' => 0
+check SELECT COUNT(*) FROM charges c JOIN joint_ops o ON o.batch_id = c.batch_id WHERE o.kind = 'monthly' AND c.direction = 'in' => 3
+shot B1_active
+
+log ---- B2. next month from the shortcuts, one price changed (the shortcut learns it)
+click + Καταχώριση εξόδων μήνα
+wait 3
+click ##bym1 | win=Μηνιαία έξοδα
+click + Όλες
+wait 3
+shot B2_from_shortcuts
+field ##a | win=Μηνιαία έξοδα | n=1 = 47,20
+click Ίσα σε όλους
+click Καταχώριση και χρέωση ενοίκων
+wait 5
+check SELECT COUNT(*) FROM monthly_bills => 2
+check SELECT printf('%.2f', amount) FROM building_expense_shortcuts WHERE label = 'ΔΕΗ κοινοχρήστων' => 47.20
+check SELECT uses FROM building_expense_shortcuts WHERE label = 'ΔΕΗ κοινοχρήστων' => 2
+check SELECT COUNT(*) FROM monthly_bill_reasons r JOIN monthly_bills b ON b.id = r.bill_id WHERE b.id = (SELECT MAX(id) FROM monthly_bills) AND r.partner_id IS NOT NULL => 3
+
+log ---- B3. a resident pays her share of the first month (Είσπραξη, with a receipt)
+scrollto Είσπραξη | win=activebills | n=4
+click Είσπραξη | n=4
+wait 3
+log the receipt's date has to be chosen
+click Επιλογή ημερομηνίας... | win=Νέα είσπραξη
+click {d}
+click OK
+wait 2
+shot B3_payment_dialog
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM receipts => 1
+check SELECT printf('%.2f', SUM(amount)) FROM payments WHERE direction = 'in' => 45.30
+
+log ---- B4. paying the first month's cost: the partners get paid, the deposit covers what the residents still owe
+scrollto Πληρωμή κόστους… | win=activebills | n=2
+click Πληρωμή κόστους… | n=2
+wait 5
+click Πληρωμή κόστους | win=billwin
+wait 3
+shot B4_pay_cost
+click ~Πληρωμή με χρήση αποθεματικού
+wait 5
+check SELECT status FROM monthly_bills WHERE id = 1 => resolved
+check SELECT printf('%.2f', covered) FROM monthly_bills WHERE id = 1 => 90.60
+check SELECT printf('%.2f', SUM(CASE WHEN direction='in' THEN amount ELSE -amount END)) FROM fund_moves => 409.40
+shot B4_bill_paid
+click Κλείσιμο | win=billwin
+
+log ---- B5. the partners' side: owed, paid, the card of one of them
+click Συνεργάτες πολυκατοικίας | win=mgwindow
+wait 3
+shot B5_partners
+log removing a partner still owed money is refused; one with nothing owed goes
+click Διαγραφή | win=mgwindow | n=2
+click Διαγραφή | win=Διαγραφή συνεργάτη πολυκατοικίας
+wait 3
+check SELECT active FROM building_partners WHERE name = 'ΔΕΗ' => 1
+shot B5_remove_refused
+click Διαγραφή | win=mgwindow | n=1
+click Διαγραφή | win=Διαγραφή συνεργάτη πολυκατοικίας
+wait 3
+check SELECT active FROM building_partners WHERE name LIKE 'Ανελκυστήρες%' => 0
+click ΔΕΗ | win=mgwindow
+wait 5
+shot B5_partner_card
+click Κλείσιμο | win=bpcard
+
+log ---- B6. the shortcuts tab: edit a price, delete one
+click Συντομεύσεις εξόδων | win=mgwindow
+wait 3
+click Επεξεργασία | win=mgwindow | n=3
+field Προτεινόμενη τιμή (€) = 19,00
+click Αποθήκευση | win=Συντόμευση εξόδου
+wait 3
+check SELECT printf('%.2f', amount) FROM building_expense_shortcuts WHERE label = 'Νερό κοινοχρήστων' => 19.00
+click Διαγραφή | win=mgwindow | n=3
+wait 3
+check SELECT COUNT(*) FROM building_expense_shortcuts => 2
+shot B6_shortcuts
+
+log ---- B7. the fund after covering the cost (still above its limit of 380)
+click Αποθεματικό | win=mgwindow
+wait 3
+shot B7_fund_after_cover
+
+log ---- B8. the money sections show the buildings' partners
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+click Χρεώσεις | win=pagecontent
+click Συνεργάτες πολυκατοικιών | n=1
+wait 3
+shot B8_charges_bpartners
+click Πληρωμές | win=pagecontent
+click Συνεργάτες πολυκατοικιών | n=1
+wait 3
+shot B8_payments_bpartners
+click Αποδείξεις | win=pagecontent
+click Συνεργάτες πολυκατοικιών | n=1
+wait 3
+shot B8_receipts_bpartners
+quit

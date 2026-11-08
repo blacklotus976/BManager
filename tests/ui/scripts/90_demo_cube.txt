@@ -1,0 +1,60 @@
+# the cube on a copy of the new demo data (a year: packages, contracts), by month; the layer slider updates the tables at once
+wait 10
+click Ιστορικό & Ανάλυση | win=##nav
+wait 20
+click ##unit
+click Μήνας
+wait 30
+shot G1_services_month
+click Πακέτα υπηρεσιών
+wait 30
+vtx 60001
+shot G2_packages_month
+click Συμβάσεις | win=pagecontent
+wait 30
+vtx 60001
+shot G3_contracts_month
+log turn square to the front, then move the layer slider: the tables show that one month, no animation
+drag ##cubes => 81,-50
+wait 40
+drag ##layer => 120,0
+wait 10
+shot G4_slider_one_layer
+click Όλο το βάθος
+wait 5
+shot G5_back_to_sums
+click ##inverse
+wait 30
+vtx 60001
+shot G6_contracts_inverse
+click ##inverse
+click Πακέτα υπηρεσιών
+wait 20
+click ##inverse
+wait 30
+vtx 60001
+shot G7_packages_inverse
+click ##cubeexcel
+wait 10
+log a package's window: its usage across the year
+click Πακέτα Υπηρεσιών | win=##nav
+wait 10
+shot G8_packages_page
+log ---- a long list (several pages): the question, all pages, in the order on screen
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+click Αποδείξεις | win=pagecontent
+click Πελάτες | win=pagecontent
+wait 5
+shot G9_long_list
+click ##excel | n=1
+wait 5
+shot G10_pages_question
+click Εξαγωγή…
+wait 10
+log ---- only the page on screen
+click ##excel | n=1
+wait 5
+click Μόνο η σελίδα που φαίνεται
+click Εξαγωγή…
+wait 10
+quit

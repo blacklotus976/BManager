@@ -764,7 +764,8 @@ public:
     // does not touch the Αποθεματικό (the building's deposit = fund_moves). Resolving means the cost got paid: if not all of
     // it was collected, the rest comes out of the Αποθεματικό, the bill is closed, and what residents still owe from then on
     // goes back into the Αποθεματικό when they pay.
-    struct BillReason { std::string reason; double amount = 0.0; };
+    // partner_id: one of the building's own partners (building_partners) the line is owed to, -1 = none
+    struct BillReason { std::string reason; double amount = 0.0; int partner_id = -1; std::string partner; };
     struct MonthlyBill {
         int id = -1, building_id = -1, op_id = -1;
         std::string ym, status = "open", resolved_date, note, created_at;
@@ -796,6 +797,32 @@ public:
     // suggestions for a new monthly cost: what the building still owes us, and what we offered it in the last 30 days
     struct BillSuggestion { int charge_id = -1; std::string label, date; double due = 0, owed = 0; bool contract = false; };
     virtual std::vector<BillSuggestion> billSuggestions(int buildingId) = 0;
+
+    // --- A managed building's own partners: whoever the building pays (ΔΕΗ, the cleaner, the lift company...). They are not our
+    // partners: what they are owed comes from the building's monthly costs (a cost line can name one), and they are paid when that
+    // month's cost is paid. owed = lines of costs still open, paid = lines of costs already paid.
+    struct BuildingPartner {
+        int id = -1, building_id = -1, source_partner_id = -1; bool active = true;
+        std::string name, trade, address, phone, email, afm, iban, notes, building, created_at;
+        int lines = 0; double owed = 0, paid = 0; std::string last_paid;
+    };
+    virtual std::vector<BuildingPartner> getBuildingPartners(int buildingId, bool withInactive = false) = 0;   // buildingId -1 = every building
+    virtual BuildingPartner getBuildingPartner(int id) = 0;                     // id < 0 when it does not exist
+    virtual int saveBuildingPartner(const BuildingPartner& p) = 0;              // insert (id -1) or update; the id, or -1 (+ takeLastError())
+    virtual bool removeBuildingPartner(int id) = 0;                             // hidden from the lists; the lines that name him stay
+    // one line of a monthly cost that names a building partner: owed while the cost is open, paid on the day the cost was paid
+    struct BuildingPartnerLine {
+        int reason_id = -1, bill_id = -1, building_id = -1, partner_id = -1;
+        std::string ym, building, partner, reason, status, paid_date, created_at; double amount = 0;
+    };
+    virtual std::vector<BuildingPartnerLine> getBuildingPartnerLines(int buildingId, int partnerId, int state) = 0;   // -1 = all; state 0 all, 1 owed, 2 paid
+    // shortcuts for logging a building's monthly costs: a reason, the suggested price (the last one used) and its partner
+    struct ExpenseShortcut { int id = -1, building_id = -1, partner_id = -1, sort = 0, uses = 0; std::string label, partner, last_used; double amount = 0; };
+    virtual std::vector<ExpenseShortcut> getExpenseShortcuts(int buildingId) = 0;
+    virtual int saveExpenseShortcut(const ExpenseShortcut& s) = 0;              // insert (id -1) or update
+    virtual bool removeExpenseShortcut(int id) = 0;
+    // after logging a month: every line becomes (or refreshes) a shortcut with that price and partner, matched by its reason
+    virtual bool rememberExpenseShortcuts(int buildingId, const std::vector<BillReason>& reasons) = 0;
     // Τιμολόγια: the document a partner gave us for what we paid (type "invoice" or "receipt")
     struct PartnerDoc { int id = -1, payment_id = -1, partner_id = -1, charge_id = -1; std::string partner, type, number, date, notes, pay_date, method, what; double amount = 0; };
     virtual bool payOutWithDoc(int chargeId, double amount, const std::string& payDate, const std::string& method, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) = 0;
@@ -806,6 +833,26 @@ public:
     struct ProfitRow { std::string kind, label; int lines = 0, clients = 0; double charged = 0, cost = 0, collected = 0, owed = 0, costPaid = 0, costOwed = 0, avgDays = -1; };
     virtual std::vector<ProfitRow> profitAnalysis(const std::string& from, const std::string& to) = 0;
     virtual std::map<int, std::pair<double, double>> contractPayScores() = 0;     // client -> (paid on time, should have been paid)
+
+    // History & analytics cube: what we charged our own clients, per client x service x time step.
+    // Only the cells with activity are returned (the cube is mostly empty). heat_* is the cell's colour,
+    // worked out in the database by heat(cume_dist()) -- the same thermal scale as Heat() below.
+    struct CubeCell { int user_id = -1, service_id = -1, t = 0, qty = 0; double money = 0; unsigned heat_money = 0, heat_qty = 0; };
+    struct CubeKey  { int id = -1; std::string name, code, special, address; double money = 0; int qty = 0; };
+    struct CubeData { std::vector<CubeCell> cells; std::vector<CubeKey> users, services; std::vector<std::string> buckets; };
+    // unit: 0 day, 1 week, 2 month, 3 quarter, 4 year. mode: what runs on the second axis -- 0 services (every service line, also
+    // inside packages and contracts), 1 packages (one sale = one package charge), 2 contracts (by what the contract is for: a
+    // service or a package; qty = contracts with an installment in that step). Every client and every catalog entry is listed,
+    // even with nothing in the period, so the reversed view can show what does not sell.
+    virtual CubeData historyCube(const std::string& from, const std::string& to, int unit, int mode = 0) = 0;
+    // thermal colour for a 0..1 position (0 = least, blue -> cyan -> yellow -> red = most), packed like IM_COL32
+    static unsigned Heat(double r) {
+        if (r < 0) r = 0; if (r > 1) r = 1;
+        static const float k[5][3] = { {0.15f, 0.25f, 0.95f}, {0.10f, 0.75f, 0.95f}, {0.30f, 0.90f, 0.35f}, {1.00f, 0.85f, 0.15f}, {0.95f, 0.15f, 0.10f} };
+        const double x = r * 4.0; int i = (int)x; if (i > 3) i = 3; const float f = (float)(x - i);
+        auto c = [&](int j) { return (unsigned)((k[i][j] + (k[i + 1][j] - k[i][j]) * f) * 255.0f + 0.5f); };
+        return c(0) | (c(1) << 8) | (c(2) << 16) | (255u << 24);
+    }
     virtual std::vector<ManageScore> manageScores(const std::string& fromYm, const std::string& toYm) = 0;
 
     // Column filters of a list (spreadsheet style): per column, the values picked and / or a text it must contain.

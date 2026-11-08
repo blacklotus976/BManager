@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/utf-8)
+    add_compile_options(/utf-8 /bigobj)   # App.cpp holds more sections than a default object file allows
     # ---- Fully static MSVC runtime (/MT, not /MD) ----
     # This is the actual fix for "runs on any Windows PC with zero prerequisites":
     # dynamic linking (/MD, the default) means every exe needs MSVCP140.dll /

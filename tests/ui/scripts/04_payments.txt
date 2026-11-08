@@ -1,0 +1,95 @@
+# Part D (after A, B, C): every way money gets settled, with the date pickers (calendar + OK, the calendar's «Σήμερα», the receipt's «Σήμερα»)
+wait 10
+log ---- D1. a client's charge: Είσπραξη with a receipt, its date from the calendar (a day, then OK)
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+click Χρεώσεις | win=pagecontent
+click Πελάτες | win=pagecontent
+wait 3
+shot D1_open_charges
+click Είσπραξη | n=1
+click Επιλογή ημερομηνίας... | win=Νέα είσπραξη
+click {d}
+click OK
+wait 2
+shot D1_date_picked
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM receipts WHERE status = 'issued' => 2
+
+log ---- D2. the next one: the receipt's date with the «Σήμερα» button next to it
+click Είσπραξη | n=1
+click Σήμερα | win=Νέα είσπραξη
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM receipts WHERE status = 'issued' => 3
+
+log ---- D3. a part payment: 20 € of the last open line
+click Είσπραξη | n=1
+field Ποσό που εισπράχθηκε (€) = 20
+click Αυτόματα: παλαιότερες πρώτα
+click Σήμερα | win=Νέα είσπραξη
+wait 2
+shot D3_part_payment
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM charges WHERE direction = 'in' AND status = 'pending' AND amount_paid > 0 AND contract_id IS NULL => 1
+
+log ---- D4. a contract's installment
+click Συμβάσεις | win=pagecontent
+wait 3
+click Είσπραξη | n=1
+click Σήμερα | win=Νέα είσπραξη
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM charges WHERE contract_id IS NOT NULL AND direction = 'in' AND status = 'paid' => 1
+
+log ---- D5. a charge paid at once, with what it cost us: the receipt's date from the calendar's own «Σήμερα»
+click Αρχική | win=##nav
+click + Χρέωση πελάτη
+click Επιλέξτε πελάτη…  ▼
+click Γιάννης Αλεξίου
+click Επιλέξτε υπηρεσία…  ▼
+click Απολύμανση
+click Συνέχεια ►
+field Οφειλόμενο ποσό | win=Στοιχεία Πληρωμής = 60
+field Πληρωμένο ποσό | win=Στοιχεία Πληρωμής = 60
+field Κόστος για εμάς | win=Στοιχεία Πληρωμής = 25
+field Πληρωμές από το κόστος | win=Στοιχεία Πληρωμής = 0
+click Επιλογή ημερομηνίας... | win=Στοιχεία Πληρωμής
+click Σήμερα | win=##Popup
+wait 2
+shot D5_paid_at_once
+scrollto Αποθήκευση | win=Στοιχεία Πληρωμής
+click Αποθήκευση | win=Στοιχεία Πληρωμής
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM receipts WHERE status = 'issued' => 6
+check SELECT COUNT(*) FROM charges WHERE direction = 'out' AND contract_id IS NULL AND status = 'pending' => 1
+
+log ---- D6. paying our partner for that cost, with his invoice (number and date)
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+click Πληρωμές | win=pagecontent
+click Συνεργάτες (κόστη μας) | win=pagecontent
+wait 3
+click Πληρωμή | win=pagecontent | n=1
+wait 2
+field Αριθμός | win=Πληρωμή προς συνεργάτη = ΤΠ-1043
+click Επιλογή ημερομηνίας... | win=Πληρωμή προς συνεργάτη
+click {d}
+click OK
+wait 2
+shot D6_pay_partner
+click Πληρωμή | win=Πληρωμή προς συνεργάτη
+wait 5
+check SELECT COUNT(*) FROM partner_docs => 1
+check SELECT COUNT(*) FROM charges WHERE direction = 'out' AND contract_id IS NULL AND status = 'paid' => 1
+
+log ---- D7. the receipts list shows them
+click Αποδείξεις | win=pagecontent
+wait 3
+shot D7_receipts
+quit

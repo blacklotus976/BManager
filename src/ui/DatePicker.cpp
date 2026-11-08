@@ -72,6 +72,10 @@ bool DatePicker(const char* id, std::string& dateInOut,
     ImVec2 btnMax = ImGui::GetItemRectMax();
 
     // --- Popup position (see header comment for the rules) ----------------
+    // ...but never off the screen: near the bottom it opens above, near the top below.
+    {   const float kEstH = 340.0f; const ImGuiViewport* vp = ImGui::GetMainViewport();
+        if (offset.y > 0.0f && btnMax.y + 4.0f + offset.y + kEstH > vp->WorkPos.y + vp->WorkSize.y) offset.y = 0.0f;
+        else if (offset.y <= 0.0f && btnMin.y - 4.0f + offset.y - kEstH < vp->WorkPos.y) offset.y = 1.0f; }
     const float gap = 4.0f;
     ImVec2 popupPos;
     ImVec2 popupPivot;
@@ -169,7 +173,7 @@ bool DatePicker(const char* id, std::string& dateInOut,
                     ImGui::PushID(day);
                     if (disabled) {
                         ImGui::BeginDisabled();
-                        ImGui::Selectable(lbl, false, 0, ImVec2(cellW - 4.0f, 0));
+                        ImGui::Selectable(lbl, false, ImGuiSelectableFlags_NoAutoClosePopups, ImVec2(cellW - 4.0f, 0));
                         ImGui::EndDisabled();
                     } else {
                         if (isSelected)
@@ -177,9 +181,15 @@ bool DatePicker(const char* id, std::string& dateInOut,
                         else if (isToday)
                             ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.24f, 0.45f, 0.60f, 0.55f));
 
-                        if (ImGui::Selectable(lbl, isSelected, 0, ImVec2(cellW - 4.0f, 0))) {
+                        // a day only selects (the popup stays open until OK); a double click takes it at once
+                        if (ImGui::Selectable(lbl, isSelected, ImGuiSelectableFlags_NoAutoClosePopups, ImVec2(cellW - 4.0f, 0))) {
                             st.selYear = navY; st.selMonth = navM; st.selDay = day;
                             st.hasSelection = true;
+                        }
+                        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                            char buf[16]; std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", navY, navM, day);
+                            dateInOut = buf; accepted = true;
+                            ImGui::CloseCurrentPopup();
                         }
                         if (isSelected || isToday) ImGui::PopStyleColor();
                     }
@@ -194,8 +204,16 @@ bool DatePicker(const char* id, std::string& dateInOut,
         ImGui::Separator();
         ImGui::Spacing();
 
-        // --- OK / Cancel footer ------------------------------------------
-        const float footerBtnW = 110.0f;
+        // --- Today / OK / Cancel footer ----------------------------------
+        const float footerBtnW = 82.0f;
+        if (!futureOnly) {           // today in one click (taken at once)
+            if (ImGui::Button("Σήμερα", ImVec2(footerBtnW, 0))) {
+                char buf[16]; std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", todayY, todayM, todayD);
+                dateInOut = buf; accepted = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+        }
         float avail = ImGui::GetContentRegionAvail().x;
         float rightStart = ImGui::GetCursorPosX() + avail
                            - footerBtnW * 2.0f - ImGui::GetStyle().ItemSpacing.x;

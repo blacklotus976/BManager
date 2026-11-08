@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 static const std::string kToday = "2026-10-27";
 
@@ -119,8 +121,16 @@ int main(int argc, char** argv) {
 
     // ---------------- clients: people and businesses (never residents) ----------------
     struct P { const char* name; const char* phone; };
+    // where the people live: ordinary buildings we don't manage, so every client has an address, ΤΚ and area
+    std::vector<int> homes;
+    { struct H { const char* addr; const char* area; const char* tk; } hs[] = { {"ΠΑΤΗΣΙΩΝ 120", "Κυψέλη", "11257"}, {"ΕΘΝ. ΑΝΤΙΣΤΑΣΕΩΣ 45", "Καισαριανή", "16121"}, {"ΚΗΦΙΣΙΑΣ 200", "Μαρούσι", "15124"}, {"ΘΗΣΕΩΣ 18", "Καλλιθέα", "17671"} };
+      for (auto& h : hs) { Building b; b.address = h.addr; b.area = h.area; b.postal_code = h.tk; int bid = c.addBuilding(b);
+          for (int k = 1; k <= 6; k++) { int a = c.addApartment(bid, (std::string("Δ") + std::to_string(k)).c_str()); if (a > 0) homes.push_back(a); } } }
+    size_t nextHome = 0;
     auto person = [&](const char* name, const char* phone, const char* kind = "person", const char* afm = "") {
-        User u; u.full_name = name; u.phone = phone; u.kind = kind; u.afm = afm; u.email = ""; Need(c.addUser(u), c, name); return UserByName(c, name); };
+        User u; u.full_name = name; u.phone = phone; u.kind = kind; u.afm = afm; u.email = "";
+        if (std::string(kind) == "person" && !homes.empty()) u.apartment_id = homes[nextHome++ % homes.size()];
+        Need(c.addUser(u), c, name); return UserByName(c, name); };
     auto charge = [&](int uid, int svc, const std::string& date, double amount, const char* note, const char* status = "pending") {
         Payment p; p.user_id = uid; p.service_id = svc; p.direction = "in"; p.status = status; p.amount_due = amount; p.amount_paid = 0; p.apartment_id = 0;
         p.year = std::atoi(date.substr(0, 4).c_str()); p.month = std::atoi(date.substr(5, 2).c_str()); p.day = std::atoi(date.substr(8, 2).c_str()); p.notes = note;
@@ -173,6 +183,90 @@ int main(int argc, char** argv) {
       if (pkg > 0) { std::vector<Payment> ps; for (int svc : {sBoiler, sPest, sClean}) { Payment p; p.user_id = u; p.service_id = svc; p.direction = "in"; p.status = "pending"; p.apartment_id = 0;
           p.amount_due = svc == sBoiler ? 90 : svc == sPest ? 60 : 150; p.amount_paid = 0; p.year = 2026; p.month = 10; p.day = 12; p.notes = "Πακέτο: ετήσια συντήρηση"; ps.push_back(p); }
         Need(c.addPaymentsWithReceipt(ps, "Πακέτο ετήσιας συντήρησης", nullptr) > 0, c, "package"); } }
+
+    // ---------------- a year of history, so the analysis cube has something to show ----------------
+    // more services, and clients with habits: favourite services, how often, seasons, a few big jobs
+    {
+        struct S2 { int id; double price; int season; };       // season: 0 all year, 1 winter, 2 summer
+        std::vector<S2> svc = { {sPest, 60, 2}, {sPipe, 100, 0}, {sBoiler, 90, 1}, {sClean, 150, 0}, {sMonthly, 50, 0},
+            {service("ΗΛΕΚΤΡΟΛΟΓΙΚΟΣ ΕΛΕΓΧΟΣ", 80, 35), 80, 0}, {service("ΣΥΝΤΗΡΗΣΗ ΚΛΙΜΑΤΙΣΤΙΚΟΥ", 70, 30), 70, 2},
+            {service("ΒΑΨΙΜΟ", 450, 260), 450, 2}, {service("ΑΠΟΦΡΑΞΗ", 120, 50), 120, 0},
+            {service("ΚΗΠΟΥΡΙΚΗ", 65, 25), 65, 2}, {service("ΚΛΕΙΔΑΡΑΣ & ΑΣΦΑΛΕΙΑ", 95, 45), 95, 0} };
+        static const char* kH[] = { "ΑΛΕΞΙΟΥ ΜΑΡΙΝΑ", "ΒΕΡΓΟΣ ΠΕΤΡΟΣ", "ΓΑΛΑΝΗ ΔΕΣΠΟΙΝΑ", "ΔΟΥΚΑΣ ΑΘΑΝΑΣΙΟΣ", "ΕΜΜΑΝΟΥΗΛ ΙΡΙΣ", "ΖΑΧΑΡΙΟΥ ΛΑΜΠΡΟΣ",
+            "ΗΛΙΟΠΟΥΛΟΥ ΚΙΚΗ", "ΘΩΜΑΣ ΓΙΩΡΓΟΣ", "ΙΩΑΝΝΙΔΟΥ ΦΩΤΕΙΝΗ", "ΚΑΛΟΓΕΡΟΠΟΥΛΟΣ ΜΙΧΑΛΗΣ", "ΛΑΜΠΡΟΥ ΝΤΙΝΑ", "ΜΑΝΩΛΑΚΗΣ ΣΠΥΡΟΣ",
+            "ΝΤΟΥΣΗ ΑΛΙΚΗ", "ΞΕΝΟΣ ΒΑΓΓΕΛΗΣ", "ΟΡΦΑΝΟΥ ΤΑΣΙΑ", "ΠΑΝΤΑΖΗΣ ΗΛΙΑΣ", "ΡΟΥΣΣΟΥ ΕΦΗ", "ΣΙΔΕΡΗΣ ΚΩΣΤΗΣ",
+            "ΤΖΑΝΗ ΜΕΛΙΝΑ", "ΥΦΑΝΤΗΣ ΡΑΦΑΗΛ", "ΦΙΛΙΠΠΟΥ ΖΩΗ", "ΧΑΤΖΗΣ ΑΡΙΣΤΟΣ", "ΨΑΡΡΑ ΝΑΤΑΣΑ", "ΩΡΑΙΟΠΟΥΛΟΣ ΤΑΚΗΣ",
+            "ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ", "ΒΙΟΤΕΧΝΙΑ ΚΟΡΑΚΗ", "ΓΡΑΦΕΙΟ ΣΤΑΜΟΥ ΟΕ", "ΔΕΛΤΑ ΦΑΡΜΑΚΕΙΟ", "ΕΛΑΙΩΝ ΚΑΦΕ", "ΖΗΤΑ ΓΥΜΝΑΣΤΗΡΙΟ",
+            "ΜΠΕΗ ΞΕΝΟΔΟΧΕΙΟ", "ΚΑΠΠΑ ΙΑΤΡΕΙΟ", "ΛΑΜΔΑ ΣΧΟΛΗ ΧΟΡΟΥ", "ΜΙ ΚΟΜΜΩΤΗΡΙΟ", "ΝΙ ΑΡΤΟΠΟΙΕΙΟ", "ΞΙ ΒΙΒΛΙΟΠΩΛΕΙΟ" };
+        int nh = 0; std::vector<std::pair<int, bool>> ids;      // the clients made here, and whether a business
+        for (int i = 0; i < 36; i++) {
+            const bool biz = i >= 24;
+            int u = person(kH[i], ("69120" + std::to_string(10000 + i)).c_str(), biz ? "business" : "person", biz ? ("0991" + std::to_string(10000 + i)).c_str() : "");
+            if (u <= 0) continue;
+            ids.push_back({u, biz});
+            // 2-4 favourite services; businesses come more often
+            std::vector<int> fav; const int nf = 2 + Rnd(3);
+            while ((int)fav.size() < nf) { int k = Rnd((int)svc.size()); if (std::find(fav.begin(), fav.end(), k) == fav.end()) fav.push_back(k); }
+            const int every = biz ? 3 + Rnd(6) : 7 + Rnd(15);             // days between visits, about
+            for (int day = 360 - Rnd(every); day > 1; day -= std::max(2, every - every / 3 + Rnd(every * 2 / 3 + 1))) {
+                const std::string d = Ago(day); const int mon = std::atoi(d.substr(5, 2).c_str());
+                const S2& s = svc[fav[Rnd((int)fav.size())]];
+                const bool winter = mon >= 11 || mon <= 3, summer = mon >= 5 && mon <= 9;
+                if ((s.season == 1 && !winter && Rnd(100) < 80) || (s.season == 2 && !summer && Rnd(100) < 80)) continue;
+                double amt = s.price * (0.8 + Rnd(50) / 100.0); if (Rnd(100) < 6) amt *= 3;    // now and then a big job
+                amt = std::round(amt);
+                int id = charge(u, s.id, d, amt, "εργασία"); if (id <= 0) continue; nh++;
+                if (Rnd(100) < 85 && day > 3) pay(u, id, Ago(std::max(1, day - Rnd(20))), amt);
+            }
+        }
+        std::printf("history: %d charges\n", nh);
+
+        // packages: three that sell (in their season) and one on offer that nobody buys (the reversed cube shows it)
+        auto pkgOf = [&](const char* name, std::vector<int> parts) { int id = c.addMasterService(name); if (id > 0) for (int sid : parts) c.addMasterServiceComponent(id, sid); Need(id > 0, c, name); return id; };
+        auto priceOf = [&](int sid) { for (auto& x : svc) if (x.id == sid) return x.price; return 80.0; };
+        const int sElec = svc[5].id, sAir = svc[6].id, sPaint = svc[7].id, sGarden = svc[9].id, sLock = svc[10].id;
+        struct P2 { const char* name; std::vector<int> parts; int season; int id; };
+        std::vector<P2> pk = { {"Πακέτο Χειμώνα", {sBoiler, sElec}, 1, -1}, {"Πακέτο Καλοκαιριού", {sPest, sAir, sGarden}, 2, -1}, {"Πακέτο Ασφάλειας", {sLock, sElec}, 0, -1} };
+        for (auto& x : pk) x.id = pkgOf(x.name, x.parts);
+        pkgOf("Πακέτο Ανακαίνισης", {sPaint, sClean});
+        int npk = 0;
+        for (auto& [u, biz] : ids) {
+            if (Rnd(100) >= 50) continue;                                   // about half the clients ever take a package
+            const int times = 1 + Rnd(biz ? 4 : 2);
+            for (int t = 0; t < times; t++) {
+                const P2& k = pk[Rnd((int)pk.size())];
+                const int day = 3 + Rnd(350); const std::string d = Ago(day); const int mon = std::atoi(d.substr(5, 2).c_str());
+                const bool winter = mon >= 11 || mon <= 3, summer = mon >= 5 && mon <= 9;
+                if ((k.season == 1 && !winter) || (k.season == 2 && !summer)) continue;
+                std::vector<Payment> ps;
+                for (int sid : k.parts) { Payment p; p.user_id = u; p.service_id = sid; p.direction = "in"; p.status = "pending"; p.apartment_id = 0; p.amount_due = std::round(priceOf(sid) * 0.9); p.amount_paid = 0;
+                    p.year = std::atoi(d.substr(0, 4).c_str()); p.month = mon; p.day = std::atoi(d.substr(8, 2).c_str()); p.notes = std::string("Πακέτο: ") + k.name; ps.push_back(p); }
+                const int first = c.addPaymentsWithReceipt(ps, std::string("Πακέτο: ") + k.name, nullptr);
+                if (first <= 0) { std::printf("package: %s\n", c.takeLastError().c_str()); g_fail++; continue; }
+                npk++;
+                if (Rnd(100) < 80) for (size_t j = 0; j < ps.size(); j++) pay(u, first + (int)j, Ago(std::max(1, day - Rnd(15))), ps[j].amount_due);    // the lines of one charge are consecutive
+            }
+        }
+        // contracts: a fixed yearly price paid in installments, for a package or a service; the installments due so far mostly paid
+        int nct = 0;
+        for (int k = 0; k < 12 && !ids.empty(); k++) {
+            const int u = ids[(size_t)(k * 7 + 3) % ids.size()].first;
+            DataConn::Contract ct; ct.user_id = u; ct.months = 12; ct.installments = k % 3 == 0 ? 4 : 12; ct.start_date = Ago(20 + Rnd(320));
+            std::vector<DataConn::ContractItem> items;
+            if (k % 4 != 3) { const P2& x = pk[k % 3]; ct.source_type = "package"; ct.source_id = x.id; ct.label = x.name;
+                for (int sid : x.parts) { DataConn::ContractItem it; it.service_id = sid; it.label = c.getServiceById(sid).label; it.amount = std::round(priceOf(sid) * 6); items.push_back(it); } }
+            else { const int sid = k % 8 == 3 ? sMonthly : sElec; ct.source_type = "service"; ct.source_id = sid; ct.label = c.getServiceById(sid).label;
+                DataConn::ContractItem it; it.service_id = sid; it.label = ct.label; it.amount = std::round(priceOf(sid) * 10); items.push_back(it); }
+            const int cid = c.addContract(ct, items);
+            if (cid <= 0) { std::printf("contract: %s\n", c.takeLastError().c_str()); g_fail++; continue; }
+            nct++;
+            for (auto& in : c.getContractInstallments(cid)) {
+                if (in.future || in.date > kToday || Rnd(100) >= 85) continue;
+                for (int ch : in.charges) { Payment pc = c.getPaymentById(ch); if (pc.direction == "in" && ToCents(pc.balance) > 0) pay(u, ch, in.date, pc.balance); }
+            }
+        }
+        std::printf("packages: %d sold, contracts: %d\n", npk, nct);
+    }
 
     // ---------------- managed buildings: funds and residents' payments ----------------
     auto jointService = [&](const char* label, const char* notes) {

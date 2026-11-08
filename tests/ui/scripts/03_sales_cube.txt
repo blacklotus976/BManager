@@ -1,0 +1,139 @@
+# Part C (after A and B, same database): services, a package, clients, charges, a contract; the cube's three tabs, the reversed
+# view, a flatten; a list column moved by dragging its name.
+wait 10
+log ---- C1. three services (one will never sell)
+click Υπηρεσίες | win=##nav
+click + Νέα Υπηρεσία
+field Ετικέτα | win=Στοιχεία Υπηρεσίας = Καθαρισμός
+field Προτεινόμενη τιμή (€) | win=Στοιχεία Υπηρεσίας = 50
+click Αποθήκευση | win=Στοιχεία Υπηρεσίας
+click Επιβεβαίωση
+click + Νέα Υπηρεσία
+field Ετικέτα | win=Στοιχεία Υπηρεσίας = Ηλεκτρολογικός έλεγχος
+field Προτεινόμενη τιμή (€) | win=Στοιχεία Υπηρεσίας = 80
+click Αποθήκευση | win=Στοιχεία Υπηρεσίας
+click Επιβεβαίωση
+click + Νέα Υπηρεσία
+field Ετικέτα | win=Στοιχεία Υπηρεσίας = Απολύμανση
+field Προτεινόμενη τιμή (€) | win=Στοιχεία Υπηρεσίας = 120
+click Αποθήκευση | win=Στοιχεία Υπηρεσίας
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM services WHERE label IN ('Καθαρισμός','Ηλεκτρολογικός έλεγχος','Απολύμανση') => 3
+
+log ---- C2. a package of two of them
+click + Νέα Υπηρεσία
+click Πακέτο (πολλαπλές υπηρεσίες)
+field Ετικέτα πακέτου = Πακέτο Φθινοπώρου
+click Καθαρισμός | win=Στοιχεία Υπηρεσίας
+scrollto Ηλεκτρολογικός έλεγχος | win=Στοιχεία Υπηρεσίας
+click Ηλεκτρολογικός έλεγχος | win=Στοιχεία Υπηρεσίας
+click Δημιουργία Πακέτου
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM master_services WHERE label = 'Πακέτο Φθινοπώρου' => 1
+check SELECT COUNT(*) FROM master_service_components => 2
+
+log ---- C3. a person and a business
+click Πελάτες | win=##nav
+click + Νέος Πελάτης
+field Ονοματεπώνυμο | win=Στοιχεία Πελάτη = Γιάννης Αλεξίου
+field Τηλέφωνο | win=Στοιχεία Πελάτη = 6977000000
+click Αποθήκευση | win=Στοιχεία Πελάτη
+click Επιβεβαίωση
+click + Νέος Πελάτης
+click Επιχείρηση | win=Στοιχεία Πελάτη
+field Διεύθυνση | win=Στοιχεία Πελάτη = Αφοί Λαμπράκη ΟΕ
+field ΑΦΜ | win=Στοιχεία Πελάτη = 123456783
+click Αποθήκευση | win=Στοιχεία Πελάτη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM users WHERE kind IN ('person','business') AND COALESCE(resident,0) = 0 => 2
+shot C3_clients
+log a list column moved by dragging its name (ΟΝΟΜΑ goes to the far left)
+drag ##name | n=4 => -330,0
+wait 5
+shot C3_column_dragged
+
+log ---- C4. charges: a service, a package (through the home page's quick charge)
+click Αρχική | win=##nav
+click + Χρέωση πελάτη
+click Επιλέξτε πελάτη…  ▼
+click Γιάννης Αλεξίου
+click Επιλέξτε υπηρεσία…  ▼
+click Καθαρισμός
+click Συνέχεια ►
+field Οφειλόμενο ποσό | win=Στοιχεία Πληρωμής = 50
+field Πληρωμένο ποσό | win=Στοιχεία Πληρωμής = 0
+click Αποθήκευση | win=Στοιχεία Πληρωμής
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM charges WHERE direction = 'in' AND service_id = (SELECT id FROM services WHERE label = 'Καθαρισμός') => 1
+click + Χρέωση πελάτη
+click Γιάννης Αλεξίου  ▼
+click Αφοί Λαμπράκη ΟΕ
+click Πακέτο υπηρεσιών
+click Επιλέξτε πακέτο…  ▼
+click Πακέτο Φθινοπώρου
+click Συνέχεια ►
+field Εισπράξεις ήδη (από το σύνολο) = 0
+wait 2
+shot C4_package_charge
+click Χρέωση | win=Χρέωση Πακέτου
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM payment_batches WHERE label = 'Πακέτο: Πακέτο Φθινοπώρου' => 1
+
+log ---- C5. a contract (12 monthly installments, the first one due today)
+click Συμβάσεις | win=##nav
+click Νέα σύμβαση
+click Επιλέξτε πελάτη…  ▼ | win=pagecontent
+click Γιάννης Αλεξίου
+click Υπηρεσία | win=pagecontent
+click Επιλέξτε υπηρεσία…  ▼ | win=pagecontent
+click Ηλεκτρολογικός έλεγχος
+field ##p | win=pagecontent = 600
+wait 2
+shot C5_contract_form
+click Δημιουργία σύμβασης
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM contracts => 1
+check SELECT COUNT(*) FROM charges WHERE contract_id IS NOT NULL AND direction = 'in' => 12
+shot C5_contract_window
+click Κλείσιμο | win=contract_1
+
+log ---- C6. the cube: three tabs
+click Ιστορικό & Ανάλυση | win=##nav
+wait 30
+vtx 60001
+shot C6_cube_services
+check SELECT COUNT(*) FROM charges c WHERE c.direction = 'in' AND c.status != 'future' AND c.service_id IS NOT NULL AND COALESCE(c.batch_id, -1) NOT IN (SELECT batch_id FROM joint_ops) => 4
+click Πακέτα υπηρεσιών
+wait 30
+shot C6_cube_packages
+click Συμβάσεις | win=pagecontent
+wait 30
+shot C6_cube_contracts
+log ---- C7. the reversed view: what does not sell lights up (Απολύμανση sold nothing)
+click Υπηρεσίες | win=pagecontent
+wait 10
+click ##inverse
+wait 40
+vtx 60001
+shot C7_inverse
+log turn square onto the front and flatten (the face goes down into the tables)
+drag ##cubes => 81,-50
+wait 40
+shot C7_snapped
+click Ισοπέδωση
+wait 80
+shot C7_flatten_collapsing
+wait 90
+shot C7_flatten_into_tables
+wait 260
+shot C7_flattened_back
+click ##inverse
+wait 30
+shot C7_normal_again
+quit

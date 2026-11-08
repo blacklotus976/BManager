@@ -1,0 +1,141 @@
+# Part A, on an empty database: one of our partners, a building client, managed, apartments, residents, its partners, the fund
+wait 10
+log ---- A0. one of OUR partners (to copy into the building later)
+click Συνεργάτες | win=##nav
+click + Νέος συνεργάτης
+field ##pn = Ανελκυστήρες Κρητικός Α.Ε.
+field ##pt = ανελκυστήρας
+field ##pp = 2109998877
+field ##pa = 123456783
+field ##pib = GR1601101250000000012300695
+click Αποθήκευση | win=Συνεργάτης
+wait 3
+check SELECT COUNT(*) FROM partners => 1
+
+log ---- A1. a building client (Πελάτες > + Νέος Πελάτης > Πολυκατοικία)
+click Πελάτες | win=##nav
+click + Νέος Πελάτης
+click Πολυκατοικία | win=Στοιχεία Πελάτη
+field Διεύθυνση | win=Στοιχεία Πελάτη = Παπαδιαμάντη 12, Αθήνα
+field ΑΦΜ πολυκατοικίας | win=Στοιχεία Πελάτη = 123456783
+field Όνομα διαχειριστή | win=Στοιχεία Πελάτη = Γιώργος Νικολάου
+field Τηλέφωνο | win=Στοιχεία Πελάτη = 2101234567
+field Email | win=Στοιχεία Πελάτη = papadiamanti12@example.gr
+shot A1_new_building_client
+click Αποθήκευση | win=Στοιχεία Πελάτη
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM users WHERE kind='building' => 1
+check SELECT COUNT(*) FROM buildings WHERE address LIKE 'Παπαδιαμάντη 12%' => 1
+shot A1_clients
+
+log ---- A2. the building goes into Διαχείριση
+click Διαχείριση | win=##nav
+click + Πολυκατοικία σε διαχείριση
+click Παπαδιαμάντη 12, Αθήνα
+wait 10
+check SELECT COUNT(*) FROM managed_buildings WHERE active=1 => 1
+shot A2_managed_window
+
+log ---- A3. apartments and residents
+click Διαμερίσματα & ένοικοι
+click + Διαμέρισμα
+field Ετικέτα (π.χ. Α1, 2ος) = Α1
+click Αποθήκευση | win=Διαμέρισμα
+click Επιβεβαίωση
+click + Διαμέρισμα
+field Ετικέτα (π.χ. Α1, 2ος) = Α2
+click Αποθήκευση | win=Διαμέρισμα
+click Επιβεβαίωση
+click + Διαμέρισμα
+field Ετικέτα (π.χ. Α1, 2ος) = Β1
+click Αποθήκευση | win=Διαμέρισμα
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM apartments => 3
+click Α1 | win=mgwindow
+field Ονοματεπώνυμο | win=Διαμέρισμα και ένοικοι = Μαρία Παππά
+field Τηλέφωνο | win=Διαμέρισμα και ένοικοι = 6900000001
+click Προσθήκη ενοίκου
+wait 3
+click Κλείσιμο | win=Διαμέρισμα και ένοικοι
+click Α2 | win=mgwindow
+field Ονοματεπώνυμο | win=Διαμέρισμα και ένοικοι = Νίκος Ζήσης
+click Προσθήκη ενοίκου
+wait 3
+click Κλείσιμο | win=Διαμέρισμα και ένοικοι
+click Β1 | win=mgwindow
+field Ονοματεπώνυμο | win=Διαμέρισμα και ένοικοι = Ελένη Ράλλη
+field Email | win=Διαμέρισμα και ένοικοι = eleni@example.gr
+click Προσθήκη ενοίκου
+wait 3
+click Κλείσιμο | win=Διαμέρισμα και ένοικοι
+wait 5
+check SELECT COUNT(*) FROM residents WHERE end_date IS NULL OR end_date = '' => 3
+shot A3_residents
+
+log ---- A4. the building's own partners
+click Συνεργάτες πολυκατοικίας
+shot A4_partners_empty
+click + Νέος συνεργάτης πολυκατοικίας
+field ##bpn = ΔΕΗ
+field ##bpt = ρεύμα κοινοχρήστων
+field ##bpp = 11770
+field ##bpi = GR1601101250000000012300695
+click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
+wait 3
+check SELECT COUNT(*) FROM building_partners WHERE name='ΔΕΗ' => 1
+log a wrong ΑΦΜ is refused, then corrected
+click + Νέος συνεργάτης πολυκατοικίας
+field ##bpn = Καθαρίστρια Μαρία
+field ##bpt = καθαριότητα
+field ##bpf = 12345
+click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
+wait 3
+shot A4_bad_afm
+check SELECT COUNT(*) FROM building_partners => 1
+field ##bpf = 987654321
+click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
+wait 3
+check SELECT COUNT(*) FROM building_partners => 2
+log a copy of one of our partners
+click + Νέος συνεργάτης πολυκατοικίας
+click Αντιγραφή από τους συνεργάτες μας  ▼
+click ~Ανελκυστήρες Κρητικός
+wait 3
+shot A4_copied
+click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
+wait 3
+check SELECT COUNT(*) FROM building_partners WHERE source_partner_id IS NOT NULL AND afm='123456783' => 1
+log edit one: the address
+click Επεξεργασία | n=1
+field ##bpa = Χαλκοκονδύλη 30
+click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
+wait 3
+check SELECT COUNT(*) FROM building_partners WHERE address='Χαλκοκονδύλη 30' => 1
+shot A4_partners
+
+log ---- A5. the reserve fund: opening balance, its limit by typing, then by dragging the bar
+click Αποθεματικό
+click Ενημέρωση Αποθεματικού
+click Αρχικό υπόλοιπο
+click Προσθήκη (+)
+field Ποσό (€) | win=Διόρθωση αποθεματικού = 500
+field Αιτία | win=Διόρθωση αποθεματικού = Παραλαβή από τον προηγούμενο διαχειριστή
+click Καταχώριση | win=Διόρθωση αποθεματικού
+wait 5
+check SELECT printf('%.2f', SUM(CASE WHEN direction='in' THEN amount ELSE -amount END)) FROM fund_moves => 500.00
+click Όριο αποθεματικού
+field Ελάχιστο ποσό = 300
+click Αποθήκευση | win=Όριο αποθεματικού
+wait 5
+check SELECT printf('%.2f', min_amount) FROM deposit_limits => 300.00
+shot A5_fund_limit_300
+drag ##depgauge => 160,0
+wait 3
+shot A5_gauge_dragged
+click Αποθήκευση ορίου
+wait 5
+check SELECT min_amount > 300 FROM deposit_limits => 1
+shot A5_fund_after_drag
+quit
