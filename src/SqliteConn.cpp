@@ -4699,6 +4699,11 @@ std::map<int, std::pair<double, double>> SqliteConn::contractPayScores() {
 // The history cube. Time steps are counted from `from`: days, weeks, calendar months, quarters or years.
 // mode 0: services, 1: packages, 2: contracts (by what they are for). Every client and catalog entry is listed (also with nothing
 // in the period: the reversed view shows exactly those), the cells only where something happened.
+// the same service given to several clients is one service in the cube: its id = the lowest id among the one-client services with that label
+static std::string CanonSvcSql(const std::string& col) {
+    return "COALESCE((SELECT MIN(s2.id) FROM services s2 WHERE s2.label = (SELECT s3.label FROM services s3 WHERE s3.id = " + col + ") "
+           "AND (SELECT COUNT(*) FROM service_users su WHERE su.service_id = s2.id) <= 1 AND NOT EXISTS (SELECT 1 FROM joint_services j WHERE j.service_id = s2.id)), " + col + ")";
+}
 DataConn::CubeData SqliteConn::historyCube(const std::string& from, const std::string& to, int unit, int mode) {
     CubeData out;
     if (from.size() != 10 || to.size() != 10 || to < from) return out;
@@ -4754,7 +4759,7 @@ DataConn::CubeData SqliteConn::historyCube(const std::string& from, const std::s
     const std::string packages = "SELECT id, label FROM master_services WHERE active = 1";
     if (mode == 1) readCatalog(packages, 0, "");
     else if (mode == 2) { readCatalog(plainServices, 0, ""); readCatalog(packages, kCubePackageBase, "Πακέτο: "); }
-    else readCatalog(plainServices, 0, "");
+    else readCatalog(plainServices + " AND s.id = (SELECT MIN(s4.id) FROM services s4 WHERE s4.label = s.label AND (SELECT COUNT(*) FROM service_users su4 WHERE su4.service_id = s4.id) <= 1 AND NOT EXISTS (SELECT 1 FROM joint_services j4 WHERE j4.service_id = s4.id)) ORDER BY s.id", 0, "");
 
     // the cells, coloured by the database (midpoint rank of ties, see heat())
     const std::string heatCols =
@@ -4776,7 +4781,7 @@ DataConn::CubeData SqliteConn::historyCube(const std::string& from, const std::s
                 " WHERE c.direction = 'in' AND c.status != 'future' AND c.user_id IS NOT NULL"
                 " AND c.charge_date >= ?1 AND c.charge_date <= ?2 GROUP BY u, s, t";
     else
-        inner = " SELECT c.user_id AS u, c.service_id AS s, " + tExpr("c.charge_date") + " AS t, COUNT(*) AS q, SUM(CAST(ROUND(c.amount_due*100) AS INTEGER)) AS m"
+        inner = " SELECT c.user_id AS u, " + CanonSvcSql("c.service_id") + " AS s, " + tExpr("c.charge_date") + " AS t, COUNT(*) AS q, SUM(CAST(ROUND(c.amount_due*100) AS INTEGER)) AS m"
                 " FROM charges c WHERE c.direction = 'in' AND c.status != 'future' AND c.user_id IS NOT NULL AND c.service_id IS NOT NULL AND " OURS_SQL
                 " AND c.charge_date >= ?1 AND c.charge_date <= ?2 GROUP BY u, s, t";
     const std::string sql = "SELECT u, s, t, q, m, " + heatCols + " FROM (" + inner + ")";
@@ -4804,12 +4809,12 @@ DataConn::CubeData SqliteConn::historyCube(const std::string& from, const std::s
     sqlite3_finalize(st);
     // every client of ours (not residents, not deleted) and anyone with a cell, with their keys and totals
     if (sqlite3_prepare_v2(db, "SELECT u.id, u.full_name, COALESCE(u.code,''), COALESCE(u.special_code,''), COALESCE(b1.address, b2.address, ''), "
-                               "  COALESCE(u.resident,0) = 0 AND NOT EXISTS (SELECT 1 FROM user_deletions d WHERE d.user_id = u.id) FROM users u "
+                               "  COALESCE(u.resident,0) = 0 AND NOT EXISTS (SELECT 1 FROM user_deletions d WHERE d.user_id = u.id), COALESCE(b1.area, b2.area, ''), COALESCE(b1.postal_code, b2.postal_code, ''), COALESCE(u.phone,'') FROM users u "
                                "LEFT JOIN apartments a ON a.id = u.apartment_id LEFT JOIN buildings b1 ON b1.id = a.building_id LEFT JOIN buildings b2 ON b2.id = u.client_building_id", -1, &st, nullptr) == SQLITE_OK)
         while (sqlite3_step(st) == SQLITE_ROW) {
             const int id = sqlite3_column_int(st, 0); auto it = um.find(id);
             if (it == um.end() && sqlite3_column_int(st, 5) == 0) continue;
-            CubeKey k; k.id = id; k.name = ColText(st, 1); k.code = ColText(st, 2); k.special = ColText(st, 3); k.address = ColText(st, 4);
+            CubeKey k; k.id = id; k.name = ColText(st, 1); k.code = ColText(st, 2); k.special = ColText(st, 3); k.address = ColText(st, 4); k.area = ColText(st, 6); k.postal = ColText(st, 7); k.phone = ColText(st, 8);
             if (it != um.end()) { k.money = FromCents(it->second.first); k.qty = it->second.second; }
             out.users.push_back(k);
         }
@@ -6532,12 +6537,14 @@ std::vector<DataConn::ClientChargeRow> SqliteConn::pageClientCharges(int userId,
     const std::string costPaid = "(SELECT COALESCE(SUM(CAST(ROUND(x.amount_paid*100) AS INTEGER)), 0) FROM charges x WHERE" + sameLines + ")";
     std::string sql = std::string("SELECT c.id, c.charge_date, COALESCE(s.label,''), c.status, ") + C("c.amount_due") + ", " + C("c.amount_paid") + ", " + C("c.balance") + ", " +
         cost + " AS costc, " + costPaid + " AS costpc, "
-        "COALESCE((SELECT o.name FROM offer_uses u JOIN offers o ON o.id = u.offer_id WHERE u.charge_id = c.id LIMIT 1), '') "
-        "FROM charges c LEFT JOIN services s ON s.id = c.service_id "
+        "COALESCE((SELECT o.name FROM offer_uses u JOIN offers o ON o.id = u.offer_id WHERE u.charge_id = c.id LIMIT 1), ''), "
+        "COALESCE(cu.full_name, '') AS cname, "
+        "COALESCE((SELECT group_concat(DISTINCT p.name) FROM charges x JOIN partner_costs pc ON pc.charge_id = x.id JOIN partners p ON p.id = pc.partner_id WHERE" + sameLines + "), '') AS pname "
+        "FROM charges c LEFT JOIN services s ON s.id = c.service_id LEFT JOIN users cu ON cu.id = c.user_id "
         "WHERE (?1 = 0 OR c.user_id = ?1) AND c.direction = 'in' AND NOT " + kIsJointCharge + (serviceIds.empty() ? std::string() : " AND c.service_id IN (" + IdListSql(serviceIds) + ")") +
         " AND (?4 = '' OR c.charge_date >= ?4) AND (?5 = '' OR c.charge_date <= ?5) " +
         OrderBy(sort, {"c.charge_date", "fold(COALESCE(s.label,''))", "CAST(ROUND(c.amount_due*100) AS INTEGER)", "CAST(ROUND(c.amount_paid*100) AS INTEGER)",
-                       "CAST(ROUND(c.balance*100) AS INTEGER)", "costc", "costpc", "(CAST(ROUND(c.amount_due*100) AS INTEGER) - costc)"}, "c.charge_date DESC, c.id DESC") +
+                       "CAST(ROUND(c.balance*100) AS INTEGER)", "costc", "costpc", "(CAST(ROUND(c.amount_due*100) AS INTEGER) - costc)", "fold(cname)", "(costc - costpc)", "fold(pname)"}, "c.charge_date DESC, c.id DESC") +
         " LIMIT ?2 OFFSET ?3";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
@@ -6547,7 +6554,7 @@ std::vector<DataConn::ClientChargeRow> SqliteConn::pageClientCharges(int userId,
         ClientChargeRow r;
         r.charge_id = sqlite3_column_int(st, 0); r.date = ColText(st, 1); r.service = ColText(st, 2); r.status = ColText(st, 3);
         r.due = FromCents(sqlite3_column_int64(st, 4)); r.paid = FromCents(sqlite3_column_int64(st, 5)); r.balance = FromCents(sqlite3_column_int64(st, 6));
-        r.cost = FromCents(sqlite3_column_int64(st, 7)); r.costPaid = FromCents(sqlite3_column_int64(st, 8)); r.offerName = ColText(st, 9);
+        r.cost = FromCents(sqlite3_column_int64(st, 7)); r.costPaid = FromCents(sqlite3_column_int64(st, 8)); r.offerName = ColText(st, 9); r.client = ColText(st, 10); r.partner = ColText(st, 11);
         out.push_back(r);
     }
     sqlite3_finalize(st);
@@ -8394,5 +8401,37 @@ std::vector<DataConn::ResidentQualityRow> SqliteConn::residentQuality(const std:
         if (q.building.empty()) q.building = getBuildingById(q.building_id).address;
         if (q.name.empty()) q.name = getUserById(q.user_id).full_name;
     }
+    return out;
+}
+
+std::vector<DataConn::CubeHit> SqliteConn::cubeCellHits(int mode, int userId, int serviceId, const std::string& serviceName, const std::string& from, const std::string& to, int limit) {
+    std::vector<CubeHit> out;
+    std::string sql;
+    const std::string cents = "CAST(ROUND(c.amount_due*100) AS INTEGER)", centsPaid = "CAST(ROUND(c.amount_paid*100) AS INTEGER)";
+    if (mode == 1)
+        sql = "SELECT MIN(c.id), MIN(c.charge_date), CASE WHEN c.notes LIKE 'Πακέτο: %' THEN substr(c.notes, 9) WHEN pb.label LIKE 'Πακέτο: %' THEN substr(pb.label, 9) ELSE COALESCE(NULLIF(pb.label, ''), 'Πακέτο') END AS nm, "
+              "COALESCE(u.full_name,''), SUM(" + cents + "), SUM(" + centsPaid + "), 0, c.user_id, 0 FROM charges c LEFT JOIN payment_batches pb ON pb.id = c.batch_id LEFT JOIN users u ON u.id = c.user_id "
+              "WHERE c.direction = 'in' AND c.status != 'future' AND c.user_id IS NOT NULL AND c.contract_id IS NULL AND " OURS_SQL
+              " AND (c.notes LIKE 'Πακέτο: %' OR (c.batch_id IS NOT NULL AND (SELECT COUNT(DISTINCT x.service_id) FROM charges x WHERE x.batch_id = c.batch_id AND x.direction = 'in') > 1))"
+              " AND c.charge_date >= ?1 AND c.charge_date <= ?2 AND (?3 = 0 OR c.user_id = ?3) GROUP BY COALESCE(c.batch_id, -c.id) HAVING (?4 = '' OR nm = ?4) ORDER BY 2 DESC LIMIT ?5";
+    else if (mode == 2)
+        sql = "SELECT k.id, MIN(c.charge_date), k.label, COALESCE(u.full_name,''), SUM(" + cents + "), SUM(" + centsPaid + "), 1, c.user_id, (CASE k.source_type WHEN 'service' THEN k.source_id ELSE " + std::to_string(kCubePackageBase) + " + k.source_id END) FROM charges c JOIN contracts k ON k.id = c.contract_id LEFT JOIN users u ON u.id = c.user_id "
+              "WHERE c.direction = 'in' AND c.status != 'future' AND c.user_id IS NOT NULL AND c.charge_date >= ?1 AND c.charge_date <= ?2 AND (?3 = 0 OR c.user_id = ?3) "
+              "AND (?6 = 0 OR (CASE k.source_type WHEN 'service' THEN k.source_id ELSE " + std::to_string(kCubePackageBase) + " + k.source_id END) = ?6) GROUP BY k.id ORDER BY 2 DESC LIMIT ?5";
+    else
+        sql = "SELECT c.id, c.charge_date, COALESCE(s.label,''), COALESCE(u.full_name,''), " + cents + ", " + centsPaid + ", 0, c.user_id, " + CanonSvcSql("c.service_id") + " FROM charges c LEFT JOIN services s ON s.id = c.service_id LEFT JOIN users u ON u.id = c.user_id "
+              "WHERE c.direction = 'in' AND c.status != 'future' AND c.user_id IS NOT NULL AND c.service_id IS NOT NULL AND " OURS_SQL
+              " AND c.charge_date >= ?1 AND c.charge_date <= ?2 AND (?3 = 0 OR c.user_id = ?3) AND (?6 = 0 OR " + CanonSvcSql("c.service_id") + " = ?6) ORDER BY c.charge_date DESC, c.id DESC LIMIT ?5";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_text(st, 1, from.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, to.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, userId); sqlite3_bind_int(st, 5, limit); sqlite3_bind_int(st, 6, serviceId);
+    if (mode == 1) sqlite3_bind_text(st, 4, serviceName.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        CubeHit h; h.id = sqlite3_column_int(st, 0); h.date = ColText(st, 1); h.label = ColText(st, 2); h.client = ColText(st, 3);
+        h.due = FromCents(sqlite3_column_int64(st, 4)); h.paid = FromCents(sqlite3_column_int64(st, 5)); h.kind = sqlite3_column_int(st, 6); h.user_id = sqlite3_column_int(st, 7); h.svc = sqlite3_column_int(st, 8);
+        out.push_back(h);
+    }
+    sqlite3_finalize(st);
     return out;
 }

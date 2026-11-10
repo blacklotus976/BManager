@@ -190,3 +190,6 @@ add_test(NAME receipt_probe COMMAND receipt_probe_test)
 # the databases that ship with the program: make_release_dbs <folder> -> data.db + empty.db
 add_executable(make_release_dbs EXCLUDE_FROM_ALL tools/make_release_dbs.cpp src/SqliteConn.cpp)
 target_link_libraries(make_release_dbs PRIVATE sqlite3_vendored)
+# the third database: a greengrocer's (people as clients, fruit and supermarket goods, one supplier): make_fruits_db <folder> -> fruits.db
+add_executable(make_fruits_db EXCLUDE_FROM_ALL tools/make_fruits_db.cpp src/SqliteConn.cpp)
+target_link_libraries(make_fruits_db PRIVATE sqlite3_vendored)

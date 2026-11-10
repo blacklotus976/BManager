@@ -29,7 +29,7 @@
 //     it back over the button regardless of how many rows the month needs.
 //
 // futureOnly:
-//     When true, today and every earlier day is disabled at selection time
+//     When true, every day BEFORE today is disabled at selection time (today is allowed)
 //     -- a strictly-future rule is structurally impossible to violate, no
 //     post-hoc validation needed. Used for future-payment resolution dates.
 //     When false, every date in the navigable range is selectable.

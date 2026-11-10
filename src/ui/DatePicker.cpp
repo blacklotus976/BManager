@@ -163,7 +163,7 @@ bool DatePicker(const char* id, std::string& dateInOut,
 
                     bool isPastOrToday = (navY < todayY) ||
                                           (navY == todayY && navM < todayM) ||
-                                          (navY == todayY && navM == todayM && day <= todayD);
+                                          (navY == todayY && navM == todayM && day < todayD);      // today itself is allowed
                     bool disabled   = futureOnly && isPastOrToday;
                     bool isSelected = st.hasSelection &&
                                       st.selYear == navY && st.selMonth == navM && st.selDay == day;

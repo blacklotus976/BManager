@@ -597,7 +597,7 @@ public:
     // A client's own services (not their parts of joint charges), one row per charge, with what they paid and what it cost us.
     // sort columns: 0 date, 1 service, 2 charged, 3 paid, 4 owed, 5 our cost, 6 paid on our cost, 7 profit (several keys allowed)
     struct ClientChargeRow {
-        int charge_id = -1; std::string date, service, status, offerName;
+        int charge_id = -1; std::string date, service, status, offerName, client, partner;
         double due = 0, paid = 0, balance = 0, cost = 0, costPaid = 0;
         double profit() const { return due - cost; }
     };
@@ -838,13 +838,17 @@ public:
     // Only the cells with activity are returned (the cube is mostly empty). heat_* is the cell's colour,
     // worked out in the database by heat(cume_dist()) -- the same thermal scale as Heat() below.
     struct CubeCell { int user_id = -1, service_id = -1, t = 0, qty = 0; double money = 0; unsigned heat_money = 0, heat_qty = 0; };
-    struct CubeKey  { int id = -1; std::string name, code, special, address; double money = 0; int qty = 0; };
+    struct CubeKey  { int id = -1; std::string name, code, special, address, area, postal, phone; double money = 0; int qty = 0; };
     struct CubeData { std::vector<CubeCell> cells; std::vector<CubeKey> users, services; std::vector<std::string> buckets; };
     // unit: 0 day, 1 week, 2 month, 3 quarter, 4 year. mode: what runs on the second axis -- 0 services (every service line, also
     // inside packages and contracts), 1 packages (one sale = one package charge), 2 contracts (by what the contract is for: a
     // service or a package; qty = contracts with an installment in that step). Every client and every catalog entry is listed,
     // even with nothing in the period, so the reversed view can show what does not sell.
     virtual CubeData historyCube(const std::string& from, const std::string& to, int unit, int mode = 0) = 0;
+    // What is behind one cell of the cube's tables: the charges (mode 0), package sales (1) or contracts (2) of that client / service in that period.
+    // userId / serviceId 0 = any (a summed cell); serviceName: a package's name in mode 1. kind 0 = a charge (id = the first of the sale), 1 = a contract.
+    struct CubeHit { int kind = 0, id = -1, user_id = 0, svc = 0; std::string date, label, client; double due = 0, paid = 0; };
+    virtual std::vector<CubeHit> cubeCellHits(int mode, int userId, int serviceId, const std::string& serviceName, const std::string& from, const std::string& to, int limit) = 0;
     // thermal colour for a 0..1 position (0 = least, blue -> cyan -> yellow -> red = most), packed like IM_COL32
     static unsigned Heat(double r) {
         if (r < 0) r = 0; if (r > 1) r = 1;

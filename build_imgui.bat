@@ -62,7 +62,7 @@ IF %ERRORLEVEL% NEQ 0 ( echo [ERROR] CMake config failed. If the toolset is the 
 
 echo.
 echo --- 3. Building Release (app + tests) ---
-"%CMAKE%" --build %BUILD_DIR% --config Release --target PropertyManager money_test receipts_test history_test audit_test attachments_test joint_test plan_test stress_test offers_test packages_test cost_test math_test make_release_dbs cash_test clients_test fund_test residents_test receipt_probe_test -- /m:2
+"%CMAKE%" --build %BUILD_DIR% --config Release --target PropertyManager money_test receipts_test history_test audit_test attachments_test joint_test plan_test stress_test offers_test packages_test cost_test math_test make_release_dbs make_fruits_db cash_test clients_test fund_test residents_test receipt_probe_test -- /m:2
 IF %ERRORLEVEL% NEQ 0 ( echo [ERROR] Build failed. & exit /b 1 )
 
 echo.
@@ -80,13 +80,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "dependency_report.ps1"
 echo.
 echo --- 5b. databases that ship with the program (release_db) ---
 if not exist "release_db\data.db" "%BUILD_DIR%\Release\make_release_dbs.exe" release_db
-for %%F in (data.db empty.db) do if not exist "%BUILD_DIR%\Release\%%F" copy /Y "release_db\%%F" "%BUILD_DIR%\Release\" >nul
+if not exist "release_db\fruits.db" "%BUILD_DIR%\Release\make_fruits_db.exe" release_db
+for %%F in (data.db empty.db fruits.db) do if not exist "%BUILD_DIR%\Release\%%F" copy /Y "release_db\%%F" "%BUILD_DIR%\Release\" >nul
 echo.
 echo --- 6. dist\ ---
 if not exist "dist" mkdir dist
 copy /Y "%BUILD_DIR%\Release\PropertyManager.exe" "dist\" >nul
 xcopy /E /I /Y /Q "demo_media" "dist\demo_media" >nul
 if not exist "dist\data.db" copy /Y "release_db\data.db" "dist\" >nul
+if not exist "dist\fruits.db" copy /Y "release_db\fruits.db" "dist\" >nul
 rem empty.db is what we share: always the clean one, never one that was used for trying things
 del /Q "dist\empty.db-wal" "dist\empty.db-shm" 2>nul
 copy /Y "release_db\empty.db" "dist\" >nul

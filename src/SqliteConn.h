@@ -280,6 +280,7 @@ public:
     std::vector<ProfitRow> profitAnalysis(const std::string& from, const std::string& to) override;
     std::map<int, std::pair<double, double>> contractPayScores() override;
     CubeData historyCube(const std::string& from, const std::string& to, int unit, int mode = 0) override;
+    std::vector<CubeHit> cubeCellHits(int mode, int userId, int serviceId, const std::string& serviceName, const std::string& from, const std::string& to, int limit) override;
     std::vector<ManageScore> manageScores(const std::string& fromYm, const std::string& toYm) override;
     std::vector<std::string> contractDefaultDates(const std::string& start, int months, int installments) override;
     int addContract(const Contract& c, const std::vector<ContractItem>& items) override;
