@@ -4,7 +4,7 @@ log ---- E1. the clients list (one page: no question, straight to the file)
 click Πελάτες | win=##nav
 wait 3
 shot E1_clients_with_excel
-click ##excelbar
+click ##excelh
 wait 10
 log ---- E2. the charges list
 click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
@@ -26,13 +26,15 @@ wait 5
 click Συνεργάτες πολυκατοικίας | win=mgwindow
 wait 3
 shot E4_partners_excel
-click ##excelbar | win=mgwindow
+click ##excelh | win=mgwindow
 wait 10
 click ##mgback
 log ---- E5. the cube's two tables, with their sums
 click Ιστορικό & Ανάλυση | win=##nav
 wait 20
-click ##cubeexcel
+click ##cubex
+wait 10
+click ##cubex
 wait 10
 log ---- E6. a client's usage panel and its export
 click Πελάτες | win=##nav
@@ -40,9 +42,30 @@ wait 3
 click 5 | win=userstable
 wait 10
 shot E6_client_usage
-scrollto ##usexcel
+scrollto ##excel | win=Καρτέλα πελάτη
 wait 3
 shot E6b_client_usage_table
-click ##usexcel
+click ##excel | win=Καρτέλα πελάτη
 wait 10
+log ---- E7. the profit split by state (collected or not × cost paid or not), a box's charges in the list
+scrollto ##psplit0 | win=Καρτέλα πελάτη
+wait 3
+shot E7_profit_split
+click ##psplit0 | win=Καρτέλα πελάτη
+wait 3
+scrollto Όλες | win=Καρτέλα πελάτη
+wait 3
+shot E7b_profit_split_filtered
+click Όλες | win=Καρτέλα πελάτη
+wait 3
+log ---- E8. a service without a suggested price or cost; the services list shows the ID
+click Υπηρεσίες | win=##nav
+click + Νέα Υπηρεσία
+field Ετικέτα | win=Στοιχεία Υπηρεσίας = Επισκευή κατά περίπτωση
+field ΚΩΔ | win=Στοιχεία Υπηρεσίας = ΣΕ-07
+click Αποθήκευση | win=Στοιχεία Υπηρεσίας
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM services WHERE label = 'Επισκευή κατά περίπτωση' AND suggested_price = 0 AND code = 'ΣΕ-07' => 1
+shot E8_services_with_id
 quit

@@ -9,4 +9,5 @@
 struct MasterService {
     int id = -1;
     std::string label;
+    std::string created_at;      // when it was entered (local time)
 };

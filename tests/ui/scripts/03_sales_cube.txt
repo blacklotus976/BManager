@@ -37,45 +37,66 @@ check SELECT COUNT(*) FROM master_service_components => 2
 log ---- C3. a person and a business
 click Πελάτες | win=##nav
 click + Νέος Πελάτης
-field Ονοματεπώνυμο | win=Στοιχεία Πελάτη = Γιάννης Αλεξίου
-field Τηλέφωνο | win=Στοιχεία Πελάτη = 6977000000
+click Ιδιώτης | win=Στοιχεία Πελάτη
+field ##uname | win=Στοιχεία Πελάτη = Γιάννης Αλεξίου
+field ##uaddr | win=Στοιχεία Πελάτη = Πατησίων 120
+field ##utk | win=Στοιχεία Πελάτη = 11257
+field ##uphone | win=Στοιχεία Πελάτη = 6977000000
 click Αποθήκευση | win=Στοιχεία Πελάτη
 click Επιβεβαίωση
 click + Νέος Πελάτης
 click Επιχείρηση | win=Στοιχεία Πελάτη
-field Διεύθυνση | win=Στοιχεία Πελάτη = Αφοί Λαμπράκη ΟΕ
-field ΑΦΜ | win=Στοιχεία Πελάτη = 123456783
+field ##uname | win=Στοιχεία Πελάτη = Αφοί Λαμπράκη ΟΕ
+field ##uaddr | win=Στοιχεία Πελάτη = Σόλωνος 40
+field ##uarea | win=Στοιχεία Πελάτη = Κολωνάκι
+field ##uafm | win=Στοιχεία Πελάτη = 123456783
+log the extra details: name and value, as many as wanted
+click + Προσθήκη στοιχείου | win=Στοιχεία Πελάτη
+field ##xk | win=Στοιχεία Πελάτη = ΔΟΥ
+field ##xv | win=Στοιχεία Πελάτη = Α' Αθηνών
+click + Προσθήκη στοιχείου | win=Στοιχεία Πελάτη
+field ##xk | win=Στοιχεία Πελάτη | n=2 = Website
+field ##xv | win=Στοιχεία Πελάτη | n=2 = lamprakis.gr
+shot C3_new_business
 click Αποθήκευση | win=Στοιχεία Πελάτη
 click Επιβεβαίωση
 wait 5
 check SELECT COUNT(*) FROM users WHERE kind IN ('person','business') AND COALESCE(resident,0) = 0 => 2
+check SELECT own_address || ' / ' || own_postal_code FROM users WHERE full_name = 'Γιάννης Αλεξίου' => Πατησίων 120 / 11257
+check SELECT own_address || ' / ' || own_area || ' / ' || json_extract(extra_json, '$."ΔΟΥ"') || ' / ' || json_extract(extra_json, '$.Website') FROM users WHERE full_name = 'Αφοί Λαμπράκη ΟΕ' => Σόλωνος 40 / Κολωνάκι / Α' Αθηνών / lamprakis.gr
 shot C3_clients
 log a list column moved by dragging its name (ΟΝΟΜΑ goes to the far left)
 drag ##name | n=4 => -330,0
 wait 5
 shot C3_column_dragged
 
-log ---- C4. charges: a service, a package (through the home page's quick charge)
-click Αρχική | win=##nav
-click + Χρέωση πελάτη
-click Επιλέξτε πελάτη…  ▼
-click Γιάννης Αλεξίου
-click Επιλέξτε υπηρεσία…  ▼
-click Καθαρισμός
-click Συνέχεια ►
+log ---- C4. charges: a service, a package (through «Συντόμευση Χρέωσης»: who, what, «Χρέωση ►»)
+click Συντόμευση Χρέωσης | win=##nav
+wait 3
+field ##qcwhoq = Αλεξίου
+wait 3
+click Γιάννης Αλεξίου | win=pagecontent
+click Υπηρεσία | win=pagecontent
+field ##qcwhatq = Καθαρισμός
+wait 3
+click Καθαρισμός | win=pagecontent
+shot C4_quick_charge
+click Χρέωση ►
 field Οφειλόμενο ποσό | win=Στοιχεία Πληρωμής = 50
 field Πληρωμένο ποσό | win=Στοιχεία Πληρωμής = 0
 click Αποθήκευση | win=Στοιχεία Πληρωμής
 click Επιβεβαίωση
 wait 5
 check SELECT COUNT(*) FROM charges WHERE direction = 'in' AND service_id = (SELECT id FROM services WHERE label = 'Καθαρισμός') => 1
-click + Χρέωση πελάτη
-click Γιάννης Αλεξίου  ▼
-click Αφοί Λαμπράκη ΟΕ
-click Πακέτο υπηρεσιών
-click Επιλέξτε πακέτο…  ▼
-click Πακέτο Φθινοπώρου
-click Συνέχεια ►
+click αλλαγή | win=pagecontent | n=1
+wait 2
+field ##qcwhoq = Λαμπράκη
+wait 3
+click Αφοί Λαμπράκη ΟΕ | win=pagecontent
+click Πακέτο υπηρεσιών | win=pagecontent
+wait 3
+click Πακέτο Φθινοπώρου | win=pagecontent
+click Χρέωση ►
 field Εισπράξεις ήδη (από το σύνολο) = 0
 wait 2
 shot C4_package_charge
@@ -112,9 +133,8 @@ check SELECT COUNT(*) FROM charges c WHERE c.direction = 'in' AND c.status != 'f
 click Πακέτα υπηρεσιών
 wait 30
 shot C6_cube_packages
-click Συμβάσεις | win=pagecontent
-wait 30
-shot C6_cube_contracts
+log the cube has no contracts tab (only services and packages)
+expectno Συμβάσεις | win=pagecontent
 log ---- C7. the reversed view: what does not sell lights up (Απολύμανση sold nothing)
 click Υπηρεσίες | win=pagecontent
 wait 10

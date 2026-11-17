@@ -43,6 +43,7 @@ inline bool ParseShown(const std::string& s0, Cell& out) {
     // a date dd/mm/yyyy or yyyy-mm-dd
     int d = 0, m = 0, y = 0; char tail = 0;
     if ((std::sscanf(n.c_str(), "%d/%d/%d%c", &d, &m, &y, &tail) == 3 && n.size() == 10) ||
+        (n.size() == 10 && n[2] == '.' && n[5] == '.' && std::sscanf(n.c_str(), "%d.%d.%d%c", &d, &m, &y, &tail) == 3) ||
         (std::sscanf(n.c_str(), "%d-%d-%d%c", &y, &m, &d, &tail) == 3 && n.size() == 10 && n[4] == '-')) {
         if (y < 1900 || m < 1 || m > 12 || d < 1 || d > 31) return false;
         // days since 1899-12-30 (Excel's day 0, with its 1900 leap-year quirk already counted in)
@@ -224,7 +225,7 @@ inline bool Write(const std::string& path, const std::vector<Sheet>& sheets, std
     z.add("xl/_rels/workbook.xml.rels", rels);
     // styles, in the order of the Style enum
     z.add("xl/styles.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
-        "<numFmts count=\"2\"><numFmt numFmtId=\"164\" formatCode=\"#,##0.00\\ &quot;€&quot;;\\-#,##0.00\\ &quot;€&quot;\"/><numFmt numFmtId=\"165\" formatCode=\"dd/mm/yyyy\"/></numFmts>"
+        "<numFmts count=\"2\"><numFmt numFmtId=\"164\" formatCode=\"#,##0.00\\ &quot;€&quot;;\\-#,##0.00\\ &quot;€&quot;\"/><numFmt numFmtId=\"165\" formatCode=\"dd.mm.yyyy\"/></numFmts>"
         "<fonts count=\"4\"><font><sz val=\"11\"/><name val=\"Calibri\"/><family val=\"2\"/></font><font><b/><sz val=\"11\"/><color rgb=\"FFFFFFFF\"/><name val=\"Calibri\"/><family val=\"2\"/></font>"
         "<font><b/><sz val=\"11\"/><name val=\"Calibri\"/><family val=\"2\"/></font><font><b/><sz val=\"14\"/><name val=\"Calibri\"/><family val=\"2\"/></font></fonts>"
         "<fills count=\"4\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill>"

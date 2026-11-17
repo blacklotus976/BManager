@@ -4,6 +4,7 @@
 struct Service {
     int id = -1;
     std::string label;
+    std::string code;                // ΚΩΔ: the office's own service code, free to edit (id is only the database's)
     std::string extra_notes;
     std::string created_at;
     double suggested_price = 0.0;   // catalog price hint; packages sum their components'

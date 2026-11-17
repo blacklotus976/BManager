@@ -7,6 +7,13 @@ wait 5
 click Ενεργά έξοδα
 click + Καταχώριση εξόδων μήνα
 wait 3
+log the automation: our own charges to the building, counted on one line, opened to see them
+expect ~Αυτοματισμός: βρέθηκαν | win=Μηνιαία έξοδα
+click ~Αυτοματισμός: βρέθηκαν | win=Μηνιαία έξοδα
+wait 3
+shot B1_bill_automation_open
+click ~Αυτοματισμός: βρέθηκαν | win=Μηνιαία έξοδα
+wait 3
 field ##w | win=Μηνιαία έξοδα = ΔΕΗ κοινοχρήστων
 field ##a | win=Μηνιαία έξοδα = 45,50
 click ##p | win=Μηνιαία έξοδα
@@ -33,6 +40,7 @@ wait 3
 click Ίσα σε όλους
 wait 2
 shot B1_month_filled
+scrollto Καταχώριση και χρέωση ενοίκων | win=Μηνιαία έξοδα
 click Καταχώριση και χρέωση ενοίκων
 wait 5
 check SELECT COUNT(*) FROM monthly_bills => 1
@@ -53,6 +61,7 @@ wait 3
 shot B2_from_shortcuts
 field ##a | win=Μηνιαία έξοδα | n=1 = 47,20
 click Ίσα σε όλους
+scrollto Καταχώριση και χρέωση ενοίκων | win=Μηνιαία έξοδα
 click Καταχώριση και χρέωση ενοίκων
 wait 5
 check SELECT COUNT(*) FROM monthly_bills => 2
@@ -64,8 +73,10 @@ log ---- B3. a resident pays her share of the first month (Είσπραξη, wit
 scrollto Είσπραξη | win=activebills | n=4
 click Είσπραξη | n=4
 wait 3
-log the receipt's date has to be chosen
-click Επιλογή ημερομηνίας... | win=Νέα είσπραξη
+log the receipt's date starts at the payment's day; another day picked from its calendar
+click ~Απόδειξη είσπραξης: όχι | win=Νέα είσπραξη
+click Έκδοση απόδειξης | win=Νέα είσπραξη
+click {dmy} | win=Νέα είσπραξη | n=2
 click {d}
 click OK
 wait 2

@@ -110,6 +110,9 @@ static bool IsEmptyDb(const std::string& path) {
 static bool IsFruitsDb(const std::string& path) {
     return path.size() >= 9 && path.compare(path.size() - 9, 9, "fruits.db") == 0;
 }
+static bool IsSmallDb(const std::string& path) {
+    return path.size() >= 8 && path.compare(path.size() - 8, 8, "small.db") == 0;
+}
 bool DatabaseFileExists(const std::string& name) { std::ifstream f(DirNextToExe() + name, std::ios::binary); return f.good(); }
 
 void WriteConfiguredDbPath(const std::string& path) {
@@ -118,9 +121,10 @@ void WriteConfiguredDbPath(const std::string& path) {
 
 bool SwitchDatabaseAndRelaunch(const std::string& currentDbPath, const std::string& which) {
     std::string mainDb = ReadConfigValue("main_db");
-    if (!IsEmptyDb(currentDbPath) && !IsFruitsDb(currentDbPath)) mainDb = RelativeToExe(currentDbPath);      // the full database to come back to
-    std::string target = which == "empty" ? "empty.db" : which == "fruits" ? "fruits.db" : (mainDb.empty() ? "data.db" : mainDb);
+    if (!IsEmptyDb(currentDbPath) && !IsFruitsDb(currentDbPath) && !IsSmallDb(currentDbPath)) mainDb = RelativeToExe(currentDbPath);      // the full database to come back to
+    std::string target = which == "empty" ? "empty.db" : which == "fruits" ? "fruits.db" : which == "small" ? "small.db" : (mainDb.empty() ? "data.db" : mainDb);
     if (which == "fruits" && !DatabaseFileExists("fruits.db")) return false;
+    if (which == "small" && !DatabaseFileExists("small.db")) return false;
     WriteConfig(target, mainDb);
 #ifdef _WIN32
     char exe[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
@@ -159,7 +163,7 @@ int main() {
     { std::ifstream probe(dbPath, std::ios::binary); dbExisted = probe.good(); }
     try {
         auto conn = std::make_unique<SqliteConn>(dbPath);
-        if (!dbExisted && !IsEmptyDb(dbPath) && !IsFruitsDb(dbPath)) seedDemoDataIfEmpty(conn.get(), DirNextToExe() + "demo_media");
+        if (!dbExisted && !IsEmptyDb(dbPath) && !IsFruitsDb(dbPath) && !IsSmallDb(dbPath)) seedDemoDataIfEmpty(conn.get(), DirNextToExe() + "demo_media");
         conn->autoBackup();   // one copy per day in <db folder>/backups, newest 14 kept
         return RunApp(conn.get(), dbPath);
     } catch (const std::exception& e) {

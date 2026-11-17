@@ -279,6 +279,7 @@ public:
     // Changes whenever this connection writes anything. Screens cache what they computed against it, so
     // an unchanged screen costs nothing per frame.
     virtual long long dataVersion() = 0;
+    virtual std::string firstChargeDate() = 0;     // the oldest charge's date (yyyy-mm-dd), "" when there is none
 
     // --- Paged "phone book" pickers (dashboard filters) -------------------
     // These fetch only one page of rows at a time -- the dashboard pickers
@@ -592,18 +593,28 @@ public:
     };
     // sort columns: 0 date, 1 partner, 2 service, 3 for whom, 4 amount, 5 paid, 6 still owed, 7 kind (several keys allowed)
     // kind: 0 all, 1 the clients' own services (and packages), 2 joint charges
-    virtual std::vector<PartnerJob> partnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, int kind = 0, bool owedOnly = false) = 0;
-    virtual int countPartnerJobs(int partnerId, const std::string& fromDate = "", const std::string& toDate = "", int kind = 0, bool owedOnly = false) = 0;
+    virtual std::vector<PartnerJob> partnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, int kind = 0, bool owedOnly = false, bool noDocOnly = false) = 0;
+    virtual int countPartnerJobs(int partnerId, const std::string& fromDate = "", const std::string& toDate = "", int kind = 0, bool owedOnly = false, bool noDocOnly = false) = 0;
     // A client's own services (not their parts of joint charges), one row per charge, with what they paid and what it cost us.
     // sort columns: 0 date, 1 service, 2 charged, 3 paid, 4 owed, 5 our cost, 6 paid on our cost, 7 profit (several keys allowed)
     struct ClientChargeRow {
         int charge_id = -1; std::string date, service, status, offerName, client, partner;
         double due = 0, paid = 0, balance = 0, cost = 0, costPaid = 0;
+        bool contract = false;           // an installment of a contract (Σύμβαση)
         double profit() const { return due - cost; }
     };
     // userId 0 = every client; serviceIds limits to those services (a service, or the services of a package)
     virtual std::vector<ClientChargeRow> pageClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, const std::vector<int>& serviceIds = {}) = 0;
     virtual int countClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const std::vector<int>& serviceIds = {}) = 0;
+    // What one service (serviceId > 0) or one package (packageId > 0) brought in: a service's every charge, a package's sales
+    // (its lines, «Πακέτο: ...»). withContracts: also the installments of contracts made for it (a contract for a package,
+    // or any contract that includes the service).
+    // The clients charged most recently (by the date of their latest charge that is due, not counting what is only scheduled):
+    // (client id, that date), newest first. Residents and former clients are left out.
+    virtual std::vector<std::pair<int, std::string>> recentChargedClients(int limit) = 0;
+    // The charges "of a period" for the home page: dated in it, or that received money in it (paid early or late)
+    virtual std::vector<ClientChargeRow> periodCharges(const std::string& fromDate, const std::string& toDate) = 0;
+    virtual std::vector<ClientChargeRow> entityCharges(int serviceId, int packageId, const std::string& fromDate, const std::string& toDate, bool withContracts) = 0;
     // The money side of one charge: what it brought in and what it cost us, paid to whom (a service can have several cost lines).
     // For a client's service: its cost lines (same action, same service); for a joint share: the operation's cost lines;
     // for a cost line: itself and the income line it belongs to.
@@ -804,6 +815,7 @@ public:
     struct BuildingPartner {
         int id = -1, building_id = -1, source_partner_id = -1; bool active = true;
         std::string name, trade, address, phone, email, afm, iban, notes, building, created_at;
+        std::string extra_json;           // the office's own details, name -> value (like a client's «Επιπλέον στοιχεία»)
         int lines = 0; double owed = 0, paid = 0; std::string last_paid;
     };
     virtual std::vector<BuildingPartner> getBuildingPartners(int buildingId, bool withInactive = false) = 0;   // buildingId -1 = every building
@@ -827,6 +839,10 @@ public:
     struct PartnerDoc { int id = -1, payment_id = -1, partner_id = -1, charge_id = -1; std::string partner, type, number, date, notes, pay_date, method, what; double amount = 0; };
     virtual bool payOutWithDoc(int chargeId, double amount, const std::string& payDate, const std::string& method, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) = 0;
     virtual std::vector<PartnerDoc> getPartnerDocs(int partnerId, const std::string& from, const std::string& to) = 0;
+    // a cost already paid (all or part) whose payments came without the partner's document: what of it has none yet,
+    // and adding that document later (one per such payment, each for the amount that payment paid)
+    virtual double paidWithoutDoc(int chargeId) = 0;
+    virtual int addPartnerDocLater(int chargeId, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) = 0;
     // what each client was charged, by kind; and each service / package / contract with what it earned and cost
     struct ClientMix { int user_id = -1; double services = 0, packages = 0, contracts = 0; };
     virtual std::vector<ClientMix> clientMix(const std::string& from, const std::string& to) = 0;
@@ -837,7 +853,7 @@ public:
     // History & analytics cube: what we charged our own clients, per client x service x time step.
     // Only the cells with activity are returned (the cube is mostly empty). heat_* is the cell's colour,
     // worked out in the database by heat(cume_dist()) -- the same thermal scale as Heat() below.
-    struct CubeCell { int user_id = -1, service_id = -1, t = 0, qty = 0; double money = 0; unsigned heat_money = 0, heat_qty = 0; };
+    struct CubeCell { int user_id = -1, service_id = -1, t = 0, qty = 0; double money = 0; unsigned heat_money = 0, heat_qty = 0; float rank_money = 0, rank_qty = 0; };
     struct CubeKey  { int id = -1; std::string name, code, special, address, area, postal, phone; double money = 0; int qty = 0; };
     struct CubeData { std::vector<CubeCell> cells; std::vector<CubeKey> users, services; std::vector<std::string> buckets; };
     // unit: 0 day, 1 week, 2 month, 3 quarter, 4 year. mode: what runs on the second axis -- 0 services (every service line, also

@@ -15,24 +15,30 @@ check SELECT COUNT(*) FROM partners => 1
 log ---- A1. a building client (Πελάτες > + Νέος Πελάτης > Πολυκατοικία)
 click Πελάτες | win=##nav
 click + Νέος Πελάτης
-click Πολυκατοικία | win=Στοιχεία Πελάτη
-field Διεύθυνση | win=Στοιχεία Πελάτη = Παπαδιαμάντη 12, Αθήνα
-field ΑΦΜ πολυκατοικίας | win=Στοιχεία Πελάτη = 123456783
-field Όνομα διαχειριστή | win=Στοιχεία Πελάτη = Γιώργος Νικολάου
-field Τηλέφωνο | win=Στοιχεία Πελάτη = 2101234567
-field Email | win=Στοιχεία Πελάτη = papadiamanti12@example.gr
+log the building is the first kind and already chosen; every kind has the same fields
+field ##uaddr | win=Στοιχεία Πελάτη = Παπαδιαμάντη 12, Αθήνα
+field ##uarea | win=Στοιχεία Πελάτη = Κυψέλη
+field ##utk | win=Στοιχεία Πελάτη = 11257
+field ##uafm | win=Στοιχεία Πελάτη = 123456783
+field ##umanager | win=Στοιχεία Πελάτη = Γιώργος Νικολάου
+field ##uphone | win=Στοιχεία Πελάτη = 2101234567
+field ##uemail | win=Στοιχεία Πελάτη = papadiamanti12@example.gr
 shot A1_new_building_client
 click Αποθήκευση | win=Στοιχεία Πελάτη
 click Επιβεβαίωση
 wait 5
 check SELECT COUNT(*) FROM users WHERE kind='building' => 1
-check SELECT COUNT(*) FROM buildings WHERE address LIKE 'Παπαδιαμάντη 12%' => 1
+check SELECT COUNT(*) FROM buildings WHERE address LIKE 'Παπαδιαμάντη 12%' AND area = 'Κυψέλη' AND postal_code = '11257' => 1
 shot A1_clients
 
 log ---- A2. the building goes into Διαχείριση
 click Διαχείριση | win=##nav
 click + Πολυκατοικία σε διαχείριση
 click Παπαδιαμάντη 12, Αθήνα
+log it asks for the fund the building starts with (none here: it is funded later)
+wait 3
+shot A2_starting_fund
+click Ανάληψη διαχείρισης
 wait 10
 check SELECT COUNT(*) FROM managed_buildings WHERE active=1 => 1
 shot A2_managed_window
@@ -47,8 +53,12 @@ click + Διαμέρισμα
 field Ετικέτα (π.χ. Α1, 2ος) = Α2
 click Αποθήκευση | win=Διαμέρισμα
 click Επιβεβαίωση
+log a new apartment takes its resident in the same window
 click + Διαμέρισμα
 field Ετικέτα (π.χ. Α1, 2ος) = Β1
+field ##arname | win=Διαμέρισμα = Ελένη Ράλλη
+field ##aremail | win=Διαμέρισμα = eleni@example.gr
+shot A3_new_apartment_with_resident
 click Αποθήκευση | win=Διαμέρισμα
 click Επιβεβαίωση
 wait 5
@@ -64,12 +74,7 @@ field Ονοματεπώνυμο | win=Διαμέρισμα και ένοικο�
 click Προσθήκη ενοίκου
 wait 3
 click Κλείσιμο | win=Διαμέρισμα και ένοικοι
-click Β1 | win=mgwindow
-field Ονοματεπώνυμο | win=Διαμέρισμα και ένοικοι = Ελένη Ράλλη
-field Email | win=Διαμέρισμα και ένοικοι = eleni@example.gr
-click Προσθήκη ενοίκου
-wait 3
-click Κλείσιμο | win=Διαμέρισμα και ένοικοι
+check SELECT COUNT(*) FROM residents r JOIN apartments a ON a.id = r.apartment_id WHERE a.label = 'Β1' AND r.email = 'eleni@example.gr' => 1
 wait 5
 check SELECT COUNT(*) FROM residents WHERE end_date IS NULL OR end_date = '' => 3
 shot A3_residents
@@ -81,23 +86,27 @@ click + Νέος συνεργάτης πολυκατοικίας
 field ##bpn = ΔΕΗ
 field ##bpt = ρεύμα κοινοχρήστων
 field ##bpp = 11770
-field ##bpi = GR1601101250000000012300695
+click + Προσθήκη στοιχείου | win=Συνεργάτης πολυκατοικίας
+field ##xk | win=Συνεργάτης πολυκατοικίας = IBAN
+field ##xv | win=Συνεργάτης πολυκατοικίας = GR1601101250000000012300695
 click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
 wait 3
 check SELECT COUNT(*) FROM building_partners WHERE name='ΔΕΗ' => 1
-log a wrong ΑΦΜ is refused, then corrected
+check SELECT COUNT(*) FROM building_partners WHERE iban='GR1601101250000000012300695' => 1
+log loose details: nothing is checked, any name -> value is kept
 click + Νέος συνεργάτης πολυκατοικίας
 field ##bpn = Καθαρίστρια Μαρία
 field ##bpt = καθαριότητα
-field ##bpf = 12345
+click + Προσθήκη στοιχείου | win=Συνεργάτης πολυκατοικίας
+field ##xk | win=Συνεργάτης πολυκατοικίας = ΑΦΜ
+field ##xv | win=Συνεργάτης πολυκατοικίας = 12345
+click + Προσθήκη στοιχείου | win=Συνεργάτης πολυκατοικίας
+field ##xk | win=Συνεργάτης πολυκατοικίας | n=2 = Ωράριο
+field ##xv | win=Συνεργάτης πολυκατοικίας | n=2 = Τρίτη πρωί
+shot A4_loose
 click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
 wait 3
-shot A4_bad_afm
-check SELECT COUNT(*) FROM building_partners => 1
-field ##bpf = 987654321
-click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
-wait 3
-check SELECT COUNT(*) FROM building_partners => 2
+check SELECT COUNT(*) FROM building_partners WHERE afm='12345' AND extra_json LIKE '%Ωράριο%' => 1
 log a copy of one of our partners
 click + Νέος συνεργάτης πολυκατοικίας
 click Αντιγραφή από τους συνεργάτες μας  ▼
@@ -108,8 +117,10 @@ click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
 wait 3
 check SELECT COUNT(*) FROM building_partners WHERE source_partner_id IS NOT NULL AND afm='123456783' => 1
 log edit one: the address
-click Επεξεργασία | n=1
-field ##bpa = Χαλκοκονδύλη 30
+click Επεξεργασία | n=3
+click + Προσθήκη στοιχείου | win=Συνεργάτης πολυκατοικίας
+field ##xk | win=Συνεργάτης πολυκατοικίας | n=3 = Διεύθυνση
+field ##xv | win=Συνεργάτης πολυκατοικίας | n=3 = Χαλκοκονδύλη 30
 click Αποθήκευση | win=Συνεργάτης πολυκατοικίας
 wait 3
 check SELECT COUNT(*) FROM building_partners WHERE address='Χαλκοκονδύλη 30' => 1

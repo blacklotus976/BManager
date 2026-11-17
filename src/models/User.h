@@ -29,13 +29,12 @@ struct User {
     // client: not listed, not searched, not rated. The resident himself (stays, contact) is a row of `residents`.
     bool resident = false;
 
-    // ---- DERIVED, read-only ------------------------------------------------
-    // Filled in by the SELECT's JOIN (users -> apartments -> buildings) so every
-    // screen can keep showing "where they live" without a second query. Never
-    // stored on the users table and ignored by addUser/editUser.
-    int building_id = -1;
+    // Where the client is: his own address / area / ΤΚ (users.own_*), or, when he has none, his apartment's building;
+    // a building client's are its building's. addUser/editUser write them (a building's go to the building).
     std::string address;
     std::string area;
     std::string postal_code;
+    // ---- DERIVED, read-only ------------------------------------------------
+    int building_id = -1;
     std::string apartment;     // the apartment's label, e.g. "Α1"
 };

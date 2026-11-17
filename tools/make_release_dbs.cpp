@@ -56,7 +56,7 @@ static int UserByName(SqliteConn& c, const std::string& name) {
 
 int main(int argc, char** argv) {
     namespace fs = std::filesystem;
-    if (argc < 2) { std::printf("make_release_dbs <folder>\n"); return 2; }
+    if (argc < 2) { std::printf("make_release_dbs <folder> [demo_media folder]\n"); return 2; }
     fs::path dir = argv[1]; fs::create_directories(dir);
     fs::remove(dir / "data.db"); fs::remove(dir / "data.db-wal"); fs::remove(dir / "data.db-shm");
     fs::remove(dir / "empty.db"); fs::remove(dir / "empty.db-wal"); fs::remove(dir / "empty.db-shm");
@@ -335,6 +335,113 @@ int main(int argc, char** argv) {
     }
     // a one-off fund correction in the good building (a refund received)
     c.fundAdjust(bid[0], 120.0, "2026-09-15", "Επιστροφή από ΔΕΗ: διόρθωση ταμείου", false);
+
+    // ---------------- one example of everything else the program does ----------------
+    int nEx = 0;
+    auto ok = [&](bool v, const char* what) { if (v) nEx++; else { std::printf("example %s: %s\n", what, c.takeLastError().c_str()); g_fail++; } };
+    // clients of ours (people), oldest first
+    std::vector<User> people;
+    for (auto& u : c.pageUsers("", 0, {}, 0, 100000)) if (u.kind == "person" && !u.resident) people.push_back(u);
+    {
+        // a managed building's own partners (whoever the building pays), its expense shortcuts and its fund limit
+        const char* bpNames[3][3] = { { "ΔΕΗ", "Ρεύμα κοινοχρήστων", "" }, { "Καθαρίστρια Ελένη Κ.", "Καθαριότητα", "6944 222 333" }, { "Ανελκυστήρες Αττικής", "Συντήρηση ανελκυστήρα", "210 555 0177" } };
+        for (size_t bi = 0; bi < 3; bi++) {
+            std::vector<int> bp;
+            for (auto& x : bpNames) {
+                DataConn::BuildingPartner q; q.building_id = bid[bi]; q.name = x[0]; q.trade = x[1]; q.phone = x[2];
+                if (std::string(x[0]) == "ΔΕΗ") { q.afm = "090000045"; q.iban = "GR1601101250000000012300695"; }
+                const int id = c.saveBuildingPartner(q); ok(id > 0, "building partner"); bp.push_back(id);
+            }
+            ok(c.setDepositMin(bid[bi], bi == 0 ? 500 : bi == 1 ? 300 : 200), "fund limit");
+            // the monthly costs (Μηνιαία έξοδα), logged from the manager's other program: September paid, October still open
+            auto rs = c.getBuildingResidents(bid[bi]);
+            if (bi < 2 && !rs.empty()) for (const char* ym : { "2026-09", "2026-10" }) {
+                std::vector<DataConn::BillReason> rr = { { "Ρεύμα κοινοχρήστων", 62.40, bp[0] }, { "Καθαριότητα", 80.00, bp[1] }, { "Συντήρηση ανελκυστήρα", 95.00, bp[2] }, { "Διάφορα (λάμπες)", 12.60, -1 } };
+                long long tot = 0; for (auto& r : rr) tot += ToCents(r.amount);
+                const int billId = c.addMonthlyBill(bid[bi], ym, "Από το πρόγραμμα κοινοχρήστων", rr, Equal(rs, tot));
+                ok(billId > 0, "monthly bill");
+                if (billId <= 0) continue;
+                c.rememberExpenseShortcuts(bid[bi], rr);
+                // the residents pay their part; September is then paid to the partners
+                size_t k = 0;
+                for (auto& sh : c.getBillShares(billId)) {
+                    if (k++ % 4 == 3 && std::string(ym) == "2026-10") continue;      // September: everybody paid; October: some still owe
+                    for (int ch : sh.charges) { Payment pc = c.getPaymentById(ch); if (ToCents(pc.balance) <= 0) continue;
+                        MoneyPayment m; m.user_id = sh.user_id; m.pay_date = std::string(ym) + "-20"; m.amount = pc.balance; m.method = "bank"; Receipt rc; rc.method = "bank";
+                        ok(c.recordPayment(m, {{-1, ch, pc.balance}}, &rc) > 0, "bill payment"); }
+                }
+                if (std::string(ym) == "2026-09") ok(c.resolveMonthlyBill(billId, "2026-10-05"), "bill paid");
+            }
+        }
+        // offers: a percentage for one client, a fixed discount on a service for everybody, one cancelled
+        if (!people.empty()) {
+            Offer o; o.name = "Πιστός πελάτης −10%"; o.kind = "percent"; o.value = 10; o.user_id = people[0].id; o.valid_from = "2026-01-01"; o.valid_to = "2026-12-31"; o.note = "Πελάτης από το 2020";
+            const int oid = c.saveOffer(o); ok(oid > 0, "offer");
+            // ... and used once: a boiler service at 90 € list price, 10% off
+            if (oid > 0) {
+                Payment p; p.user_id = people[0].id; p.service_id = sBoiler; p.direction = "in"; p.apartment_id = 0; p.list_price = 90; p.amount_due = 81; p.amount_paid = 81; p.balance = 0;
+                p.status = "paid"; p.offer_id = oid; p.year = 2026; p.month = 10; p.day = 6; p.notes = "Ετήσιο σέρβις, με την έκπτωση του πελάτη";
+                Receipt r; r.user_id = people[0].id; r.method = "card"; ok(c.addPaymentsWithReceipt({ p }, "", &r) > 0, "offer use");
+            }
+            Offer f; f.name = "Φθινοπωρινή απεντόμωση −15 €"; f.kind = "fixed"; f.value = 15; f.target_type = "service"; f.target_id = sPest; f.valid_from = "2026-09-01"; f.valid_to = "2026-11-30";
+            ok(c.saveOffer(f) > 0, "offer");
+            Offer x; x.name = "Λάθος καταχώριση"; x.kind = "percent"; x.value = 5; x.valid_from = "2026-10-01"; x.valid_to = "2026-12-31";
+            const int xid = c.saveOffer(x); ok(xid > 0 && c.cancelOffer(xid, "Καταχωρίστηκε δύο φορές"), "cancelled offer");
+        }
+        // notes on the home page
+        for (auto& [t, b] : std::vector<std::pair<const char*, const char*>>{ { "Τηλεφώνημα ΚΗΦΙΣΙΑΣ 118", "Ο διαχειριστής ζητά προσφορά για βάψιμο κλιμακοστασίου έως 15/11." },
+                                                                             { "Παραγγελία ανταλλακτικών", "Φλάντζες και βαλβίδες για τους καυστήρες: παραλαβή Πέμπτη." } }) {
+            Note n; n.title = t; n.content = b; ok(c.addNote(n), "note");
+        }
+        // an installment plan still running: a boiler service in 3 monthly installments, the first paid
+        if (people.size() > 2) {
+            const int u = people[2].id; std::vector<Payment> lines;
+            const char* dates[3] = { "2026-09-15", "2026-10-15", "2026-11-15" };
+            for (int k = 0; k < 3; k++) {
+                Payment p; p.user_id = u; p.service_id = sBoiler; p.direction = "in"; p.apartment_id = 0; p.amount_due = 60;
+                p.year = 2026; p.month = 9 + k; p.day = 15; p.amount_paid = k == 0 ? 60 : 0; p.balance = k == 0 ? 0 : 60;
+                p.status = k == 0 ? "paid" : "future"; p.resolution_date = k == 0 ? "" : dates[k];
+                p.notes = "Δόση " + std::to_string(k + 1) + "/3 · ΣΥΝΤΗΡΗΣΗ ΚΑΥΣΤΗΡΑ"; lines.push_back(p);
+            }
+            Receipt r; r.user_id = u; r.method = "cash";
+            ok(c.addInstallmentPlan(lines, "ΣΥΝΤΗΡΗΣΗ ΚΑΥΣΤΗΡΑ σε 3 δόσεις", 3, "month", "each", &r) > 0, "installment plan");
+        }
+        // a partner paid with his invoice (Τιμολόγια)
+        {
+            int paidDocs = 0;
+            std::vector<std::string> cols; std::vector<std::vector<std::string>> rows; std::string err;
+            c.executeRawQuery("SELECT c.id, c.balance FROM charges c JOIN partner_costs pc ON pc.charge_id = c.id WHERE c.direction = 'out' AND c.balance > 0.004 ORDER BY c.id LIMIT 1", cols, rows, err);
+            for (auto& r : rows) {
+                const int id = std::atoi(r[0].c_str()); const double bal = std::atof(r[1].c_str());
+                ok(c.payOutWithDoc(id, bal, kToday, "bank", paidDocs == 0 ? "invoice" : "receipt", paidDocs == 0 ? "ΤΠ-2041" : "ΑΠΥ-118", kToday, "Εξόφληση με κατάθεση"), "partner invoice");
+                paidDocs++;
+            }
+        }
+        // a contract cancelled early
+        {
+            auto cts = c.pageContracts(0, 0, "", SortSpec{}, 0, 100);
+            if (!cts.empty()) ok(c.cancelContract(cts.back().id, "Ο πελάτης μετακόμισε"), "cancelled contract");
+        }
+        // a former client: still in the books, no longer in the lists
+        {
+            const std::string name = "ΠΑΛΙΟΣ ΠΕΛΑΤΗΣ ΓΙΑΝΝΗΣ";
+            User u; u.full_name = name; u.phone = "6900000099"; u.kind = "person";
+            if (c.addUser(u)) { const int id = UserByName(c, name); const int ch = charge(id, sPest, Ago(200), 60, "απεντόμωση"); pay(id, ch, Ago(200), 60);
+                                ok(c.removeUser(id), "former client"); }
+        }
+        // attachments: files kept next to the database (attachments/), from the demo media
+        if (argc > 2) {
+            const std::string m = argv[2];
+            if (!people.empty()) ok(c.addAttachment("client", people[0].id, m + "/client_id_card.jpg", "Ταυτότητα") > 0, "attachment");
+            if (!people.empty()) ok(c.addAttachment("client", people[0].id, m + "/management_contract.pdf", "Σύμβαση") > 0, "attachment");
+            for (auto& r : c.getReceipts(0, 2)) ok(c.addAttachment("receipt", r.id, m + "/receipt_scan_A000001.jpg", "Σκαναρισμένη απόδειξη") > 0, "attachment");
+            for (auto& p : c.pagePayments("", kToday, -1, sBoiler, "", "in", 0, 1)) {
+                ok(c.addAttachment("charge", p.id, m + "/boiler_damage.jpg", "Φωτογραφία βλάβης") > 0, "attachment");
+                ok(c.addAttachment("charge", p.id, m + "/boiler_inspection.mp4", "Βίντεο από τον τεχνικό") > 0, "attachment");
+            }
+        }
+    }
+    std::printf("examples of everything else: %d\n", nEx);
 
     // the same money seen from every screen must agree to the cent
     {

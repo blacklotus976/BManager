@@ -1,0 +1,165 @@
+# Collecting on a copy of the demo data (`demo`): the home page's owings (a client's services, one bill of his, part of it,
+# a contract's installments), a client's card (its open owings, one bill, all of them), a service's card, and paying a partner.
+wait 10
+log ---- H0. home: the profit of the period split by the state of its money; no separate management-fee boxes
+shot H0_home_profit_split
+log ---- H1. home, «Πελάτες με υπηρεσίες»: a client's open bills under his name, then Είσπραξη of all his services
+check SELECT printf('%.2f', SUM(balance)) FROM charges c JOIN users u ON u.id=c.user_id WHERE u.full_name='ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ' AND c.direction='in' AND c.contract_id IS NULL => 2389.00
+click ▼ Χρεώσεις | n=1
+wait 3
+shot H1_home_open_bills
+click Είσπραξη | n=1
+wait 3
+shot H1a_nothing_ticked
+check SELECT 1 => 1
+click Όλες | win=Νέα είσπραξη
+wait 2
+shot H1b_collect_dialog
+click ~Απόδειξη είσπραξης: όχι | win=Νέα είσπραξη
+click Έκδοση απόδειξης | win=Νέα είσπραξη
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 10
+check SELECT printf('%.2f', SUM(balance)) FROM charges c JOIN users u ON u.id=c.user_id WHERE u.full_name='ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ' AND c.direction='in' AND c.contract_id IS NULL => 0.00
+check SELECT printf('%.2f', SUM(balance)) FROM charges c JOIN users u ON u.id=c.user_id WHERE u.full_name='ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ' AND c.direction='in' AND c.contract_id IS NOT NULL AND c.status != 'future' => 125.00
+check SELECT COUNT(*) FROM receipts r JOIN users u ON u.id=r.user_id WHERE u.full_name='ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ' AND r.issue_date = date('now','localtime') => 1
+log ---- H2. one bill of the next client, only 10 € of it
+click ▼ Χρεώσεις | n=1
+wait 3
+click Είσπραξη | n=2
+wait 3
+field Ποσό που εισπράχθηκε (€) = 10
+wait 2
+shot H2_part_of_one_bill
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 10
+check SELECT COUNT(*) FROM charges WHERE direction='in' AND amount_paid > 0 AND balance > 0.005 AND id IN (SELECT charge_id FROM allocations a JOIN payments m ON m.id=a.payment_id WHERE m.pay_date = date('now','localtime')) => 1
+log ---- H3. «Πελάτες με συμβάσεις»: the installments that are due
+click Πελάτες με συμβάσεις
+wait 3
+click Είσπραξη | n=1
+wait 3
+click Όλες | win=Νέα είσπραξη
+wait 2
+shot H3_contract_installments
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 10
+check SELECT COUNT(*) FROM payments WHERE pay_date = date('now','localtime') AND direction='in' => 3
+log ---- J1. «Συντόμευση Χρέωσης»: who (recently charged first, or searched), what (a service), «Χρέωση ►»
+click Συντόμευση Χρέωσης | win=##nav
+wait 5
+shot J1_quick_charge
+field ##qcwhoq = ΑΘΗΝΑΪΚΗ
+wait 3
+click ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ | win=pagecontent
+click Υπηρεσία | win=pagecontent
+field ##qcwhatq = ΑΠΟΦΡΑΞΗ
+wait 3
+click ΑΠΟΦΡΑΞΗ | win=pagecontent
+shot J1b_chosen
+click Χρέωση ►
+wait 3
+field Οφειλόμενο ποσό | win=Στοιχεία Πληρωμής = 120
+field Πληρωμένο ποσό | win=Στοιχεία Πληρωμής = 0
+click Αποθήκευση | win=Στοιχεία Πληρωμής
+click Επιβεβαίωση
+wait 5
+check SELECT COUNT(*) FROM charges c JOIN users u ON u.id = c.user_id WHERE u.full_name = 'ΑΘΗΝΑΪΚΗ ΕΣΤΙΑΣΗ ΑΕ' AND c.charge_date = date('now','localtime') AND c.amount_due = 120 => 1
+log ---- J2. home, «Οφειλές μας»: to the list of what we owe our partners
+click Αρχική | win=##nav
+wait 5
+click Οφειλές μας
+wait 3
+click Πληρωμές συνεργατών ► | win=pagecontent
+wait 5
+shot J2_jump_pay_partners
+log ---- L2. later partner documents: what we paid without one, its invoice now for exactly what was paid
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+wait 3
+click Χρεώσεις | win=pagecontent
+click Συνεργάτες (κόστη μας) | win=pagecontent
+click ##qmode | win=pagecontent
+click Όλες οι ημερομηνίες
+click Χωρίς παραστατικό | win=pagecontent
+wait 5
+shot L2_no_doc
+click Παραστατικό | win=pagecontent | n=1
+wait 3
+field Αριθμός##late = ΤΠ-900
+shot L2b_late_doc
+click Καταχώριση παραστατικού
+wait 5
+check SELECT COUNT(*) FROM partner_docs WHERE number = 'ΤΠ-900' AND amount > 0 => 1
+log ---- L1. later receipts: charges paid without a receipt, the receipt issued now for exactly that money
+click Χρεώσεις Πληρωμές Αποδείξεις | win=##nav
+wait 3
+click Χρεώσεις | win=pagecontent
+click Πελάτες | win=pagecontent
+click ##qmode | win=pagecontent
+click Όλες οι ημερομηνίες
+click Χωρίς απόδειξη | win=pagecontent
+wait 5
+shot L1_no_receipt
+click Απόδειξη | win=pagecontent | n=1
+wait 3
+shot L1b_late_receipt
+click Έκδοση τώρα | win=Απόδειξη για όσα πληρώθηκαν
+wait 5
+check SELECT COUNT(*) >= 2 FROM receipts WHERE issue_date = date('now','localtime') AND status = 'issued' => 1
+click Κλείσιμο | win=Απόδειξη Α
+log ---- P1. a partner's card: what we owe him (any date), «Πληρωμή» from there
+click Συνεργάτες | win=##nav
+wait 5
+click Μαρία Σταθοπούλου | win=pagecontent
+wait 10
+shot P1_partner_card_owings
+click Πληρωμή | win=Καρτέλα συνεργάτη
+wait 3
+shot P1b_pay_from_card
+click Πληρωμή | win=Πληρωμή προς συνεργάτη
+wait 5
+check SELECT COUNT(*) FROM charges WHERE direction = 'out' AND balance > 0.005 => 0
+log ---- K1. a client's card: what he owes now (any date), one bill, then all of them
+click Αρχική | win=##nav
+wait 5
+click Πελάτες με υπηρεσίες
+wait 3
+click ΟΡΦΑΝΟΥ ΤΑΣΙΑ
+wait 10
+shot K1_card_open_owings
+click Είσπραξη | win=Καρτέλα πελάτη | n=1
+wait 3
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 10
+click ~Είσπραξη όλων | win=Καρτέλα πελάτη
+wait 3
+shot K1b_collect_all
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 10
+check SELECT printf('%.2f', COALESCE(SUM(balance),0)) FROM charges c JOIN users u ON u.id=c.user_id WHERE u.full_name='ΟΡΦΑΝΟΥ ΤΑΣΙΑ' AND c.direction='in' AND c.status != 'future' => 0.00
+log ---- K2. a service's card: who owes for it (contracts left out unless asked), Είσπραξη of one line
+click Υπηρεσίες | win=##nav
+wait 5
+click ΑΠΟΦΡΑΞΗ | win=pagecontent
+wait 10
+shot K2_service_open_owings
+click Είσπραξη | win=Καρτέλα υπηρεσίας | n=1
+wait 3
+click Καταχώριση | win=Νέα είσπραξη
+click Επιβεβαίωση
+wait 10
+check SELECT COUNT(*) FROM payments WHERE pay_date = date('now','localtime') AND direction='in' => 6
+log ---- Q1. a package's card: like a service's, over the package's sales; its income by service; contracts only when asked
+click Πακέτα Υπηρεσιών | win=##nav
+wait 5
+click Πακέτο Χειμώνα | win=pagecontent
+wait 10
+shot Q1_package_card
+click Μαζί οι συμβάσεις | win=Καρτέλα πακέτου
+wait 10
+shot Q1b_package_card_with_contracts
+quit

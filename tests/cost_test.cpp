@@ -25,6 +25,16 @@ int main() {
         CHECK(ToCents(c.getServiceCost(svc)) == 1500);
         s.id = svc; s.cost_price = 0; CHECK(c.editService(svc, s)); CHECK(c.getServiceCost(svc) == 0.0);
         CHECK(c.setServiceCost(svc, 12.5) && ToCents(c.getServiceCost(svc)) == 1250);
+        {   // price and cost are only suggestions: a service without either is fine, a negative one is not
+            Service z; z.label = "ΧΩΡΙΣ ΤΙΜΗ"; const int zid = c.addServiceGetId(-1, z);
+            CHECK(zid > 0); CHECK(c.getServiceById(zid).suggested_price == 0.0);
+            z.suggested_price = 25; CHECK(c.editService(zid, z)); z.suggested_price = 0; CHECK(c.editService(zid, z));
+            Service neg; neg.label = "ΑΡΝΗΤΙΚΗ"; neg.suggested_price = -1; CHECK(c.addServiceGetId(-1, neg) < 0);
+            Service k; k.label = "ΜΕ ΚΩΔΙΚΟ"; k.code = "Σ-12"; const int kid = c.addServiceGetId(-1, k);       // the office's own code, not the id
+            CHECK(kid > 0 && c.getServiceById(kid).code == "Σ-12");
+            k.code = "Σ-13"; CHECK(c.editService(kid, k) && c.getServiceById(kid).code == "Σ-13");
+            CHECK(c.countServices("Σ-13") == 1);
+        }
 
         // a client service charged with its cost: the charge (owed) + the cost line (paid out at once)
         Payment ch; ch.user_id = U1; ch.service_id = svc; ch.year = 2026; ch.month = 10; ch.day = 5; ch.amount_due = 40; ch.amount_paid = 0; ch.status = "pending"; ch.direction = "in";

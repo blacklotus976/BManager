@@ -3,8 +3,12 @@
 #include "SqliteConn.h"
 #include "Money.h"
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include "sqlite3.h"
+#include <string>
+#include <vector>
 
 static int fails = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("FAIL line %d: %s\n", __LINE__, #cond); fails++; } } while (0)
@@ -57,6 +61,14 @@ int main() {
             int cid = c.addContract(k, {{a1, "ΥΠ1", 120, 24}, {a2, "ΥΠ2", 60.01, 0}});
             if (cid <= 0) std::printf("contract: %s\n", c.takeLastError().c_str());
             CHECK(cid > 0);
+            {   // a service's / a package's card: the contract's installments only when asked
+                CHECK(c.entityCharges(a1, 0, "", "", false).empty());
+                auto withC = c.entityCharges(a1, 0, "", "", true);
+                CHECK(withC.size() == 12); bool allC = true; for (auto& r : withC) allC = allC && r.contract; CHECK(allC);
+                CHECK(c.entityCharges(0, 1, "", "", false).empty() && c.entityCharges(0, 1, "", "", true).size() == 24);
+                bool recent = false; for (auto& [id, d] : c.recentChargedClients(10)) if (id == su && !d.empty()) recent = true;
+                CHECK(recent);                                          // charged (its first installments are due) -> among the recent
+            }
             auto in = c.getContractInstallments(cid);
             CHECK(in.size() == 12);
             long long sum = 0; int fut = 0; for (auto& i : in) { sum += ToCents(i.due); if (i.future) fut++; }
@@ -177,9 +189,12 @@ int main() {
             int nc = BuildingClient(c, nbid);
             User x = c.getUserById(nc);
             CHECK(nc > 0 && x.kind == "building" && x.phone == "2100000000" && x.email == "d@x.gr" && x.afm == "333333333");
-            x.full_name = "ΠΑΤΗΣΙΩΝ 205Α"; x.afm = "444444444";
+            x.address = "ΠΑΤΗΣΙΩΝ 205Α"; x.afm = "444444444";                  // its address and ΑΦΜ are the building's
             CHECK(c.editUser(nc, x));
             CHECK(c.getBuildingById(nbid).address == "ΠΑΤΗΣΙΩΝ 205Α" && c.getBuildingById(nbid).afm == "444444444");
+            CHECK(c.getUserById(nc).full_name == "ΠΑΤΗΣΙΩΝ 205Α");             // a name that was just the address follows it
+            x = c.getUserById(nc); x.full_name = "ΠΟΛΥΚΑΤΟΙΚΙΑ ΑΚΡΟΠΟΛΙΣ"; CHECK(c.editUser(nc, x));     // a name of its own: the building keeps its address
+            CHECK(c.getUserById(nc).full_name == "ΠΟΛΥΚΑΤΟΙΚΙΑ ΑΚΡΟΠΟΛΙΣ" && c.getBuildingById(nbid).address == "ΠΑΤΗΣΙΩΝ 205Α" && c.getUserById(nc).address == "ΠΑΤΗΣΙΩΝ 205Α");
             CHECK(c.countUsers("", 0, {}, 2) == 2);                        // still one client per building
             // Διαχείριση: only the buildings we manage
             CHECK(c.getManagedBuildings().empty() && !c.isBuildingManaged(nbid));
@@ -198,6 +213,47 @@ int main() {
         CHECK(c.removeBuilding(bid) || true);
         CHECK(c.countUsers("", 0, {}, 2) == (c.getBuildingById(bid).id > 0 ? 2 : 1));
         CHECK(c.getUserById(bc).id == bc);
+    }
+    // every kind has its own address, area and ΤΚ (a building's are its building's)
+    fs::remove_all(dir); fs::create_directories(dir);
+    {
+        SqliteConn c((dir / "data.db").string());
+        User p; p.full_name = "ΔΙΕΥΘΥΝΣΗ ΔΟΚΙΜΗ"; p.address = "ΠΑΤΗΣΙΩΝ 120"; p.area = "ΚΥΨΕΛΗ"; p.postal_code = "11257"; CHECK(c.addUser(p));
+        const int pid = c.searchUsers("ΔΙΕΥΘΥΝΣΗ ΔΟΚΙΜΗ", 0, 10)[0].id;
+        User g = c.getUserById(pid);
+        CHECK(g.address == "ΠΑΤΗΣΙΩΝ 120" && g.area == "ΚΥΨΕΛΗ" && g.postal_code == "11257");
+        CHECK(c.countUsers("ΚΥΨΕΛΗ", 0, {}) == 1);                           // searched like any other field
+        g.address = "ΣΟΛΩΝΟΣ 40"; g.kind = "business"; CHECK(c.editUser(pid, g)); CHECK(c.getUserById(pid).address == "ΣΟΛΩΝΟΣ 40" && c.getUserById(pid).kind == "business");
+        User b; b.kind = "building"; b.full_name = "ΜΑΚΕΔΟΝΙΑΣ 3"; b.area = "ΒΥΡΩΝΑΣ"; b.postal_code = "16231"; CHECK(c.addUser(b));
+        int bu = -1; for (auto& u : c.pageUsers("", 0, {}, 0, 100, {}, 2)) if (u.full_name == "ΜΑΚΕΔΟΝΙΑΣ 3") bu = u.id;
+        CHECK(bu > 0); const User bb = c.getUserById(bu);
+        CHECK(bb.address == "ΜΑΚΕΔΟΝΙΑΣ 3" && bb.area == "ΒΥΡΩΝΑΣ" && bb.postal_code == "16231");
+        CHECK(c.getBuildingById(bb.client_building_id).area == "ΒΥΡΩΝΑΣ");
+        User e = bb; e.address = "ΜΑΚΕΔΟΝΙΑΣ 5"; CHECK(c.editUser(bu, e));            // a changed address renames the building
+        CHECK(c.getBuildingById(bb.client_building_id).address == "ΜΑΚΕΔΟΝΙΑΣ 5" && c.getUserById(bu).full_name == "ΜΑΚΕΔΟΝΙΑΣ 5");
+    }
+    {   // a database from before v37: what was kept as extra rows under those names becomes the fields
+        sqlite3* db = nullptr; sqlite3_open((dir / "data.db").string().c_str(), &db);
+        {   // the history triggers of users name every column: an old database had none for these (they are made again on upgrade)
+            std::vector<std::string> trg; sqlite3_stmt* st = nullptr;
+            sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'users'", -1, &st, nullptr);
+            while (sqlite3_step(st) == SQLITE_ROW) trg.push_back((const char*)sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+            for (auto& t : trg) sqlite3_exec(db, ("DROP TRIGGER " + t + ";").c_str(), nullptr, nullptr, nullptr);
+        }
+        sqlite3_exec(db, "UPDATE users SET own_address = NULL, own_area = NULL, own_postal_code = NULL, extra_json = '{\"Διεύθυνση\":\"ΑΓΙΟΥ ΜΕΛΕΤΙΟΥ 7\",\"Τ.Κ.\":\"11361\",\"ΔΟΥ\":\"Γ ΑΘΗΝΩΝ\"}' WHERE full_name = 'ΔΙΕΥΘΥΝΣΗ ΔΟΚΙΜΗ';"
+                         "ALTER TABLE users DROP COLUMN own_address; ALTER TABLE users DROP COLUMN own_area; ALTER TABLE users DROP COLUMN own_postal_code; PRAGMA user_version = 36;", nullptr, nullptr, nullptr);
+        sqlite3_close(db);
+        SqliteConn c((dir / "data.db").string());
+        const User g = c.getUserById(c.searchUsers("ΔΙΕΥΘΥΝΣΗ ΔΟΚΙΜΗ", 0, 10)[0].id);
+        CHECK(g.address == "ΑΓΙΟΥ ΜΕΛΕΤΙΟΥ 7" && g.postal_code == "11361");
+        CHECK(g.extra_json == "{\"ΔΟΥ\":\"Γ ΑΘΗΝΩΝ\"}");
+        // (the history check is not asked here: the "old database" above was changed behind the triggers' back, which it reports)
+    }
+    if (const char* real = std::getenv("BM_UPGRADE_CHECK_DB")) {      // by hand: a real older database (a copy) upgraded, its history still whole
+        SqliteConn c(real);
+        auto chk = c.verifyAuditLog(); for (auto& pr : chk.problems) std::printf("audit: %s\n", pr.c_str());
+        std::printf("upgrade check: %s\n", chk.ok ? "ok" : "PROBLEMS"); CHECK(chk.ok);
     }
     fs::remove_all(dir);
     if (fails) { std::printf("%d check(s) failed\n", fails); return 1; }

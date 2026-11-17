@@ -9,7 +9,7 @@ mkdir -p "$W"
 cp "$EXE" "$W/PM_uitest.exe"
 if [ "$4" == "fresh" ] || [ "$4" == "demo" ] || [ ! -f "$W/test.db" ]; then
     rm -rf "$W"/test.db* "$W/backups" "$W/logs" "$W/ui_prefs.ini" "$W/imgui.ini"
-    if [ "$4" == "demo" ]; then cp "$HERE/../../release_db/data.db" "$W/test.db"; else cp "$HERE/../../release_db/empty.db" "$W/test.db"; fi
+    if [ "$4" == "demo" ]; then cp "$HERE/../../release_db/data.db" "$W/test.db"; rm -rf "$W/attachments"; cp -r "$HERE/../../release_db/attachments" "$W/" 2>/dev/null; else cp "$HERE/../../release_db/empty.db" "$W/test.db"; fi
 fi
 printf 'db_path=test.db\n' > "$W/config.ini"
 OUT="$W/out/$(basename "$SCRIPT" .txt)"; rm -rf "$OUT"; mkdir -p "$OUT"

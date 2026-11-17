@@ -17,6 +17,7 @@ private:
     std::string dbPath_;
     int apartmentAt(int userId, int y, int m, int d);
     double priceOf(int serviceId);
+    std::string codeOf(int serviceId);
     double costOf(int serviceId);
     std::string toJson(const std::vector<std::string>& cols, const std::vector<std::string>& vals);
     std::vector<std::string> getColumnNames(const std::string& table);
@@ -142,8 +143,10 @@ public:
     bool editJointService(int id, const Service& s, const std::string& kind, bool active) override;
     int chargeJoint(const JointOp& op, const std::vector<JointLine>& lines, const std::vector<JointShare>& shares,
                     double costTotal = 0.0, int costPartnerId = -1, double costPaid = -1.0, const Receipt* receipt = nullptr) override;
-    std::vector<PartnerJob> partnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, int kind = 0, bool owedOnly = false) override;
-    int countPartnerJobs(int partnerId, const std::string& fromDate = "", const std::string& toDate = "", int kind = 0, bool owedOnly = false) override;
+    std::vector<PartnerJob> partnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, int kind = 0, bool owedOnly = false, bool noDocOnly = false) override;
+    double paidWithoutDoc(int chargeId) override;
+    int addPartnerDocLater(int chargeId, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) override;
+    int countPartnerJobs(int partnerId, const std::string& fromDate = "", const std::string& toDate = "", int kind = 0, bool owedOnly = false, bool noDocOnly = false) override;
     std::vector<PartnerStat> partnerStats(const std::string& fromDate, const std::string& toDate) override;
     double getJointOpCost(int opId) override;
     double getServiceCost(int serviceId) override;
@@ -155,6 +158,10 @@ public:
     std::vector<QualityRow> clientQuality(int userId = 0, const std::string& fromDate = "", const std::string& toDate = "") override;
     std::vector<ClientChargeRow> pageClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit, const std::vector<int>& serviceIds = {}) override;
     int countClientCharges(int userId, const std::string& fromDate, const std::string& toDate, const std::vector<int>& serviceIds = {}) override;
+    std::vector<ClientChargeRow> entityCharges(int serviceId, int packageId, const std::string& fromDate, const std::string& toDate, bool withContracts) override;
+    std::vector<std::pair<int, std::string>> recentChargedClients(int limit) override;
+    std::vector<ClientChargeRow> periodCharges(const std::string& fromDate, const std::string& toDate) override;
+    std::vector<ClientChargeRow> chargeRowsWhere(const std::string& cond, int userId, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit);
     std::vector<EntityClientRow> entityClients(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate, const SortSpec& sort, int offset, int limit) override;
     int countEntityClients(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate) override;
     std::vector<PartnerStat> entityPartners(const std::vector<int>& serviceIds, const std::string& fromDate, const std::string& toDate) override;
@@ -347,6 +354,13 @@ public:
     MoneyTotals paymentTotals(const PaymentFilter& f) override;
     std::vector<GroupedTotals> paymentTotalsBy(PayGroup group, const PaymentFilter& f) override;
     long long dataVersion() override { return (long long)sqlite3_total_changes64(db); }
+    std::string firstChargeDate() override {
+        sqlite3_stmt* st = nullptr; std::string d;
+        if (sqlite3_prepare_v2(db, "SELECT MIN(charge_date) FROM charges", -1, &st, nullptr) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+            d = (const char*)sqlite3_column_text(st, 0);
+        sqlite3_finalize(st);
+        return d.substr(0, 10);
+    }
 
     // Paged phone-book pickers (dashboard filters) -- see DataConn.h for contract.
     std::vector<User> pickerUsers(const std::vector<std::string>& letters,

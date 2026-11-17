@@ -56,6 +56,9 @@ bool DatePicker(const char* id, std::string& dateInOut,
 
     // --- Trigger button ---------------------------------------------------
     std::string btnLabel = dateInOut.empty() ? "Επιλογή ημερομηνίας..." : dateInOut;
+    if (dateInOut.size() == 10 && dateInOut[4] == '-' && dateInOut[7] == '-')      // shown dd.mm.yyyy like every date in the program (kept yyyy-mm-dd)
+        btnLabel = dateInOut.substr(8, 2) + "." + dateInOut.substr(5, 2) + "." + dateInOut.substr(0, 4);
+    btnLabel += std::string("##") + id;
     if (ImGui::Button(btnLabel.c_str(), ImVec2(180, 0))) {
         // Snapshot current value into working state so nothing commits until OK.
         int y = 0, m = 0, d = 0;

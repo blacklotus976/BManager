@@ -167,11 +167,12 @@ void WritePng(const std::string& path, int w, int h, const std::vector<unsigned 
     chunk("IHDR", ih); chunk("IDAT", z); chunk("IEND", {});
 }
 
-// {d} today's day (no leading zero), {ym} YYYY-MM, {ymd} YYYY-MM-DD
+// {d} today's day (no leading zero), {ym} YYYY-MM, {ymd} YYYY-MM-DD, {dmy} DD.MM.YYYY (as the app shows dates)
 std::string Expand(std::string s) {
     std::time_t t = std::time(nullptr); std::tm tm{}; localtime_s(&tm, &t);
-    char d[8], ym[16], ymd[16]; std::snprintf(d, sizeof d, "%d", tm.tm_mday); std::strftime(ym, sizeof ym, "%Y-%m", &tm); std::strftime(ymd, sizeof ymd, "%Y-%m-%d", &tm);
-    for (auto [k, v] : { std::pair<const char*, const char*>{"{d}", d}, {"{ym}", ym}, {"{ymd}", ymd} })
+    char d[8], ym[16], ymd[16], dmy[16]; std::snprintf(d, sizeof d, "%d", tm.tm_mday); std::strftime(ym, sizeof ym, "%Y-%m", &tm); std::strftime(ymd, sizeof ymd, "%Y-%m-%d", &tm);
+    std::strftime(dmy, sizeof dmy, "%d.%m.%Y", &tm);
+    for (auto [k, v] : { std::pair<const char*, const char*>{"{dmy}", dmy}, {"{d}", d}, {"{ym}", ym}, {"{ymd}", ymd} })
         for (size_t at; (at = s.find(k)) != std::string::npos; ) s.replace(at, std::strlen(k), v);
     return s;
 }

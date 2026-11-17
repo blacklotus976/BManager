@@ -19,8 +19,10 @@ step and saves its own screenshots.
   «Σήμερα»), a part payment, a contract installment, a charge paid at once with its cost, paying the partner with his
   invoice (04); Excel exports of lists, a building's partners, the cube's tables and a client's usage panel (05).
   `90_demo_cube.txt` runs on the demo data (`demo`; give `BM_TEST_CUBE=364,-650,400,0` so the cube opens on a whole year):
-  packages and contracts by month, the layer slider updating the tables, the reversed view, the cube's export, and a long
+  services and packages by month (the cube has no contracts tab), the layer slider updating the tables, the reversed view, the cube's export, and a long
   list's export with the «all pages / only this page» question.
+  `91_demo_collect.txt` (also `demo`): collecting — the home page's owings (a client's services, one bill, part of it, a
+  contract's installments), a client's card (its open owings, one bill, all of them), a service's card, paying a partner.
 
 ## Script steps
 One per line, `#` = comment:
@@ -39,7 +41,7 @@ One per line, `#` = comment:
 | `vtx <n>` | fails if a window's draw list has `n` vertices or more (the cube must stay under 65,536) |
 
 `<target>`: the label (the part before `##`, or the whole label such as `##bpn`), `~text` = contains; options after ` | `:
-`win=<part of the window name>`, `n=<which match on the page, in drawing order>`. `{d}`, `{ym}`, `{ymd}` = today.
+`win=<part of the window name>`, `n=<which match on the page, in drawing order>`. `{d}`, `{ym}`, `{ymd}`, `{dmy}` (dd.mm.yyyy, as the app shows dates) = today.
 A target that does not show up (or stays covered by another window / behind a modal) fails after a few seconds with a
 screenshot and the reason; the script goes on. Results: `uitest.log` and the screenshots in `out/<script>/`.
 

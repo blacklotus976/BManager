@@ -98,7 +98,9 @@ int main(int argc, char** argv) {
                 const bool recent = ago < 20;                       // the supplier is paid later for the last weeks: that is what we owe him
                 out.amount_paid = recent && Rnd(100) < 60 ? 0.0 : cost; out.balance = Cents(cost - out.amount_paid);
                 out.status = out.amount_paid + 0.004 >= cost ? "paid" : "pending"; out.notes = "Κόστος: " + std::string(goods[g].name);
-                Need(c.addPaymentsWithReceipt({ in, out }, goods[g].name, nullptr) > 0, c, "sale"); sales++;
+                // what the client paid gets its receipt on the day (cash mostly, sometimes card), like every payment in the program
+                Receipt rc; rc.issue_date = date; rc.user_id = uid; rc.method = Rnd(100) < 75 ? "cash" : "card";
+                Need(c.addPaymentsWithReceipt({ in, out }, goods[g].name, paid > 0.004 ? &rc : nullptr) > 0, c, "sale"); sales++;
             }
         }
     }

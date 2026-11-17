@@ -193,3 +193,6 @@ target_link_libraries(make_release_dbs PRIVATE sqlite3_vendored)
 # the third database: a greengrocer's (people as clients, fruit and supermarket goods, one supplier): make_fruits_db <folder> -> fruits.db
 add_executable(make_fruits_db EXCLUDE_FROM_ALL tools/make_fruits_db.cpp src/SqliteConn.cpp)
 target_link_libraries(make_fruits_db PRIVATE sqlite3_vendored)
+# the fourth database: a small one to explore (3 clients, 1 managed building, 3 services charged to all, 1 contract, 1 partner): make_small_db <folder> -> small.db
+add_executable(make_small_db EXCLUDE_FROM_ALL tools/make_small_db.cpp src/SqliteConn.cpp)
+target_link_libraries(make_small_db PRIVATE sqlite3_vendored)
