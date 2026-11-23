@@ -1,0 +1,92 @@
+<title>BManager v0 Scan</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Space+Grotesk:wght@500;700&family=JetBrains+Mono&display=swap">
+<style>
+/* Layout: single reading column, pipeline strip, then findings grouped by severity */
+:root{--bg:#f6f7f9;--fg:#1b2230;--muted:#5b6577;--card:#fff;--line:#dde2ea;--accent:#2b5fd9;--crit:#c43d32;--warn:#b7791f;--ok:#2f855a;
+--display:"Space Grotesk",system-ui,sans-serif;--body:"Inter",system-ui,sans-serif;--mono:"JetBrains Mono",ui-monospace,monospace}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12161d;--fg:#e4e8ef;--muted:#9aa4b5;--card:#1a2029;--line:#2b3340;--accent:#7aa2ff;--crit:#ff7b6e;--warn:#f0b54a;--ok:#5fcf93;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#12161d;--fg:#e4e8ef;--muted:#9aa4b5;--card:#1a2029;--line:#2b3340;--accent:#7aa2ff;--crit:#ff7b6e;--warn:#f0b54a;--ok:#5fcf93;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);line-height:1.55;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:32px 64px}
+main{max-width:860px;margin:0 auto;display:grid;gap:28px}
+h1,h2{font-family:var(--display);text-wrap:balance;margin:0}
+h1{font-size:2rem}h2{font-size:1.25rem}
+p{margin:0}.muted{color:var(--muted)}
+code{font-family:var(--mono);font-size:.85em;background:var(--line);padding:1px 5px;border-radius:4px}
+.flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-family:var(--mono);font-size:.85rem}
+.flow span{background:var(--card);border:1px solid var(--line);padding:6px 10px;border-radius:6px}
+.flow i{color:var(--muted);font-style:normal}
+section{display:grid;gap:12px}
+.item{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--sev);border-radius:6px;padding:14px 16px;display:grid;gap:6px;min-width:0}
+.item b{font-family:var(--display);font-weight:600}
+.crit{--sev:var(--crit)}.warn{--sev:var(--warn)}.ok{--sev:var(--ok)}
+.tag{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--sev);font-weight:600}
+ul{margin:0;padding-left:20px;display:grid;gap:4px}
+</style>
+<main>
+<header style="display:grid;gap:8px">
+<h1>BManager v0 scan</h1>
+<p class="muted">Read-through of <code>SqliteConn.cpp</code> (schema, triggers, receipts, joint charges) and <code>Money.h</code>. I didn't build or run the tests. Scanned 17 Nov 2026.</p>
+</header>
+
+<section>
+<h2>How the money pipeline works</h2>
+<div class="flow"><span>charges</span><i>←</i><span>allocations</span><i>→</i><span>payments</span><i>→</i><span>receipts</span><i>→</i><span>audit_log (hash chain)</span></div>
+<ul>
+<li><b>charges</b> are what is owed (<code>amount_due</code>). Triggers keep <code>amount_paid</code> and <code>balance</code> in sync, computed in integer cents.</li>
+<li><b>payments</b> are money that came in or went out (<code>direction</code> in/out). Any part of a payment that isn't allocated counts as the client's credit.</li>
+<li><b>allocations</b> link payments to charges. Triggers stop an allocation from going over the payment or the charge, or crossing directions.</li>
+<li><b>receipts</b> number is <code>MAX+1</code> per series. A receipt needs its payments fully allocated, and one receipt can only cover one client and one batch. Once issued, a receipt can't be deleted, and it freezes its payments, their allocations and the charges they settle. To undo one, you void it with a reason.</li>
+<li><b>joint charges (κοινόχρηστα)</b> are a <code>joint_ops</code> record plus fixed <code>joint_shares</code>. The shares have to add up exactly to the total, and every excluded apartment needs a reason.</li>
+<li><b>audit_log</b> is append-only and hash-chained. A checkpoint is written daily to <code>backups/*_audit_anchor.txt</code>, and the chain is checked at startup.</li>
+</ul>
+</section>
+
+<section>
+<h2>Solid already</h2>
+<div class="item ok"><span class="tag">Good</span><p>The maths adds up. All the sums I looked at are done in integer cents, in C++ and in SQL triggers alike. Money parsing rejects ambiguous input such as <code>1,234</code> or a third decimal. Joint shares and receipt totals must match exactly, and multi-step writes run inside savepoints. I found no rounding drift in the code I read.</p></div>
+</section>
+
+<section>
+<h2>Weak points, most important first</h2>
+
+<div class="item crit"><span class="tag">High</span><b>Receipt number and date can disagree</b>
+<p>The number is <code>MAX(number)+1</code>, but <code>issue_date</code> is whatever the user types, and nothing checks it is on or after the previous receipt's date. So receipt A-10 can be dated before A-9. Greek bookkeeping (and later myDATA) expects numbering and dates to be chronological within a series. Fix: refuse any date earlier than the last issued receipt in the same series.</p></div>
+
+<div class="item crit"><span class="tag">High</span><b>No VAT or tax model yet, so receipts aren't legal documents</b>
+<p>Charges have no <code>nature</code>, VAT rate or net/VAT/gross fields. The company has no ΑΦΜ/ΔΟΥ and clients have no ΑΦΜ. These are roadmap steps 1–3. Until they're done, what the app prints are internal collection notes, not ΑΠΥ/ΤΠΥ.</p></div>
+
+<div class="item crit"><span class="tag">High</span><b>No login or roles</b>
+<p>There's an <code>actor</code> column but no authentication. Anyone at the PC can void receipts or use the SQL console. For a "really good logger" the log has to say <i>who</i> did each thing, so you need at least local users with a PIN, and the SQL console limited to admins.</p></div>
+
+<div class="item warn"><span class="tag">Medium</span><b>Backups and the audit anchor sit on the same disk as the database</b>
+<p>Backups go to <code>backups/</code> next to <code>data.db</code>, so one disk failure takes out everything. The tamper anchor is in that same folder too, so anyone who can edit the database can rewrite the anchor as well. Add a second backup target (USB drive or cloud folder) and offer an export of the anchor file.</p></div>
+
+<div class="item warn"><span class="tag">Medium</span><b>Several rules exist only in C++, not in the database</b>
+<p>These rules are only checked in the app: receipt <code>total</code> equals the sum of its payments, one client per receipt, and joint shares summing to the total. The SQL console or any future server goes straight past them. Also, <code>charges.amount_due</code> has no <code>CHECK ≥ 0</code> and <code>charges.status</code> is free text with no <code>CHECK IN (…)</code>. Add triggers or CHECKs for these.</p></div>
+
+<div class="item warn"><span class="tag">Medium</span><b>Money is stored as REAL</b>
+<p>It's safe for now because every write snaps to whole cents and every sum casts to cents. But a raw SQL write can still store <code>10.005</code>. Before online payments arrive, move these columns to INTEGER cents. That's one migration, and you already have the migration framework for it.</p></div>
+
+<div class="item warn"><span class="tag">Medium</span><b><code>voidReceipt</code> has leftover code</b>
+<p>It runs a single UPDATE with no savepoint, then computes <code>ids</code> and <code>now</code> and never uses them. That looks like a step that got deleted, probably an audit entry or unlocking the payments. Check that a void still writes an audit row that includes the reason.</p></div>
+
+<div class="item warn"><span class="tag">Low</span><b>Code and repo hygiene</b>
+<ul>
+<li><code>App.cpp</code> is about 17k lines and <code>SqliteConn.cpp</code> about 8.6k. The migrations live inside the constructor, and the same trigger blocks are repeated across schema versions.</li>
+<li>Files committed that probably shouldn't be: <code>RELEASE-V1.zip</code>, the <code>.db</code> files, an mp4, <code>SqliteConn.cpp.bak_before_partnerfix</code> and <code>imgui.ini</code>.</li>
+<li>Recent commit messages are just "transferring fixes", so the history doesn't explain what changed.</li>
+</ul></div>
+</section>
+
+<section>
+<h2>Suggested order</h2>
+<ul>
+<li>Check that receipt dates are chronological, and fix up <code>voidReceipt</code>. Both are small.</li>
+<li>Add the missing CHECKs and triggers on charges and receipts.</li>
+<li>Add local users and PINs, and put real names in the audit actor.</li>
+<li>Add a second backup location.</li>
+<li>Then roadmap steps 1–3 (nature, tax details, VAT), followed by the switch to INTEGER cents.</li>
+</ul>
+</section>
+</main>

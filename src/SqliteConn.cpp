@@ -119,8 +119,8 @@ static const char* kPaymentCols =
     "p.status, p.direction, p.notes, COALESCE(p.resolution_date,''), "
     "COALESCE(datetime(p.resolved_at,'localtime'),''), COALESCE(datetime(p.created_at,'localtime'),''), "
     // the receipt covering the money paid on this charge (an issued one first), -1 = none
-    "COALESCE((SELECT m.receipt_id FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN receipts r ON r.id = m.receipt_id "
-    "          WHERE a.charge_id = p.id ORDER BY (r.status = 'issued') DESC, m.receipt_id DESC LIMIT 1), -1), "
+    "COALESCE((SELECT rl.receipt_id FROM receipt_lines rl JOIN receipts r ON r.id = rl.receipt_id "
+    "          WHERE rl.charge_id = p.id ORDER BY (r.status = 'issued') DESC, rl.receipt_id DESC LIMIT 1), -1), "
     "COALESCE(p.batch_id,-1), "
     // the joint charge (κοινόχρηστο) this line is a share of, -1 = none (joint_ops.batch_id is unique)
     "COALESCE((SELECT o.id FROM joint_ops o WHERE o.batch_id = p.batch_id), -1), "
@@ -193,6 +193,7 @@ static const char* kAuditedTables[] = {
     "attachments", "joint_services", "joint_ops", "joint_shares", "payment_plans", "offers", "offer_uses",
     "service_costs", "partners", "partner_costs", "user_deletions", "record_deletions", "managed_buildings", "fund_moves", "residents", "expense_shares", "contracts", "contract_items", "receipt_lines", "partner_docs", "monthly_bills", "monthly_bill_reasons", "deposit_limits", "contract_cancels",
     "building_partners", "building_expense_shortcuts",
+    "store_items", "store_item_partners", "store_moves", "service_items",
 };
 
 static bool TableExists(sqlite3* db, const std::string& t) {
@@ -2064,6 +2065,59 @@ SqliteConn::SqliteConn(const std::string& dbPath) {
         if (ok) ok = executeQuery("PRAGMA user_version = 39; COMMIT;");
         if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v39) απέτυχε: " + why; }
     }
+    // --- v40: receipts belong to charges (receipt_lines), issued when a charge is paid in full.
+    //     No extra locks on receipted charges (kept free for experimenting); only the lookup index. ---
+    if (UserVersion(db) < 40) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE INDEX IF NOT EXISTS idx_receipt_lines_charge ON receipt_lines(charge_id);
+        )");
+        if (ok) ok = executeQuery("PRAGMA user_version = 40; COMMIT;");
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v40) απέτυχε: " + why; }
+    }
+    // --- v41: Αποθήκη. Items (name, code, suggested cost), their suppliers, every purchase / use, and which items a
+    //     service uses. A purchase from a partner is also a normal cost line owed to him (charges + partner_costs). ---
+    if (UserVersion(db) < 41) {
+        bool ok = executeQuery("BEGIN;") && executeQuery(R"(
+            CREATE TABLE IF NOT EXISTS store_items (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL CHECK (TRIM(name) <> ''),
+                code           TEXT,
+                suggested_cost REAL NOT NULL DEFAULT 0,
+                notes          TEXT,
+                active         INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS store_item_partners (
+                item_id    INTEGER NOT NULL REFERENCES store_items(id),
+                partner_id INTEGER NOT NULL REFERENCES partners(id),
+                PRIMARY KEY (item_id, partner_id)
+            );
+            CREATE TABLE IF NOT EXISTS store_moves (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id    INTEGER NOT NULL REFERENCES store_items(id),
+                kind       TEXT NOT NULL CHECK (kind IN ('in','use')),
+                qty        REAL NOT NULL,
+                unit_cost  REAL NOT NULL DEFAULT 0,
+                total      REAL NOT NULL DEFAULT 0,
+                partner_id INTEGER REFERENCES partners(id),
+                charge_id  INTEGER REFERENCES charges(id),
+                move_date  TEXT NOT NULL,
+                notes      TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_store_moves_item ON store_moves(item_id, move_date);
+            CREATE INDEX IF NOT EXISTS idx_store_moves_charge ON store_moves(charge_id);
+            CREATE TABLE IF NOT EXISTS service_items (
+                service_id INTEGER NOT NULL REFERENCES services(id),
+                item_id    INTEGER NOT NULL REFERENCES store_items(id),
+                qty        REAL NOT NULL DEFAULT 1,
+                PRIMARY KEY (service_id, item_id)
+            );
+        )");
+        if (ok) { ensureAuditTriggers(); ok = executeQuery("PRAGMA user_version = 41; COMMIT;"); }
+        if (!ok) { std::string why = lastError_; executeQuery("ROLLBACK;"); lastError_ = "Η αναβάθμιση της βάσης (v41) απέτυχε: " + why; }
+    }
+    setupReceiptWatch();
     // Every REFERENCES in the schema is enforced from here on (after the migrations, which reshape tables).
     executeQuery("PRAGMA foreign_keys = ON;");
 
@@ -2648,8 +2702,8 @@ bool SqliteConn::setResidencyHistory(int userId, const std::vector<Residency>& h
            "AND (r.to_date IS NULL OR r.to_date >= charges.charge_date) "
            "ORDER BY r.from_date DESC, r.id DESC LIMIT 1), apartment_id) WHERE user_id = " + uid +
            // receipted payments keep the apartment printed on their receipt
-           " AND NOT EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id JOIN receipts rc ON rc.id = m.receipt_id "
-           "                 WHERE a.charge_id = charges.id AND rc.status = 'issued');COMMIT;";
+           " AND NOT EXISTS (SELECT 1 FROM receipt_lines rl JOIN receipts rc ON rc.id = rl.receipt_id "
+           "                 WHERE rl.charge_id = charges.id AND rc.status = 'issued');COMMIT;";
     if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
         lastError_ = err ? err : "setResidencyHistory failed";
         sqlite3_free(err);
@@ -3730,8 +3784,10 @@ int SqliteConn::countServices(const std::string& query) {
 // (startDate/endDate/direction), then int binds (userId/serviceId), so the
 // placeholder order in the SQL matches the bind order below.
 static const char* kMissingReceiptSql =
-    " AND EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id LEFT JOIN receipts rc ON rc.id = m.receipt_id"
-    "             WHERE a.charge_id = p.id AND m.direction = 'in' AND (m.receipt_id IS NULL OR rc.status = 'void'))";
+    // a fully paid client charge (not a resident's κοινόχρηστο share) that has no issued receipt
+    " AND p.direction = 'in' AND CAST(ROUND(p.amount_due*100) AS INTEGER) > 0 AND CAST(ROUND(p.balance*100) AS INTEGER) <= 0"
+    " AND (p.batch_id IS NULL OR p.batch_id NOT IN (SELECT batch_id FROM joint_ops WHERE batch_id IS NOT NULL))"
+    " AND NOT EXISTS (SELECT 1 FROM receipt_lines rl JOIN receipts rc ON rc.id = rl.receipt_id WHERE rl.charge_id = p.id AND rc.status = 'issued')";
 
 static std::string BuildPaymentPageWhere(const std::string& startDate, const std::string& endDate,
                                           int userId, int serviceId,
@@ -3791,8 +3847,8 @@ std::vector<Payment> SqliteConn::pagePayments(const std::string& startDate, cons
             case 6: part = "amount_due" + d; break;
             case 7: part = "amount_paid" + d; break;
             case 8: part = "notes" + d; break;
-            case 9: part = "(SELECT MAX(r.number) FROM allocations a JOIN payments m ON m.id = a.payment_id "
-                           "JOIN receipts r ON r.id = m.receipt_id WHERE a.charge_id = p.id AND r.status = 'issued')" + d; break;
+            case 9: part = "(SELECT MAX(r.number) FROM receipt_lines rl "
+                           "JOIN receipts r ON r.id = rl.receipt_id WHERE rl.charge_id = p.id AND r.status = 'issued')" + d; break;
             default: break;
         }
         if (!part.empty()) order += std::string(order.empty() ? "" : ", ") + part;
@@ -3843,7 +3899,7 @@ static const char* kReceiptCols =
 // A receipt with no joint-batch payment AND a building user is still "personal" at this level (the
 // building-as-client case); the sub-tab filters use a broader rule so it lands in Διαχείριση.
 static std::string ReceiptKindSql(const std::string& idExpr) {
-    return "CASE WHEN EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = " + idExpr + " AND kc.batch_id IN (SELECT batch_id FROM joint_ops)) THEN 'joint' ELSE 'personal' END";
+    return "CASE WHEN EXISTS (SELECT 1 FROM receipt_lines kl JOIN charges kc ON kc.id = kl.charge_id WHERE kl.receipt_id = " + idExpr + " AND kc.batch_id IN (SELECT batch_id FROM joint_ops)) THEN 'joint' ELSE 'personal' END";
 }
 
 static Receipt ReadReceipt(sqlite3_stmt* st) {
@@ -4420,11 +4476,139 @@ static std::string QuickAuditCheck(sqlite3* db, const std::string& dbPath) {
 
 // --- BILLS (charges) AND MONEY (payments) ---------------------------------------------------------------
 // Savepoints instead of BEGIN so these operations nest (e.g. editPaymentWithReceipt = editPayment + receipt).
-bool SqliteConn::savepoint(const char* name) { return executeQuery(std::string("SAVEPOINT ") + name + ";"); }
-bool SqliteConn::release(const char* name)   { return executeQuery(std::string("RELEASE ") + name + ";"); }
+bool SqliteConn::savepoint(const char* name) {
+    if (!executeQuery(std::string("SAVEPOINT ") + name + ";")) return false;
+    spDepth_++;
+    return true;
+}
+// Every operation ends here: before its savepoint is released, the charges it paid in full get their receipts,
+// inside the same transaction (all or nothing).
+bool SqliteConn::release(const char* name) {
+    if (spDepth_ <= 1 && !issueDueReceipts()) return false;   // only the outermost operation issues (its data is complete)
+    if (!executeQuery(std::string("RELEASE ") + name + ";")) return false;
+    if (spDepth_ > 0) spDepth_--;
+    return true;
+}
+
+// A connection-local watch list: any client charge whose balance reaches 0 is noted in temp.receipt_due.
+// TEMP objects are never written to the file, so the schema and the audit chain are untouched.
+void SqliteConn::setupReceiptWatch() {
+    executeQuery(
+        "CREATE TEMP TABLE IF NOT EXISTS receipt_due (charge_id INTEGER PRIMARY KEY);"
+        "CREATE TEMP TRIGGER IF NOT EXISTS trg_receipt_due AFTER UPDATE OF balance ON main.charges "
+        "WHEN NEW.direction = 'in' AND CAST(ROUND(NEW.balance*100) AS INTEGER) <= 0 AND CAST(ROUND(NEW.amount_due*100) AS INTEGER) > 0 "
+        "BEGIN INSERT OR IGNORE INTO receipt_due (charge_id) VALUES (NEW.id); END;");
+}
+
+// Receipt rules:
+//  * a client charge gets ONE receipt when it is paid in full, never for part payments. A package is one
+//    charge per service, so one receipt per service; a contract is one charge per installment, so one per installment;
+//  * an installment plan (payment_plans) gets one receipt for all its charges once the whole plan is paid;
+//  * a resident's κοινόχρηστο share gets no receipt;
+//  * payments to partners get no receipt from us (their τιμολόγιο is recorded instead, see payOutWithDoc).
+bool SqliteConn::issueDueReceipts() {
+    std::vector<int> due;
+    {   sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT charge_id FROM temp.receipt_due ORDER BY charge_id", -1, &st, nullptr) != SQLITE_OK) return true;
+        while (sqlite3_step(st) == SQLITE_ROW) due.push_back(sqlite3_column_int(st, 0));
+        sqlite3_finalize(st); }
+    if (due.empty()) return true;
+    if (!executeQuery("DELETE FROM temp.receipt_due;")) return false;
+    std::set<int> done;
+    for (int cid : due) {
+        if (done.count(cid)) continue;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db,
+            "SELECT COALESCE(c.batch_id,-1), "
+            "  (c.direction = 'in' AND c.status != 'future' AND CAST(ROUND(c.balance*100) AS INTEGER) <= 0 AND CAST(ROUND(c.amount_due*100) AS INTEGER) > 0), "
+            "  EXISTS (SELECT 1 FROM joint_ops o WHERE o.batch_id = c.batch_id), "
+            "  EXISTS (SELECT 1 FROM receipt_lines rl JOIN receipts r ON r.id = rl.receipt_id WHERE rl.charge_id = c.id AND r.status = 'issued'), "
+            "  EXISTS (SELECT 1 FROM payment_plans pl WHERE pl.batch_id = c.batch_id) "
+            "FROM charges c WHERE c.id = ?", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, cid);
+        bool found = sqlite3_step(st) == SQLITE_ROW;
+        int batch = found ? sqlite3_column_int(st, 0) : -1;
+        bool paid = found && sqlite3_column_int(st, 1), joint = found && sqlite3_column_int(st, 2);
+        bool receipted = found && sqlite3_column_int(st, 3), plan = found && sqlite3_column_int(st, 4);
+        sqlite3_finalize(st);
+        done.insert(cid);
+        if (!paid || joint || receipted) continue;
+        std::vector<int> ids{cid};
+        std::string notes;
+        if (plan) {           // the whole plan, once its last installment is paid
+            int open = 0; ids.clear();
+            sqlite3_prepare_v2(db, "SELECT c.id, (c.status = 'future' OR CAST(ROUND(c.balance*100) AS INTEGER) > 0) FROM charges c WHERE c.batch_id = ? AND c.direction = 'in' "
+                                   "AND NOT EXISTS (SELECT 1 FROM receipt_lines rl JOIN receipts r ON r.id = rl.receipt_id WHERE rl.charge_id = c.id AND r.status = 'issued') ORDER BY c.id", -1, &st, nullptr);
+            sqlite3_bind_int(st, 1, batch);
+            while (sqlite3_step(st) == SQLITE_ROW) { int id = sqlite3_column_int(st, 0); done.insert(id); if (sqlite3_column_int(st, 1)) open++; else ids.push_back(id); }
+            sqlite3_finalize(st);
+            if (open > 0 || ids.empty()) continue;
+            PaymentPlan p = getPlanForBatch(batch);
+            notes = "Εξόφληση σε " + std::to_string(p.installments) + " δόσεις — " + p.label;
+        }
+        if (issueChargeReceipt(ids, notes) < 0) return false;
+    }
+    return true;
+}
+
+// One receipt for these fully paid charges, for exactly what they billed. Dated today: a receipt is issued when the
+// money is complete, so numbers and dates always run in the same order.
+int SqliteConn::issueChargeReceipt(const std::vector<int>& chargeIds, const std::string& notes) {
+    auto refuse = [&](const std::string& why) { lastError_ = why; return -1; };
+    if (chargeIds.empty()) return refuse("Δεν υπάρχει εξοφλημένη χρέωση για απόδειξη.");
+    std::string list;
+    for (int id : chargeIds) list += (list.empty() ? "" : ",") + std::to_string(id);
+    long long total = 0; std::set<int> users; std::set<std::string> methods; std::string bankRef;
+    {   sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, ("SELECT COALESCE(SUM(CAST(ROUND(amount_due*100) AS INTEGER)),0), COUNT(DISTINCT COALESCE(user_id,-1)), MIN(COALESCE(user_id,-1)) FROM charges WHERE id IN (" + list + ")").c_str(), -1, &st, nullptr);
+        if (sqlite3_step(st) == SQLITE_ROW) { total = sqlite3_column_int64(st, 0); if (sqlite3_column_int(st, 1) == 1) users.insert(sqlite3_column_int(st, 2)); }
+        sqlite3_finalize(st);
+        sqlite3_prepare_v2(db, ("SELECT m.method, COALESCE(m.reference,'') FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id IN (" + list + ") AND m.direction = 'in' ORDER BY m.pay_date DESC, m.id DESC").c_str(), -1, &st, nullptr);
+        // the payment that completed it (the latest) says how it was paid
+        while (sqlite3_step(st) == SQLITE_ROW) { std::string mth = ColText(st, 0); if (methods.empty() && !mth.empty() && mth != "unspecified") methods.insert(mth); if (bankRef.empty()) bankRef = ColText(st, 1); }
+        sqlite3_finalize(st); }
+    if (total <= 0) return refuse("Το σύνολο της απόδειξης πρέπει να είναι μεγαλύτερο από 0.");
+    Receipt r;
+    if (receiptTemplate_) r = *receiptTemplate_;
+    r.id = -1; r.status = "issued";
+    r.series = r.series.empty() ? "A" : r.series;
+    if (r.method.empty() || r.method == "unspecified") r.method = methods.size() == 1 ? *methods.begin() : "cash";
+    static const char* kMethods[] = {"cash", "collector", "bank", "ebanking", "card", "iris", "other"};
+    if (std::find(std::begin(kMethods), std::end(kMethods), r.method) == std::end(kMethods)) r.method = "other";
+    if (r.bank_ref.empty()) r.bank_ref = bankRef;
+    if (!notes.empty()) r.notes = notes;
+    r.user_id = users.size() == 1 ? *users.begin() : -1;
+    r.number = nextReceiptNumber(r.series);
+    r.total = FromCents(total);
+    { char ref[32]; std::snprintf(ref, sizeof(ref), "%s%07d", r.series.c_str(), r.number); r.rf_code = MakeRfCode(ref); }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO receipts (series, number, issue_date, user_id, building_id, total, method, rf_code, paper_ref, bank_ref, notes) "
+                           "VALUES (?,?,date('now','localtime'),?,?,?,?,?,?,?,?)", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, r.series.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (st, 2, r.number);
+    if (r.user_id > 0) sqlite3_bind_int(st, 3, r.user_id); else sqlite3_bind_null(st, 3);
+    if (r.building_id > 0) sqlite3_bind_int(st, 4, r.building_id); else sqlite3_bind_null(st, 4);
+    sqlite3_bind_double(st, 5, r.total);
+    sqlite3_bind_text(st, 6, r.method.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, r.rf_code.c_str(), -1, SQLITE_TRANSIENT);
+    auto bindOpt = [&](int i, const std::string& v) { if (v.empty()) sqlite3_bind_null(st, i); else sqlite3_bind_text(st, i, v.c_str(), -1, SQLITE_TRANSIENT); };
+    // a paper number belongs to one receipt only
+    bindOpt(8, issuedNow_.empty() ? r.paper_ref : std::string()); bindOpt(9, r.bank_ref); bindOpt(10, r.notes);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return refuse(std::string("Αποτυχία έκδοσης απόδειξης: ") + sqlite3_errmsg(db));
+    int rid = (int)sqlite3_last_insert_rowid(db);
+    if (!executeQuery("INSERT INTO receipt_lines (receipt_id, charge_id, service_id, charge_date, label, amount) "
+                      "SELECT " + std::to_string(rid) + ", c.id, c.service_id, c.charge_date, COALESCE(c.notes,''), CAST(ROUND(c.amount_due*100) AS INTEGER) / 100.0 "
+                      "FROM charges c WHERE c.id IN (" + list + ");"))
+        return refuse(std::string("Αποτυχία γραμμών απόδειξης: ") + lastError_);
+    issuedNow_.push_back(rid);
+    return rid;
+}
 void SqliteConn::rollbackTo(const char* name) {
     std::string why = lastError_;
     executeQuery(std::string("ROLLBACK TO ") + name + "; RELEASE " + name + ";");
+    if (spDepth_ > 0) spDepth_--;
     lastError_ = why;
 }
 
@@ -4632,12 +4816,12 @@ int SqliteConn::addPaymentsWithReceipt(const std::vector<Payment>& lines, const 
             if (!allocate(mid, cid, alloc)) return fail();
         }
     }
-    if (receipt) {
-        if (moneyIds.empty()) { lastError_ = "Η απόδειξη χρειάζεται πληρωμένο ποσό μεγαλύτερο από 0."; return fail(); }
-        if (receiptPerLine) { for (int mid : moneyIds) if (issueReceiptInTx(*receipt, {mid}) < 0) return fail(); }      // a receipt for each payment
-        else if (issueReceiptInTx(*receipt, moneyIds) < 0) return fail();
-    }
-    if (!release("add_lines")) return fail();
+    // receipts: each line that is now paid in full gets its own (issued on release); `receipt` only says how it was paid
+    (void)receiptPerLine;
+    receiptTemplate_ = receipt; issuedNow_.clear();
+    bool ok = release("add_lines");
+    receiptTemplate_ = nullptr;
+    if (!ok) return fail();
     return charges.front();
 }
 
@@ -4726,6 +4910,12 @@ bool SqliteConn::payOutWithDoc(int chargeId, double amount, const std::string& p
     if (a > bal) { lastError_ = "Το ποσό ξεπερνά αυτό που οφείλουμε (" + FormatMoney(c.balance) + " €)."; return false; }
     if (payDate.size() != 10) { lastError_ = "Μη έγκυρη ημερομηνία."; return false; }
     if (!docType.empty() && docDate.size() != 10) { lastError_ = "Ορίστε την ημερομηνία του παραστατικού."; return false; }
+    // the partner's τιμολόγιο is for the whole job: it is recorded with the payment that settles it in full
+    if (!docType.empty() && a != bal) {
+        lastError_ = "Το παραστατικό του συνεργάτη καταχωρίζεται με την εξόφληση: πληρώστε όλο το υπόλοιπο (" + FormatMoney(c.balance) +
+                     " €) ή καταχωρίστε την πληρωμή χωρίς παραστατικό και προσθέστε το όταν εξοφληθεί.";
+        return false;
+    }
     if (!savepoint("pay_doc")) return false;
     MoneyPayment m; m.user_id = -1; m.direction = "out"; m.amount = FromCents(a); m.batch_id = c.batch_id; m.pay_date = payDate; m.method = method; m.reference = number;
     int mid = insertMoney(m);
@@ -4735,7 +4925,7 @@ bool SqliteConn::payOutWithDoc(int chargeId, double amount, const std::string& p
         sqlite3_prepare_v2(db, "INSERT INTO partner_docs (payment_id, charge_id, partner_id, doc_type, number, doc_date, amount, notes) VALUES (?,?,(SELECT partner_id FROM partner_costs WHERE charge_id = ?2),?,?,?,?,?)", -1, &st, nullptr);
         sqlite3_bind_int(st, 1, mid); sqlite3_bind_int(st, 2, chargeId); sqlite3_bind_text(st, 3, docType.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 4, number.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 5, docDate.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_double(st, 6, FromCents(a)); sqlite3_bind_text(st, 7, notes.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(st, 6, RoundMoney(c.amount_due)); sqlite3_bind_text(st, 7, notes.c_str(), -1, SQLITE_TRANSIENT);   // the full job
         const int rc = sqlite3_step(st); if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db); sqlite3_finalize(st);
         if (rc != SQLITE_DONE) { rollbackTo("pay_doc"); return false; }
     }
@@ -5074,41 +5264,48 @@ int SqliteConn::issueReceiptInTx(const Receipt& in, const std::vector<int>& mone
     return r.id;
 }
 
+// Receipts for the charges this money paid (e.g. again, after a receipt was voided). Only charges paid in full get one.
 int SqliteConn::issueReceiptForMoney(const Receipt& r, const std::vector<int>& moneyIds) {
-    if (!savepoint("receipt")) return -1;
-    int id = issueReceiptInTx(r, moneyIds);
-    if (id < 0 || !release("receipt")) { rollbackTo("receipt"); return -1; }
-    return id;
+    std::set<int> charges;
+    for (int mid : moneyIds) {
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT charge_id FROM allocations WHERE payment_id = ?", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, mid);
+        while (sqlite3_step(st) == SQLITE_ROW) charges.insert(sqlite3_column_int(st, 0));
+        sqlite3_finalize(st);
+    }
+    return issueReceipt(r, std::vector<int>(charges.begin(), charges.end()));
 }
 
-// Receipt for the incoming money paid on these charge lines (money that has no issued receipt yet).
+// Receipts for these charge lines: one per charge (one per plan), only for charges paid in full that have none.
 int SqliteConn::issueReceipt(const Receipt& r, const std::vector<int>& chargeIds) {
-    std::vector<int> money;
-    for (int cid : chargeIds)
-        for (auto& m : getMoneyForCharge(cid)) {
-            if (m.receipt_id <= 0 || getReceiptById(m.receipt_id).status != "issued") money.push_back(m.id);
-        }
-    // refusals that are about the lines themselves read better than "no money"
     for (int cid : chargeIds) {
         Payment c = getPaymentById(cid);
         if (c.id < 0) { lastError_ = "Η πληρωμή #" + std::to_string(cid) + " δεν υπάρχει."; return -1; }
         if (c.status == "future") { lastError_ = "Η πληρωμή #" + std::to_string(cid) + " είναι μελλοντική - επιλύστε την πρώτα."; return -1; }
         if (c.direction != "in") { lastError_ = "Η πληρωμή #" + std::to_string(cid) + " είναι πληρωμή προς τρίτους, όχι είσπραξη."; return -1; }
     }
-    return issueReceiptForMoney(r, money);
+    if (chargeIds.empty()) { lastError_ = "Δεν υπάρχει χρέωση για απόδειξη."; return -1; }
+    if (!savepoint("receipt")) return -1;
+    for (int cid : chargeIds) executeQuery("INSERT OR IGNORE INTO temp.receipt_due (charge_id) VALUES (" + std::to_string(cid) + ");");
+    receiptTemplate_ = &r; issuedNow_.clear();
+    bool ok = issueDueReceipts();
+    receiptTemplate_ = nullptr;
+    if (!ok || !release("receipt")) { rollbackTo("receipt"); return -1; }
+    if (issuedNow_.empty()) {
+        lastError_ = "Απόδειξη εκδίδεται μόνο για χρέωση που έχει εξοφληθεί πλήρως και δεν έχει ήδη απόδειξη "
+                     "(τα κοινόχρηστα των ενοίκων δεν έχουν απόδειξη· οι δόσεις παίρνουν μία απόδειξη στο τέλος).";
+        return -1;
+    }
+    return issuedNow_.front();
 }
 
 bool SqliteConn::editPaymentWithReceipt(int id, const Payment& payment, const Receipt& receipt) {
-    if (!savepoint("edit_receipt")) return false;
-    if (!editPayment(id, payment)) { rollbackTo("edit_receipt"); lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + lastError_; return false; }
-    std::vector<int> money;
-    for (auto& m : getMoneyForCharge(id)) {
-        if (m.receipt_id <= 0 || getReceiptById(m.receipt_id).status != "issued") money.push_back(m.id);
-    }
-    if (issueReceiptInTx(receipt, money) < 0 || !release("edit_receipt")) {
-        rollbackTo("edit_receipt"); lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + lastError_; return false;
-    }
-    return true;
+    // the receipt comes by itself if the edit pays the charge in full; `receipt` says how the money came in
+    receiptTemplate_ = &receipt; issuedNow_.clear();
+    bool ok = editPayment(id, payment);
+    receiptTemplate_ = nullptr;
+    return ok;
 }
 
 int SqliteConn::recordPayment(const MoneyPayment& money, const std::vector<Allocation>& allocations, const Receipt* receipt) {
@@ -5126,19 +5323,17 @@ int SqliteConn::recordPayment(const MoneyPayment& money, const std::vector<Alloc
     for (auto& a : allocations) {
         if (!allocate(mid, a.charge_id, a.amount)) return fail();
     }
-    if (receipt && issueReceiptInTx(*receipt, {mid}) < 0) return fail();
-    {
-        std::set<int> batches;
-        for (auto& a : allocations) { int b = getPaymentById(a.charge_id).batch_id; if (b > 0) batches.insert(b); }
-        for (int b : batches) if (!closePlanIfPaid(b)) return fail();
-    }
-    if (!release("record_money")) return fail();
+    receiptTemplate_ = receipt; issuedNow_.clear();
+    bool ok = release("record_money");      // charges this money completed get their receipts here
+    receiptTemplate_ = nullptr;
+    if (!ok) return fail();
     return mid;
 }
 
 static const char* kMoneyCols =
     "m.id, COALESCE(m.user_id,-1), m.pay_date, m.amount, m.direction, m.method, COALESCE(m.reference,''), COALESCE(m.notes,''), "
-    "COALESCE(m.receipt_id,-1), COALESCE(m.batch_id,-1), COALESCE(datetime(m.created_at,'localtime'),''), ";
+    "COALESCE(m.receipt_id, (SELECT rl.receipt_id FROM allocations ra JOIN receipt_lines rl ON rl.charge_id = ra.charge_id JOIN receipts rr ON rr.id = rl.receipt_id "
+    "  WHERE ra.payment_id = m.id ORDER BY (rr.status = 'issued') DESC, rl.receipt_id DESC LIMIT 1), -1), COALESCE(m.batch_id,-1), COALESCE(datetime(m.created_at,'localtime'),''), ";
 
 static std::vector<MoneyPayment> QueryMoney(sqlite3* db, const std::string& sql, int bind) {
     std::vector<MoneyPayment> out;
@@ -5175,7 +5370,8 @@ std::vector<MoneyPayment> SqliteConn::getMoneyForCharge(int chargeId) {
 std::vector<MoneyPayment> SqliteConn::getReceiptMoney(int receiptId) {
     return QueryMoney(db, std::string("SELECT ") + kMoneyCols +
         "COALESCE((SELECT SUM(CAST(ROUND(a.amount*100) AS INTEGER)) FROM allocations a WHERE a.payment_id = m.id), 0) / 100.0 "
-        "FROM payments m WHERE m.receipt_id = ? ORDER BY m.id", receiptId);
+        "FROM payments m WHERE m.receipt_id = ?1 OR m.id IN (SELECT a.payment_id FROM allocations a JOIN receipt_lines rl ON rl.charge_id = a.charge_id "
+        "WHERE rl.receipt_id = ?1) ORDER BY m.id", receiptId);
 }
 
 std::vector<Allocation> SqliteConn::getAllocationsForMoney(int paymentId) {
@@ -5211,8 +5407,7 @@ double SqliteConn::getClientCredit(int userId) {
 std::vector<int> SqliteConn::getReceiptPaymentIds(int receiptId) {
     std::vector<int> out;
     sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "SELECT DISTINCT a.charge_id FROM allocations a JOIN payments m ON m.id = a.payment_id "
-                           "WHERE m.receipt_id = ? ORDER BY a.charge_id", -1, &st, nullptr);
+    sqlite3_prepare_v2(db, "SELECT DISTINCT charge_id FROM receipt_lines WHERE receipt_id = ? ORDER BY charge_id", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, receiptId);
     while (sqlite3_step(st) == SQLITE_ROW) out.push_back(sqlite3_column_int(st, 0));
     sqlite3_finalize(st);
@@ -5263,16 +5458,16 @@ static std::string ReceiptWhere(const DataConn::ReceiptQuery& q, std::vector<std
     }
     if (q.kind == "managed") {
         // Διαχείριση: only what a resident paid for his building. The building's own bills to us are under Πελάτες.
-        w += " AND (EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.batch_id IN (SELECT batch_id FROM joint_ops)))";
+        w += " AND (EXISTS (SELECT 1 FROM receipt_lines kl JOIN charges kc ON kc.id = kl.charge_id WHERE kl.receipt_id = r.id AND kc.batch_id IN (SELECT batch_id FROM joint_ops)))";
     }
-    if (q.kind == "contracts") w += " AND EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.contract_id IS NOT NULL)";
+    if (q.kind == "contracts") w += " AND EXISTS (SELECT 1 FROM receipt_lines kl JOIN charges kc ON kc.id = kl.charge_id WHERE kl.receipt_id = r.id AND kc.contract_id IS NOT NULL)";
     if (q.kind == "clients") {
-        w += " AND NOT EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.contract_id IS NOT NULL)";
+        w += " AND NOT EXISTS (SELECT 1 FROM receipt_lines kl JOIN charges kc ON kc.id = kl.charge_id WHERE kl.receipt_id = r.id AND kc.contract_id IS NOT NULL)";
         // Πελάτες: money received from a person/business client for their OWN purchase.
         // Excluded: any receipt for a resident's share. A building's own bills are listed here in Πληρωμές, so their receipts are too.
-        w += " AND NOT EXISTS (SELECT 1 FROM payments km JOIN allocations ka ON ka.payment_id = km.id JOIN charges kc ON kc.id = ka.charge_id WHERE km.receipt_id = r.id AND kc.batch_id IN (SELECT batch_id FROM joint_ops))";
+        w += " AND NOT EXISTS (SELECT 1 FROM receipt_lines kl JOIN charges kc ON kc.id = kl.charge_id WHERE kl.receipt_id = r.id AND kc.batch_id IN (SELECT batch_id FROM joint_ops))";
     }
-    const std::string covers = "SELECT 1 FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id WHERE m.receipt_id = r.id";
+    const std::string covers = "SELECT 1 FROM receipt_lines rl JOIN charges c ON c.id = rl.charge_id WHERE rl.receipt_id = r.id";
     std::string conds;
     for (auto& c : q.conds) {
         std::string e;
@@ -5300,7 +5495,7 @@ std::vector<Receipt> SqliteConn::searchReceipts(const ReceiptQuery& q, int offse
     sortCols.push_back("r.issue_date");
     if (q.kind == "managed") {
         // Managed layout: 0=number, 1=date, 2=building, 3=recipient, 4=method, 5=references, 6=total, 7=status
-        sortCols.push_back("(SELECT COALESCE(b.address,'') FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id JOIN joint_ops o ON o.batch_id = c.batch_id JOIN buildings b ON b.id = o.building_id WHERE m.receipt_id = r.id LIMIT 1)");
+        sortCols.push_back("(SELECT COALESCE(b.address,'') FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id JOIN joint_ops o ON o.batch_id = c.batch_id JOIN buildings b ON b.id = o.building_id WHERE m.receipt_id = r.id OR a.charge_id IN (SELECT charge_id FROM receipt_lines WHERE receipt_id = r.id) LIMIT 1)");
         sortCols.push_back("(SELECT fold(u.full_name) FROM users u WHERE u.id = r.user_id)");
         sortCols.push_back("r.method");
         sortCols.push_back("COALESCE(r.paper_ref, r.bank_ref, '')");
@@ -5933,8 +6128,8 @@ std::vector<DataConn::ContractInstallment> SqliteConn::getContractInstallments(i
 }
 std::vector<Receipt> SqliteConn::getContractReceipts(int id) {
     std::vector<Receipt> out; sqlite3_stmt* st = nullptr;
-    std::string sql = std::string("SELECT ") + kReceiptCols + ", " + ReceiptKindSql("r.id") + " FROM receipts r WHERE r.id IN (SELECT m.receipt_id FROM payments m JOIN allocations a ON a.payment_id = m.id "
-                      "JOIN charges c ON c.id = a.charge_id WHERE c.contract_id = ?) ORDER BY r.issue_date DESC, r.id DESC";
+    std::string sql = std::string("SELECT ") + kReceiptCols + ", " + ReceiptKindSql("r.id") + " FROM receipts r WHERE r.id IN (SELECT rl.receipt_id FROM receipt_lines rl "
+                      "JOIN charges c ON c.id = rl.charge_id WHERE c.contract_id = ?) ORDER BY r.issue_date DESC, r.id DESC";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
     sqlite3_bind_int(st, 1, id);
     while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadReceipt(st));
@@ -6913,7 +7108,7 @@ std::vector<DataConn::PartnerJob> SqliteConn::partnerJobs(int partnerId, const s
     std::vector<PartnerJob> out;
     std::string sql = PartnerJobSelect() + " WHERE c.direction = 'out' AND (?1 = 0 OR COALESCE(pc.partner_id, -1) = ?1) AND (?4 = '' OR c.charge_date >= ?4) AND (?5 = '' OR c.charge_date <= ?5) "
         " AND (?6 = 0 OR (?6 = 1 AND jo.opid IS NULL) OR (?6 = 2 AND jo.opid IS NOT NULL)) "
-        + std::string(owedOnly ? " AND c.balance > 0.005 " : "") + std::string(noDocOnly ? " AND EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.payment_id = m.id)) " : "") + OrderBy(sort, {"c.charge_date", "fold(COALESCE(p.name, '#-1'))", "fold(COALESCE(s.label, ''))", "fold(COALESCE(u.full_name, ''))",
+        + std::string(owedOnly ? " AND c.balance > 0.005 " : "") + std::string(noDocOnly ? " AND EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.payment_id = m.id OR d.charge_id = c.id)) " : "") + OrderBy(sort, {"c.charge_date", "fold(COALESCE(p.name, '#-1'))", "fold(COALESCE(s.label, ''))", "fold(COALESCE(u.full_name, ''))",
                        "CAST(ROUND(c.amount_due*100) AS INTEGER)", "CAST(ROUND(c.amount_paid*100) AS INTEGER)", "CAST(ROUND(c.balance*100) AS INTEGER)", "kindx"},
                       "c.charge_date DESC, c.id DESC") + " LIMIT ?2 OFFSET ?3";
     sqlite3_stmt* st = nullptr;
@@ -6926,9 +7121,10 @@ std::vector<DataConn::PartnerJob> SqliteConn::partnerJobs(int partnerId, const s
 }
 
 double SqliteConn::paidWithoutDoc(int chargeId) {
+    // a cost has one document for the whole job; until it has one, everything paid on it is "without document"
     sqlite3_stmt* st = nullptr; long long c = 0;
     sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(CAST(ROUND(a.amount*100) AS INTEGER)), 0) FROM allocations a JOIN payments m ON m.id = a.payment_id "
-                           "WHERE a.charge_id = ? AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.payment_id = m.id)", -1, &st, nullptr);
+                           "WHERE a.charge_id = ?1 AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.charge_id = ?1 OR d.payment_id = m.id)", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, chargeId);
     if (sqlite3_step(st) == SQLITE_ROW) c = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
@@ -6936,28 +7132,28 @@ double SqliteConn::paidWithoutDoc(int chargeId) {
 }
 int SqliteConn::addPartnerDocLater(int chargeId, const std::string& docType, const std::string& number, const std::string& docDate, const std::string& notes) {
     if (docType != "invoice" && docType != "receipt") { lastError_ = "Τιμολόγιο ή απόδειξη."; return -1; }
-    // every payment of this cost that has no document yet gets this one, for exactly the amount it paid (the numbers match)
-    std::vector<std::pair<int, long long>> pays; sqlite3_stmt* st = nullptr;
-    sqlite3_prepare_v2(db, "SELECT m.id, CAST(ROUND(a.amount*100) AS INTEGER) FROM allocations a JOIN payments m ON m.id = a.payment_id "
-                           "WHERE a.charge_id = ? AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.payment_id = m.id) ORDER BY m.id", -1, &st, nullptr);
+    Payment c = getPaymentById(chargeId);
+    if (c.id <= 0 || c.direction != "out") { lastError_ = "Η γραμμή δεν είναι κόστος που πληρώνουμε."; return -1; }
+    if (ToCents(c.balance) > 0) { lastError_ = "Το παραστατικό του συνεργάτη καταχωρίζεται όταν εξοφληθεί όλο το κόστος (υπόλοιπο " + FormatMoney(c.balance) + " €)."; return -1; }
+    if (docDate.size() != 10) { lastError_ = "Ορίστε την ημερομηνία του παραστατικού."; return -1; }
+    // one document for the whole job, on the payment that settled it
+    sqlite3_stmt* st = nullptr; int pid = -1; bool has = false;
+    sqlite3_prepare_v2(db, "SELECT EXISTS (SELECT 1 FROM partner_docs d WHERE d.charge_id = ?1), "
+                           "(SELECT m.id FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = ?1 AND m.direction = 'out' ORDER BY m.pay_date DESC, m.id DESC LIMIT 1)", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, chargeId);
-    while (sqlite3_step(st) == SQLITE_ROW) pays.push_back({ sqlite3_column_int(st, 0), sqlite3_column_int64(st, 1) });
+    if (sqlite3_step(st) == SQLITE_ROW) { has = sqlite3_column_int(st, 0); pid = sqlite3_column_type(st, 1) == SQLITE_NULL ? -1 : sqlite3_column_int(st, 1); }
     sqlite3_finalize(st);
-    if (pays.empty()) { lastError_ = "Δεν υπάρχει πληρωμή χωρίς παραστατικό σε αυτό το κόστος."; return -1; }
+    if (has) { lastError_ = "Αυτό το κόστος έχει ήδη παραστατικό."; return -1; }
+    if (pid <= 0) { lastError_ = "Δεν υπάρχει πληρωμή σε αυτό το κόστος."; return -1; }
     if (!savepoint("late_doc")) return -1;
-    int n = 0;
-    for (auto& [pid, cents] : pays) {
-        if (cents <= 0) continue;
-        sqlite3_prepare_v2(db, "INSERT INTO partner_docs (payment_id, charge_id, partner_id, doc_type, number, doc_date, amount, notes) VALUES (?,?,(SELECT partner_id FROM partner_costs WHERE charge_id = ?2),?,?,?,?,?)", -1, &st, nullptr);
-        sqlite3_bind_int(st, 1, pid); sqlite3_bind_int(st, 2, chargeId); sqlite3_bind_text(st, 3, docType.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 4, number.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 5, docDate.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_double(st, 6, FromCents(cents)); sqlite3_bind_text(st, 7, notes.c_str(), -1, SQLITE_TRANSIENT);
-        const int rc = sqlite3_step(st); sqlite3_finalize(st);
-        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); rollbackTo("late_doc"); return -1; }
-        n++;
-    }
+    sqlite3_prepare_v2(db, "INSERT INTO partner_docs (payment_id, charge_id, partner_id, doc_type, number, doc_date, amount, notes) VALUES (?,?,(SELECT partner_id FROM partner_costs WHERE charge_id = ?2),?,?,?,?,?)", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, pid); sqlite3_bind_int(st, 2, chargeId); sqlite3_bind_text(st, 3, docType.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, number.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 5, docDate.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 6, RoundMoney(c.amount_due)); sqlite3_bind_text(st, 7, notes.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(st); if (rc != SQLITE_DONE) lastError_ = sqlite3_errmsg(db); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { rollbackTo("late_doc"); return -1; }
     if (!release("late_doc")) { rollbackTo("late_doc"); return -1; }
-    return n;
+    return 1;
 }
 
 int SqliteConn::countPartnerJobs(int partnerId, const std::string& fromDate, const std::string& toDate, int kind, bool owedOnly, bool noDocOnly) {
@@ -6967,7 +7163,7 @@ int SqliteConn::countPartnerJobs(int partnerId, const std::string& fromDate, con
                            "WHERE c.direction = 'out' AND ")
                            + std::string("")
                            + "(?1 = 0 OR COALESCE(pc.partner_id, -1) = ?1) "
-                           "AND (?2 = '' OR c.charge_date >= ?2) AND (?3 = '' OR c.charge_date <= ?3) AND (?4 = 0 OR (?4 = 1 AND jo.opid IS NULL) OR (?4 = 2 AND jo.opid IS NOT NULL))" + (owedOnly ? " AND c.balance > 0.005" : "") + (noDocOnly ? " AND EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.payment_id = m.id)) " : "")).c_str(), -1, &st, nullptr);
+                           "AND (?2 = '' OR c.charge_date >= ?2) AND (?3 = '' OR c.charge_date <= ?3) AND (?4 = 0 OR (?4 = 1 AND jo.opid IS NULL) OR (?4 = 2 AND jo.opid IS NOT NULL))" + (owedOnly ? " AND c.balance > 0.005" : "") + (noDocOnly ? " AND EXISTS (SELECT 1 FROM allocations a JOIN payments m ON m.id = a.payment_id WHERE a.charge_id = c.id AND m.direction = 'out' AND NOT EXISTS (SELECT 1 FROM partner_docs d WHERE d.payment_id = m.id OR d.charge_id = c.id)) " : "")).c_str(), -1, &st, nullptr);
     sqlite3_bind_int(st, 4, kind);
     sqlite3_bind_int(st, 1, partnerId); sqlite3_bind_text(st, 2, fromDate.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, toDate.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
@@ -7213,7 +7409,8 @@ int SqliteConn::addInstallmentPlan(const std::vector<Payment>& lines, const std:
 // An "end"-mode plan whose installments are all paid gets its ONE receipt now, for all the money paid on it that has
 // no receipt yet. Called inside the caller's transaction after money is allocated.
 bool SqliteConn::closePlanIfPaid(int batchId) {
-    if (batchId <= 0) return true;
+    // v40: a plan's one receipt is issued by issueDueReceipts when its last installment is paid (any receipt mode).
+    if (batchId > 0) return true;
     PaymentPlan plan = getPlanForBatch(batchId);
     if (plan.id < 0 || plan.receipt_mode != "end" || plan.receipt_id > 0) return true;
     sqlite3_stmt* st = nullptr; int open = 0;
@@ -7251,9 +7448,9 @@ DataConn::PaymentPlan SqliteConn::getPlanForBatch(int batchId) {
         "  (SELECT COUNT(DISTINCT c.charge_date) FROM charges c WHERE c.batch_id = pl.batch_id AND c.status != 'future' "
         "     AND NOT EXISTS (SELECT 1 FROM charges x WHERE x.batch_id = c.batch_id AND x.charge_date = c.charge_date "
         "                     AND (x.status = 'future' OR CAST(ROUND(x.balance*100) AS INTEGER) > 0))), "
-        "  COALESCE((SELECT m.receipt_id FROM payments m JOIN allocations a ON a.payment_id = m.id JOIN charges c ON c.id = a.charge_id "
-        "            JOIN receipts r ON r.id = m.receipt_id WHERE c.batch_id = pl.batch_id AND r.status = 'issued' "
-        "            AND r.notes LIKE 'Εξόφληση σε %' LIMIT 1), -1) "
+        "  COALESCE((SELECT rl.receipt_id FROM receipt_lines rl JOIN charges c ON c.id = rl.charge_id "
+        "            JOIN receipts r ON r.id = rl.receipt_id WHERE c.batch_id = pl.batch_id AND r.status = 'issued' "
+        "            ORDER BY rl.receipt_id DESC LIMIT 1), -1) "
         "FROM payment_plans pl LEFT JOIN payment_batches b ON b.id = pl.batch_id WHERE pl.batch_id = ?", -1, &st, nullptr);
     sqlite3_bind_int(st, 1, batchId);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -7274,6 +7471,8 @@ std::vector<DataConn::MethodTotal> SqliteConn::moneyByMethod(const std::string& 
     sqlite3_prepare_v2(db,
         "SELECT m.method, COUNT(*), SUM(CAST(ROUND(m.amount*100) AS INTEGER)), "
         "  SUM(CASE WHEN EXISTS (SELECT 1 FROM receipts r WHERE r.id = m.receipt_id AND r.status = 'issued') "
+        "        OR EXISTS (SELECT 1 FROM allocations a JOIN receipt_lines rl ON rl.charge_id = a.charge_id JOIN receipts r ON r.id = rl.receipt_id "
+        "                   WHERE a.payment_id = m.id AND r.status = 'issued') "
         "      THEN CAST(ROUND(m.amount*100) AS INTEGER) ELSE 0 END) "
         "FROM payments m WHERE m.direction = 'in' AND (?1 = '' OR m.pay_date >= ?1) AND (?2 = '' OR m.pay_date <= ?2) "
         "GROUP BY m.method ORDER BY 3 DESC", -1, &st, nullptr);
@@ -7643,8 +7842,12 @@ SqlBinds MoneyWhere(const DataConn::MoneyQuery& q) {
     if (!q.toDate.empty()) w.text(" AND m.pay_date <= ?", q.toDate);
     if (q.direction == "in" || q.direction == "out") w.text(" AND m.direction = ?", q.direction);
     if (!q.method.empty()) w.text(" AND m.method = ?", q.method);
-    if (q.receipt == 1) w.where += " AND m.receipt_id IN (SELECT id FROM receipts WHERE status = 'issued')";
-    if (q.receipt == 2) w.where += " AND m.direction = 'in' AND (m.receipt_id IS NULL OR m.receipt_id NOT IN (SELECT id FROM receipts WHERE status = 'issued'))";
+    {   // money is "receipted" when its own (old-style) receipt or a receipt of a charge it paid is issued
+        const std::string has = "(m.receipt_id IN (SELECT id FROM receipts WHERE status = 'issued') OR EXISTS (SELECT 1 FROM allocations ra "
+                                "JOIN receipt_lines rl ON rl.charge_id = ra.charge_id JOIN receipts rr ON rr.id = rl.receipt_id WHERE ra.payment_id = m.id AND rr.status = 'issued'))";
+        if (q.receipt == 1) w.where += " AND " + has;
+        if (q.receipt == 2) w.where += " AND m.direction = 'in' AND NOT " + has;
+    }
     if (!q.text.empty()) {
         w.where += std::string(" AND (instr(fold(") + kMoneyWho + "), fold(?)) > 0 OR instr(fold(COALESCE(m.reference,'')), fold(?)) > 0"
                    " OR instr(fold(COALESCE(m.notes,'')), fold(?)) > 0)";
@@ -8632,4 +8835,210 @@ std::vector<DataConn::CubeHit> SqliteConn::cubeCellHits(int mode, int userId, in
     }
     sqlite3_finalize(st);
     return out;
+}
+
+
+// =====================================================================================================================
+// ΑΠΟΘΗΚΗ (store): items bought from partners, used up by services. Quantities are plain numbers (pieces, litres...).
+// =====================================================================================================================
+static std::string StoreQtyText(double q) {
+    char b[32]; std::snprintf(b, sizeof b, "%.2f", q);
+    std::string s = b; while (!s.empty() && s.back() == '0') s.pop_back(); if (!s.empty() && s.back() == '.') s.pop_back();
+    return s;
+}
+
+static const char* kStoreItemCols =
+    "i.id, i.name, COALESCE(i.code,''), i.suggested_cost, COALESCE(i.notes,''), "
+    "COALESCE((SELECT group_concat(p.name, ', ') FROM store_item_partners sp JOIN partners p ON p.id = sp.partner_id WHERE sp.item_id = i.id),''), "
+    "COALESCE((SELECT SUM(qty) FROM store_moves m WHERE m.item_id = i.id AND m.kind = 'in'),0), "
+    "COALESCE((SELECT SUM(qty) FROM store_moves m WHERE m.item_id = i.id AND m.kind = 'use'),0), "
+    "COALESCE((SELECT MAX(move_date) FROM store_moves m WHERE m.item_id = i.id),''), "
+    "COALESCE((SELECT SUM(CAST(ROUND(total*100) AS INTEGER)) FROM store_moves m WHERE m.item_id = i.id AND m.kind = 'in'),0) ";
+
+static DataConn::StoreItem ReadStoreItem(sqlite3_stmt* st) {
+    DataConn::StoreItem it;
+    it.id = sqlite3_column_int(st, 0); it.name = ColText(st, 1); it.code = ColText(st, 2); it.suggested_cost = RoundMoney(sqlite3_column_double(st, 3));
+    it.notes = ColText(st, 4); it.partners = ColText(st, 5); it.bought = sqlite3_column_double(st, 6); it.used = sqlite3_column_double(st, 7);
+    it.stock = it.bought - it.used; it.last_move = ColText(st, 8); it.spent = FromCents(sqlite3_column_int64(st, 9));
+    return it;
+}
+
+int SqliteConn::saveStoreItem(const StoreItem& in) {
+    std::string name = in.name; while (!name.empty() && std::isspace((unsigned char)name.back())) name.pop_back();
+    if (name.empty()) { lastError_ = "Το προϊόν χρειάζεται όνομα."; return -1; }
+    if (!savepoint("store_item")) return -1;
+    auto fail = [&]() { rollbackTo("store_item"); return -1; };
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, in.id > 0 ? "UPDATE store_items SET name=?1, code=NULLIF(?2,''), suggested_cost=?3, notes=NULLIF(?4,'') WHERE id=?5"
+                                     : "INSERT INTO store_items (name, code, suggested_cost, notes) VALUES (?1, NULLIF(?2,''), ?3, NULLIF(?4,''))", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, name.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, in.code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 3, RoundMoney(in.suggested_cost)); sqlite3_bind_text(st, 4, in.notes.c_str(), -1, SQLITE_TRANSIENT);
+    if (in.id > 0) sqlite3_bind_int(st, 5, in.id);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    int id = in.id > 0 ? in.id : (int)sqlite3_last_insert_rowid(db);
+    if (!executeQuery("DELETE FROM store_item_partners WHERE item_id = " + std::to_string(id) + ";")) return fail();
+    for (int pid : std::set<int>(in.partner_ids.begin(), in.partner_ids.end())) {
+        if (pid <= 0) continue;
+        if (!executeQuery("INSERT INTO store_item_partners (item_id, partner_id) VALUES (" + std::to_string(id) + "," + std::to_string(pid) + ");")) return fail();
+    }
+    if (!release("store_item")) return fail();
+    return id;
+}
+
+DataConn::StoreItem SqliteConn::getStoreItem(int id) {
+    StoreItem it; sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, (std::string("SELECT ") + kStoreItemCols + "FROM store_items i WHERE i.id = ?").c_str(), -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) it = ReadStoreItem(st);
+    sqlite3_finalize(st);
+    if (it.id > 0) {
+        sqlite3_prepare_v2(db, "SELECT partner_id FROM store_item_partners WHERE item_id = ? ORDER BY partner_id", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, id);
+        while (sqlite3_step(st) == SQLITE_ROW) it.partner_ids.push_back(sqlite3_column_int(st, 0));
+        sqlite3_finalize(st);
+    }
+    return it;
+}
+
+static const char* kStoreWhere =
+    " WHERE i.active = 1 AND (?1 = '' OR instr(fold(i.name || ' ' || COALESCE(i.code,'') || ' ' || COALESCE(i.notes,'') || ' ' || "
+    "COALESCE((SELECT group_concat(p.name, ' ') FROM store_item_partners sp JOIN partners p ON p.id = sp.partner_id WHERE sp.item_id = i.id),'')), fold(?1)) > 0)";
+
+std::vector<DataConn::StoreItem> SqliteConn::pageStoreItems(const std::string& query, int offset, int limit) {
+    std::vector<StoreItem> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, (std::string("SELECT ") + kStoreItemCols + "FROM store_items i" + kStoreWhere + " ORDER BY fold(i.name), i.id LIMIT ?2 OFFSET ?3").c_str(), -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_text(st, 1, query.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back(ReadStoreItem(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
+int SqliteConn::countStoreItems(const std::string& query) {
+    int n = 0; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, (std::string("SELECT COUNT(*) FROM store_items i") + kStoreWhere).c_str(), -1, &st, nullptr) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, query.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+int SqliteConn::addStorePurchase(int itemId, double qty, double unitCost, double total, int partnerId, const std::string& date,
+                                 const std::string& notes, bool paidNow, const std::string& method,
+                                 const std::string& docType, const std::string& docNo, const std::string& docDate) {
+    StoreItem it = getStoreItem(itemId);
+    if (it.id <= 0) { lastError_ = "Το προϊόν δεν υπάρχει."; return -1; }
+    if (date.size() != 10) { lastError_ = "Μη έγκυρη ημερομηνία."; return -1; }
+    total = RoundMoney(total);
+    if (!savepoint("store_buy")) return -1;
+    auto fail = [&]() { rollbackTo("store_buy"); lastError_ = "Δεν αποθηκεύτηκε τίποτα: " + lastError_; return -1; };
+    int chargeId = -1;
+    if (partnerId > 0 && ToCents(total) > 0) {
+        // what we owe the supplier: a normal paid-out cost line, on the store's own catalog service
+        int svc = -1; sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT id FROM services WHERE code = 'STORE' ORDER BY id LIMIT 1", -1, &st, nullptr);
+        if (sqlite3_step(st) == SQLITE_ROW) svc = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+        if (svc <= 0) {
+            Service s; s.label = "Αγορές αποθήκης"; s.code = "STORE"; s.extra_notes = "Αγορές προϊόντων για την αποθήκη";
+            svc = addServiceGetId(-1, s);
+            if (svc <= 0) return fail();
+        }
+        Payment co; co.user_id = -1; co.service_id = svc; co.direction = "out"; co.partner_id = partnerId; co.apartment_id = 0;
+        std::sscanf(date.c_str(), "%d-%d-%d", &co.year, &co.month, &co.day);
+        co.amount_due = total; co.amount_paid = (paidNow && docType.empty()) ? total : 0.0; co.balance = MoneySub(co.amount_due, co.amount_paid);
+        co.status = "paid";
+        co.notes = "Αποθήκη: " + it.name + " x " + StoreQtyText(qty) + (notes.empty() ? "" : " - " + notes);
+        chargeId = addPaymentsWithReceipt({co}, "", nullptr);
+        if (chargeId <= 0) return fail();
+        if (paidNow && !docType.empty() && !payOutWithDoc(chargeId, total, date, method.empty() ? "cash" : method, docType, docNo, docDate.empty() ? date : docDate, ""))
+            return fail();
+    }
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "INSERT INTO store_moves (item_id, kind, qty, unit_cost, total, partner_id, charge_id, move_date, notes) VALUES (?,'in',?,?,?,?,?,?,NULLIF(?,''))", -1, &st, nullptr);
+    sqlite3_bind_int(st, 1, itemId); sqlite3_bind_double(st, 2, qty); sqlite3_bind_double(st, 3, RoundMoney(unitCost)); sqlite3_bind_double(st, 4, total);
+    if (partnerId > 0) sqlite3_bind_int(st, 5, partnerId); else sqlite3_bind_null(st, 5);
+    if (chargeId > 0) sqlite3_bind_int(st, 6, chargeId); else sqlite3_bind_null(st, 6);
+    sqlite3_bind_text(st, 7, date.c_str(), -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 8, notes.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); return fail(); }
+    int mid = (int)sqlite3_last_insert_rowid(db);
+    if (partnerId > 0 && !executeQuery("INSERT OR IGNORE INTO store_item_partners (item_id, partner_id) VALUES (" + std::to_string(itemId) + "," + std::to_string(partnerId) + ");"))
+        return fail();
+    if (!release("store_buy")) return fail();
+    return mid;
+}
+
+std::vector<DataConn::StoreMove> SqliteConn::getStoreMoves(int itemId, int limit) {
+    std::vector<StoreMove> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db,
+        "SELECT m.id, m.item_id, COALESCE(m.partner_id,-1), COALESCE(m.charge_id,-1), m.kind, m.move_date, COALESCE(p.name,''), "
+        "  CASE WHEN m.kind = 'use' THEN COALESCE(s.label,'') ELSE '' END, CASE WHEN m.kind = 'use' THEN COALESCE(u.full_name,'') ELSE '' END, "
+        "  COALESCE(m.notes,''), m.qty, m.unit_cost, m.total "
+        "FROM store_moves m LEFT JOIN partners p ON p.id = m.partner_id LEFT JOIN charges c ON c.id = m.charge_id "
+        "LEFT JOIN services s ON s.id = c.service_id LEFT JOIN users u ON u.id = c.user_id "
+        "WHERE m.item_id = ? ORDER BY m.move_date DESC, m.id DESC LIMIT ?", -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, itemId); sqlite3_bind_int(st, 2, limit);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        StoreMove m; m.id = sqlite3_column_int(st, 0); m.item_id = sqlite3_column_int(st, 1); m.partner_id = sqlite3_column_int(st, 2); m.charge_id = sqlite3_column_int(st, 3);
+        m.kind = ColText(st, 4); m.date = ColText(st, 5); m.partner = ColText(st, 6); m.service = ColText(st, 7); m.client = ColText(st, 8); m.notes = ColText(st, 9);
+        m.qty = sqlite3_column_double(st, 10); m.unit_cost = RoundMoney(sqlite3_column_double(st, 11)); m.total = RoundMoney(sqlite3_column_double(st, 12));
+        out.push_back(m);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<DataConn::StoreMonth> SqliteConn::storeMonths(int itemId) {
+    std::vector<StoreMonth> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db,
+        "SELECT substr(move_date,1,7) AS ym, SUM(CASE WHEN kind='in' THEN qty ELSE 0 END), SUM(CASE WHEN kind='use' THEN qty ELSE 0 END), "
+        "  SUM(CASE WHEN kind='in' THEN CAST(ROUND(total*100) AS INTEGER) ELSE 0 END) "
+        "FROM store_moves WHERE item_id = ? GROUP BY ym ORDER BY ym DESC", -1, &st, nullptr) != SQLITE_OK) { lastError_ = sqlite3_errmsg(db); return out; }
+    sqlite3_bind_int(st, 1, itemId);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back({ ColText(st, 0), sqlite3_column_double(st, 1), sqlite3_column_double(st, 2), FromCents(sqlite3_column_int64(st, 3)) });
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<DataConn::ServiceItem> SqliteConn::getServiceItems(int serviceId) {
+    std::vector<ServiceItem> out; sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT si.item_id, i.name, COALESCE(i.code,''), si.qty, i.suggested_cost FROM service_items si JOIN store_items i ON i.id = si.item_id "
+                               "WHERE si.service_id = ? AND i.active = 1 ORDER BY fold(i.name)", -1, &st, nullptr) != SQLITE_OK) return out;
+    sqlite3_bind_int(st, 1, serviceId);
+    while (sqlite3_step(st) == SQLITE_ROW) out.push_back({ sqlite3_column_int(st, 0), ColText(st, 1), ColText(st, 2), sqlite3_column_double(st, 3), RoundMoney(sqlite3_column_double(st, 4)) });
+    sqlite3_finalize(st);
+    return out;
+}
+
+bool SqliteConn::setServiceItems(int serviceId, const std::vector<ServiceItem>& items) {
+    if (!savepoint("svc_items")) return false;
+    if (!executeQuery("DELETE FROM service_items WHERE service_id = " + std::to_string(serviceId) + ";")) { rollbackTo("svc_items"); return false; }
+    std::set<int> seen;
+    for (auto& x : items) {
+        if (x.item_id <= 0 || !seen.insert(x.item_id).second) continue;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "INSERT INTO service_items (service_id, item_id, qty) VALUES (?,?,?)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, serviceId); sqlite3_bind_int(st, 2, x.item_id); sqlite3_bind_double(st, 3, x.qty);
+        int rc = sqlite3_step(st); sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); rollbackTo("svc_items"); return false; }
+    }
+    if (!release("svc_items")) { rollbackTo("svc_items"); return false; }
+    return true;
+}
+
+bool SqliteConn::logStoreUse(int chargeId, const std::vector<ServiceItem>& used, const std::string& date) {
+    if (!savepoint("store_use")) return false;
+    for (auto& x : used) {
+        if (x.item_id <= 0 || x.qty == 0.0) continue;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "INSERT INTO store_moves (item_id, kind, qty, charge_id, move_date) VALUES (?,'use',?,?,?)", -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, x.item_id); sqlite3_bind_double(st, 2, x.qty);
+        if (chargeId > 0) sqlite3_bind_int(st, 3, chargeId); else sqlite3_bind_null(st, 3);
+        sqlite3_bind_text(st, 4, date.c_str(), -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(st); sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { lastError_ = sqlite3_errmsg(db); rollbackTo("store_use"); return false; }
+    }
+    if (!release("store_use")) { rollbackTo("store_use"); return false; }
+    return true;
 }

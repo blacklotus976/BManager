@@ -1,0 +1,3 @@
+# Graphify map of the code: keep the viewer, the data and the report; the rest is rebuilt by "python -m graphify update ."
+cache/
+.graphify_*

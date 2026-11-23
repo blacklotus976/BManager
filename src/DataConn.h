@@ -912,4 +912,38 @@ public:
                                const std::string& status, const std::string& direction,
                                bool missingReceiptOnly = false, int joint = 0) = 0;
 
+
+    // ---- Αποθήκη (store): items bought from partners and used up by services ----
+    struct StoreItem {
+        int id = -1;
+        std::string name, code, notes;
+        double suggested_cost = 0.0;           // suggested cost per piece (only a suggestion when buying)
+        std::vector<int> partner_ids;          // its suppliers (usually one)
+        std::string partners;                  // their names, for lists
+        double bought = 0.0, used = 0.0, stock = 0.0;
+        double spent = 0.0;                    // what all its purchases cost us
+        std::string last_move;                 // date of the latest purchase or use
+    };
+    struct StoreMove {
+        int id = -1, item_id = -1, partner_id = -1, charge_id = -1;
+        std::string kind;                      // "in" bought, "use" used by a service charge
+        std::string date, partner, service, client, notes;
+        double qty = 0.0, unit_cost = 0.0, total = 0.0;
+    };
+    struct StoreMonth { std::string month; double bought = 0.0, used = 0.0, spent = 0.0; };
+    struct ServiceItem { int item_id = -1; std::string name, code; double qty = 1.0; double unit_cost = 0.0; };   // unit_cost: the item's suggested cost, shown only (never charged)
+    virtual int saveStoreItem(const StoreItem& item) = 0;                     // new (id < 0) or edit; returns the id
+    virtual StoreItem getStoreItem(int id) = 0;
+    virtual std::vector<StoreItem> pageStoreItems(const std::string& query, int offset, int limit) = 0;
+    virtual int countStoreItems(const std::string& query) = 0;
+    // a purchase: qty pieces for `total`; with a partner it is also a cost owed to him (paid now with his document, if given)
+    virtual int addStorePurchase(int itemId, double qty, double unitCost, double total, int partnerId, const std::string& date,
+                                 const std::string& notes, bool paidNow, const std::string& method,
+                                 const std::string& docType, const std::string& docNo, const std::string& docDate) = 0;
+    virtual std::vector<StoreMove> getStoreMoves(int itemId, int limit) = 0;
+    virtual std::vector<StoreMonth> storeMonths(int itemId) = 0;
+    virtual std::vector<ServiceItem> getServiceItems(int serviceId) = 0;
+    virtual bool setServiceItems(int serviceId, const std::vector<ServiceItem>& items) = 0;
+    // what a service charge used from the store (logged against the charge; no money)
+    virtual bool logStoreUse(int chargeId, const std::vector<ServiceItem>& used, const std::string& date) = 0;
 };

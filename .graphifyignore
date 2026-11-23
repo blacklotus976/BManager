@@ -1,0 +1,9 @@
+build/
+dist/
+third_party/
+RELEASE-V1/
+release_db/
+demo_media/
+src/stockviewer/
+*.txt
+*.log

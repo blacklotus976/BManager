@@ -32,6 +32,13 @@ private:
     bool release(const char* name);
     void rollbackTo(const char* name);
     int issueReceiptInTx(const Receipt& r, const std::vector<int>& paymentIds);   // caller owns the transaction
+    // Receipts per charge, issued the moment a charge is paid in full (see issueDueReceipts in SqliteConn.cpp).
+    void setupReceiptWatch();
+    bool issueDueReceipts();
+    int issueChargeReceipt(const std::vector<int>& chargeIds, const std::string& notes);
+    const Receipt* receiptTemplate_ = nullptr;   // how the money came in, as the screen said (method, refs, series)
+    int spDepth_ = 0;                            // open savepoints made with savepoint()
+    std::vector<int> issuedNow_;                 // receipts issued since the caller last cleared it
     void registerSqlFunctions();
     // (Re)creates the per-table audit triggers from the tables' current columns. Returns how many were
     // missing or altered (tampering signal once they have been installed).
@@ -372,4 +379,16 @@ public:
     std::vector<Service> pickerServices(const std::string& nameSearch,
                                          int offset, int limit) override;
     int pickerServicesCount(const std::string& nameSearch) override;
+    int saveStoreItem(const StoreItem& item) override;
+    StoreItem getStoreItem(int id) override;
+    std::vector<StoreItem> pageStoreItems(const std::string& query, int offset, int limit) override;
+    int countStoreItems(const std::string& query) override;
+    int addStorePurchase(int itemId, double qty, double unitCost, double total, int partnerId, const std::string& date,
+                         const std::string& notes, bool paidNow, const std::string& method,
+                         const std::string& docType, const std::string& docNo, const std::string& docDate) override;
+    std::vector<StoreMove> getStoreMoves(int itemId, int limit) override;
+    std::vector<StoreMonth> storeMonths(int itemId) override;
+    std::vector<ServiceItem> getServiceItems(int serviceId) override;
+    bool setServiceItems(int serviceId, const std::vector<ServiceItem>& items) override;
+    bool logStoreUse(int chargeId, const std::vector<ServiceItem>& used, const std::string& date) override;
 };
